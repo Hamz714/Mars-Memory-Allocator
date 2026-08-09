@@ -171,6 +171,19 @@ if(BUILD_TESTING)
   mars_add_test(test_realloc     tests/test_realloc.c)
   mars_add_test(test_integrity   tests/test_integrity.c)
   mars_add_test(test_regressions tests/test_regressions.c)
+
+  # The fuzzer brings its own main() and CLI, so it is registered directly
+  # rather than through mars_add_test. CI runs a short bounded pass; longer
+  # runs are launched by hand with --seconds or --ops.
+  add_executable(fuzz_shadow tests/fuzz_shadow.c)
+  target_link_libraries(fuzz_shadow PRIVATE mars mars_flags mars_flags_strict)
+  target_include_directories(fuzz_shadow
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  set_target_properties(fuzz_shadow PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+  add_test(NAME fuzz_shadow_smoke
+           COMMAND fuzz_shadow --seed 20260809 --ops 20000)
+  set_tests_properties(fuzz_shadow_smoke PROPERTIES TIMEOUT 300)
 endif()
 
 # ---------------------------------------------------------------------------
