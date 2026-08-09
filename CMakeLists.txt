@@ -146,6 +146,31 @@ endif()
 
 include(CTest)
 
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+if(BUILD_TESTING)
+  add_library(mars_test STATIC tests/mars_test.c)
+  target_include_directories(mars_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  target_link_libraries(mars_test PUBLIC mars_flags PRIVATE mars_flags_strict)
+  set_target_properties(mars_test PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+
+  # add_test() with a timeout: a corrupted-link test that regresses would
+  # otherwise hang the run rather than fail it.
+  function(mars_add_test name source)
+    add_executable(${name} ${source})
+    target_link_libraries(${name} PRIVATE mars mars_test)
+    set_target_properties(${name} PROPERTIES
+      C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES TIMEOUT 60)
+  endfunction()
+
+  mars_add_test(test_regressions tests/test_regressions.c)
+endif()
+
 if(MARS_BUILD_DEMO)
   add_executable(mars_demo tests/mars_demo.c)
   target_link_libraries(mars_demo PRIVATE mars)
