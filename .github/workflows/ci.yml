@@ -93,8 +93,10 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
+      # From apt rather than pip: this pins the same gcovr the development
+      # environment has, so a coverage number cannot differ between the two.
       - name: Install gcovr
-        run: pipx install gcovr
+        run: sudo apt-get update && sudo apt-get install -y gcovr
       - name: Configure
         run: cmake --preset gcc-coverage
       - name: Build
@@ -104,11 +106,15 @@ jobs:
       # Gated, not merely reported: a number nobody enforces drifts downwards.
       - name: Report
         run: |
+          mkdir -p coverage
           gcovr --root . --filter 'src/' \
                 --html-details coverage/index.html \
                 --txt --print-summary \
                 --fail-under-line 90
+      # Uploaded even when the gate fails -- that is precisely when someone
+      # needs to look at which lines stopped being covered.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: coverage
           path: coverage/
