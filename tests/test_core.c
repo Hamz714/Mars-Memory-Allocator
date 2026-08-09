@@ -63,6 +63,29 @@ MM_TEST(core, calls_before_init_report_not_initialized) {
   CHECK_EQ(mm_check_heap(), MM_ERR_NOT_INITIALIZED);
 }
 
+MM_TEST(core, every_status_has_a_message) {
+  static const mm_status_t all[] = {
+      MM_OK,           MM_ERR_NOT_INITIALIZED, MM_ERR_BAD_ARENA,
+      MM_ERR_INVALID_PTR, MM_ERR_OOB,          MM_ERR_CORRUPT_HEADER,
+      MM_ERR_CORRUPT_CANARY, MM_ERR_CORRUPT_PAYLOAD, MM_ERR_CORRUPT_LINKS,
+      MM_ERR_DOUBLE_FREE, MM_ERR_NOMEM,        MM_ERR_QUARANTINED};
+
+  for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+    const char *msg = mm_strerror(all[i]);
+    CHECK_NOT_NULL(msg);
+    if (msg == NULL) continue;
+    // A status that fell through the switch would come back as the catch-all,
+    // which is how a newly added code without a message shows up here.
+    if (strcmp(msg, "unknown status") == 0) {
+      MARS_FAIL_("status %d has no message of its own", (int)all[i]);
+    }
+    if (msg[0] == '\0') MARS_FAIL_("status %d has an empty message", (int)all[i]);
+  }
+
+  // And an out-of-range value must still return something printable.
+  CHECK_NOT_NULL(mm_strerror((mm_status_t)9999));
+}
+
 // --- Allocation ------------------------------------------------------------
 
 MM_TEST(core, malloc_returns_distinct_aligned_blocks) {

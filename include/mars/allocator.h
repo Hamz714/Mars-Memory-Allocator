@@ -36,8 +36,15 @@ typedef enum mm_status {
   MM_ERR_QUARANTINED       // block was isolated after corruption was found
 } mm_status_t;
 
-// Status of the calling thread's most recent allocator call. Set on every
-// failure and cleared to MM_OK on success.
+// What the calling thread's most recent allocator call ran into. Reset at the
+// start of every call, so it always describes that call and no earlier one.
+//
+// MM_OK means nothing untoward happened. Any other value is the problem the
+// call encountered -- which does not always mean the call failed: an
+// allocation that succeeds after stepping over a corrupted block still reports
+// MM_ERR_QUARANTINED, because silently discarding that signal is exactly what
+// this allocator exists not to do. Use the return value to tell success from
+// failure, and this to find out what was seen along the way.
 mm_status_t mm_last_error(void);
 
 // Human-readable name for a status code. Never returns NULL.

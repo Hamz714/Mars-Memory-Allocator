@@ -20,6 +20,7 @@ size_t mm_size_for(size_t payload) {
 // --- Initialisation --------------------------------------------------------
 
 int mm_init(void *heap, size_t heap_size) {
+  mm_clear_error();
   if (heap == NULL || heap_size < mm_min_arena()) {
     mm_fail(MM_ERR_BAD_ARENA);
     return -1;
@@ -56,7 +57,6 @@ int mm_init(void *heap, size_t heap_size) {
   mm_seal(first);
 
   g_arena.first = first;
-  mm_clear_error();
   return 0;
 }
 
@@ -147,6 +147,7 @@ static void split_block(mm_header *block, size_t need) {
 // --- Allocation ------------------------------------------------------------
 
 void *mm_malloc(size_t size) {
+  mm_clear_error();
   if (g_arena.base == NULL) {
     mm_fail(MM_ERR_NOT_INITIALIZED);
     return NULL;
@@ -186,7 +187,6 @@ void *mm_malloc(size_t size) {
   block->payload_checksum = 0;
   mm_seal(block);
 
-  mm_clear_error();
   return payload;
 }
 
@@ -208,6 +208,7 @@ static void coalesce_forward(mm_header *block) {
 }
 
 void mm_free(void *ptr) {
+  mm_clear_error();
   if (ptr == NULL) return;
 
   mm_header *block = mm_block_of(ptr);
@@ -245,8 +246,6 @@ void mm_free(void *ptr) {
       mm_footer_ok(prev) && prev->next == block) {
     coalesce_forward(prev);
   }
-
-  mm_clear_error();
 }
 
 // The payload checksum only means anything when every byte it covers has been
@@ -266,6 +265,7 @@ static void carry_payload_checksum(mm_header *block, size_t old_size,
 // --- Resize ----------------------------------------------------------------
 
 void *mm_realloc(void *ptr, size_t new_size) {
+  mm_clear_error();
   if (ptr == NULL) return mm_malloc(new_size);
 
   if (new_size == 0) {
@@ -306,7 +306,6 @@ void *mm_realloc(void *ptr, size_t new_size) {
     mm_write_canary(block);
     carry_payload_checksum(block, old_size, old_sum, new_size);
     mm_seal(block);
-    mm_clear_error();
     return payload;
   }
 
@@ -321,7 +320,6 @@ void *mm_realloc(void *ptr, size_t new_size) {
     mm_write_canary(block);
     carry_payload_checksum(block, old_size, old_sum, new_size);
     mm_seal(block);
-    mm_clear_error();
     return payload;
   }
 
@@ -340,6 +338,5 @@ void *mm_realloc(void *ptr, size_t new_size) {
   }
 
   mm_free(ptr);
-  mm_clear_error();
   return fresh;
 }

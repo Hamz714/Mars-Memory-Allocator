@@ -234,6 +234,80 @@ MM_TEST(regression, realloc_grow_no_size_underflow) {
   free(heap);
 }
 
+// Coalescing backwards must confirm the previous block actually points at this
+// one. Trusting `prev` alone means a damaged link merges two blocks using
+// geometry that describes neither of them.
+MM_TEST(regression, free_does_not_merge_through_a_broken_prev_link) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *a = mm_malloc(256);
+  void *b = mm_malloc(256);
+  void *c = mm_malloc(256);
+  REQUIRE_NOT_NULL(a);
+  REQUIRE_NOT_NULL(b);
+  REQUIRE_NOT_NULL(c);
+
+  const char msg[] = "c is a bystander";
+  REQUIRE_EQ(mm_write(c, 0, msg, sizeof(msg)), (int64_t)sizeof(msg));
+
+  mm_free(a);  // a is now free, and sits immediately before b
+
+  // Point a's forward link at c instead of b, re-sealing so the checksum
+  // agrees. Freeing b must notice that a does not point back at it.
+  mm_header *ha = (mm_header *)(void *)((uint8_t *)a - MM_PREFIX);
+  mm_header *hc = (mm_header *)(void *)((uint8_t *)c - MM_PREFIX);
+  ha->next = hc;
+  mm_seal(ha);
+
+  mm_free(b);
+
+  // Had the merge gone ahead, a would have swallowed a span computed from the
+  // wrong neighbour and c's header would sit inside it.
+  CHECK_EQ(mm_verify(c), MM_OK);
+  char back[32] = {0};
+  CHECK_EQ(mm_read(c, 0, back, sizeof(msg)), (int64_t)sizeof(msg));
+  CHECK_STR_EQ(back, msg);
+
+  free(heap);
+}
+
+// A neighbour that fails validation must be dropped from the list, never
+// written through. Its size field is what decides where its footer lands, so
+// sealing a corrupted neighbour scatters writes across -- and past -- the
+// arena. Run under ASan, where such a write is caught rather than tolerated.
+MM_TEST(regression, corrupt_successor_is_dropped_not_written_through) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *a = mm_malloc(256);
+  void *b = mm_malloc(256);
+  void *c = mm_malloc(256);
+  REQUIRE_NOT_NULL(a);
+  REQUIRE_NOT_NULL(b);
+  REQUIRE_NOT_NULL(c);
+
+  mm_free(b);  // leaves a free block directly after a
+
+  // Damage c's header without re-sealing, so it still looks like a block but
+  // no longer matches its checksum.
+  mm_header *hc = (mm_header *)(void *)((uint8_t *)c - MM_PREFIX);
+  hc->size ^= 0x20;
+
+  // Freeing a merges it with b, after which the list would run on into c.
+  mm_free(a);
+
+  CHECK_EQ(mm_last_error(), MM_ERR_CORRUPT_LINKS);
+
+  // The allocator must still answer, rather than having corrupted itself.
+  void *fresh = mm_malloc(64);
+  (void)fresh;
+
+  free(heap);
+}
+
 // A corrupted link must not send a traversal into an unbounded loop. Writing a
 // block's own address into its next pointer is the minimal way to produce one.
 //

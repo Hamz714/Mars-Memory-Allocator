@@ -217,6 +217,7 @@ mm_header *mm_block_of(const void *ptr) {
 // --- Public checks ---------------------------------------------------------
 
 mm_status_t mm_verify(const void *ptr) {
+  mm_clear_error();
   mm_header *block = mm_block_of(ptr);
   if (block == NULL) return mm_last_error();
 
@@ -230,11 +231,11 @@ mm_status_t mm_verify(const void *ptr) {
         mm_payload_checksum(mm_payload_of(block), block->requested_size);
     if (want != got) return mm_fail(MM_ERR_CORRUPT_PAYLOAD);
   }
-  mm_clear_error();
   return MM_OK;
 }
 
 mm_status_t mm_check_heap(void) {
+  mm_clear_error();
   if (g_arena.base == NULL) return mm_fail(MM_ERR_NOT_INITIALIZED);
 
   size_t budget = mm_max_blocks();
@@ -268,6 +269,5 @@ mm_status_t mm_check_heap(void) {
     return mm_fail(MM_ERR_CORRUPT_LINKS);
   }
 
-  mm_clear_error();
   return MM_OK;
 }

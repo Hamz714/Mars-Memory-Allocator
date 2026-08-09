@@ -37,6 +37,7 @@ static mm_header *checked_block(const void *ptr, size_t offset, size_t len) {
 }
 
 int64_t mm_read(const void *ptr, size_t offset, void *buf, size_t len) {
+  mm_clear_error();
   if (buf == NULL && len != 0) {
     mm_fail(MM_ERR_INVALID_PTR);
     return -1;
@@ -62,11 +63,11 @@ int64_t mm_read(const void *ptr, size_t offset, void *buf, size_t len) {
 
   if (len > 0) memcpy(buf, mm_payload_of(block) + offset, len);
 
-  mm_clear_error();
   return (int64_t)len;
 }
 
 int64_t mm_write(void *ptr, size_t offset, const void *src, size_t len) {
+  mm_clear_error();
   if (src == NULL && len != 0) {
     mm_fail(MM_ERR_INVALID_PTR);
     return -1;
@@ -90,6 +91,5 @@ int64_t mm_write(void *ptr, size_t offset, const void *src, size_t len) {
                                                 block->requested_size);
   mm_seal(block);
 
-  mm_clear_error();
   return (int64_t)len;
 }
