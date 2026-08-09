@@ -13,19 +13,14 @@
 #include <string.h>
 
 #include "mars/allocator.h"
+#include "mm_internal.h"
 
 #define ARENA_SIZE (64u * 1024u)
-#define PATTERN_LEN 5
 
-// The allocator currently requires the arena to arrive pre-filled with a
-// repeating 5-byte pattern, so every test builds one the same way.
+// malloc is guaranteed to return storage aligned for any fundamental type,
+// which satisfies what mm_init requires of an arena.
 static uint8_t *arena_new(size_t size) {
-  uint8_t *heap = (uint8_t *)malloc(size);
-  if (heap == NULL) return NULL;
-  for (size_t i = 0; i < size; i++) {
-    heap[i] = (uint8_t)((i % PATTERN_LEN) + 0xA0);
-  }
-  return heap;
+  return (uint8_t *)malloc(size);
 }
 
 // ---------------------------------------------------------------------------
@@ -96,9 +91,6 @@ MM_TEST(regression, footer_valid_after_coalesce) {
 
   // Fresh arena: allocate three neighbours, then free two so that the second
   // free coalesces backward into the first.
-  for (size_t i = 0; i < ARENA_SIZE; i++) {
-    heap[i] = (uint8_t)((i % PATTERN_LEN) + 0xA0);
-  }
   REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
 
   void *a = mm_malloc(256);
@@ -260,15 +252,19 @@ MM_TEST(regression, traversal_terminates_on_cyclic_link) {
   REQUIRE_NOT_NULL(b);
   mm_free(b);
 
-  // Point the first block's forward link at itself. The layout puts `next` at
-  // a fixed offset in the header, and the header sits at the arena base.
-  header *first = (header *)heap;
+  // Point the first block's forward link at itself, and re-seal it so the
+  // checksum agrees. Without re-sealing, the checksum catches the edit and the
+  // cycle is never actually walked.
+  mm_header *first = (mm_header *)(void *)heap;
   first->next = first;
+  mm_seal(first);
 
   // Any allocation now has to walk the list. It must terminate -- returning
   // NULL is an acceptable outcome, hanging is not.
   void *c = mm_malloc(64);
   (void)c;
+
+  CHECK_EQ(mm_check_heap(), MM_ERR_CORRUPT_LINKS);
 
   mm_free(a);
   free(heap);

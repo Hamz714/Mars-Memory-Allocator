@@ -1,121 +1,105 @@
-#ifndef ALLOCATOR_H_
-#define ALLOCATOR_H_
+// A fault-tolerant memory allocator.
+//
+// The allocator manages a caller-supplied arena. Every block carries integrity
+// metadata -- a checksummed header, a mirrored footer, and a canary past the
+// payload -- which is verified on each access, so that memory corrupted after
+// the fact is detected rather than silently used.
+//
+// Payload integrity is only meaningful when reads and writes go through
+// mm_read and mm_write: a raw pointer handed to the caller can be written
+// behind the allocator's back, at which point any payload checksum is stale.
+
+#ifndef MARS_ALLOCATOR_H_
+#define MARS_ALLOCATOR_H_
 
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
-// --- Public API ---
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// Initializes the memory allocator using the provided heap block.
-// Sets up the initial free block, establishes the 5-byte pattern for
-// radiation detection, and prepares the internal state.
+// --- Status reporting ------------------------------------------------------
+
+typedef enum mm_status {
+  MM_OK = 0,
+  MM_ERR_NOT_INITIALIZED,  // no arena has been installed
+  MM_ERR_BAD_ARENA,        // arena rejected: too small, misaligned, or null
+  MM_ERR_INVALID_PTR,      // pointer did not come from this arena
+  MM_ERR_OOB,              // offset/length outside the payload
+  MM_ERR_CORRUPT_HEADER,   // header checksum or footer mismatch
+  MM_ERR_CORRUPT_CANARY,   // payload overflowed past its end
+  MM_ERR_CORRUPT_PAYLOAD,  // payload contents no longer match their checksum
+  MM_ERR_CORRUPT_LINKS,    // block list topology is inconsistent
+  MM_ERR_DOUBLE_FREE,      // block was already free
+  MM_ERR_NOMEM,            // no block large enough
+  MM_ERR_QUARANTINED       // block was isolated after corruption was found
+} mm_status_t;
+
+// Status of the calling thread's most recent allocator call. Set on every
+// failure and cleared to MM_OK on success.
+mm_status_t mm_last_error(void);
+
+// Human-readable name for a status code. Never returns NULL.
+const char *mm_strerror(mm_status_t status);
+
+// --- Lifecycle -------------------------------------------------------------
+
+// Installs `heap` as the arena. The arena must be at least mm_min_arena()
+// bytes and aligned to mm_alignment(). Its previous contents are discarded.
 //
-// @param heap       Pointer to the start of the memory block.
-// @param heap_size  Total size of the heap in bytes.
-// @return           0 on success, -1 on failure (e.g., heap too small).
-int mm_init(uint8_t *heap, size_t heap_size);
+// Returns 0 on success, -1 on failure.
+int mm_init(void *heap, size_t heap_size);
 
-// Allocates a block of memory with the specified size.
-// The returned pointer is guaranteed to be aligned to a 40-byte boundary
-// relative to the start of the heap. Uses SECURE_WRITE to protect metadata.
-//
-// @param size Number of bytes to allocate.
-// @return     Pointer to the payload on success, NULL on failure.
+// Alignment guaranteed for every pointer returned by mm_malloc/mm_realloc.
+size_t mm_alignment(void);
+
+// Smallest arena mm_init will accept.
+size_t mm_min_arena(void);
+
+// --- Allocation ------------------------------------------------------------
+
+// Allocates `size` bytes. Returns NULL if size is 0 or no block is available.
 void *mm_malloc(size_t size);
 
-// Reads data safely from an allocated block.
-// Performs bounds checking against requested_size and verifies integrity
-// (checksums, footers) before reading to prevent accessing corrupted memory.
-//
-// @param ptr    Pointer to the allocated block.
-// @param offset Offset within the block to start reading.
-// @param buf    Destination buffer.
-// @param len    Number of bytes to read.
-// @return       Bytes read on success, -1 on corruption or invalid pointer.
-int mm_read(void *ptr, size_t offset, void *buf, size_t len);
-
-// Writes data safely to an allocated block.
-// Includes Brownout Protection: verify-after-write loops ensure data is
-// correctly persisted even during power fluctuations.
-//
-// @param ptr    Pointer to the allocated block.
-// @param offset Offset within the block to start writing.
-// @param src    Source buffer.
-// @param len    Number of bytes to write.
-// @return       Bytes written on success, -1 on corruption or invalid pointer.
-int mm_write(void *ptr, size_t offset, const void *src, size_t len);
-
-// Frees a previously allocated block.
-// Coalesces adjacent free blocks to reduce fragmentation and sanitizes
-// the memory (restoring the pattern) to prevent data leaks.
-// Safely ignores NULL pointers and detects double-frees.
-//
-// @param ptr Pointer to the block to free.
+// Releases a block. Ignores NULL. A pointer this arena did not hand out, or a
+// block already free, is reported through mm_last_error() and otherwise
+// ignored.
 void mm_free(void *ptr);
 
-// Resizes an existing allocation to new_size.
-// Optimizes by attempting to shrink or grow in-place before resorting to
-// a full malloc-memcpy-free cycle.
-//
-// @param ptr      Pointer to the existing block.
-// @param new_size New requested size in bytes.
-// @return         Pointer to new memory (may be same as ptr) or NULL on
-//                 failure.
+// Resizes a block, preserving its contents up to the smaller of the two sizes.
+// With ptr == NULL this is mm_malloc; with new_size == 0 the block is freed and
+// NULL returned. On failure the original block is left untouched.
 void *mm_realloc(void *ptr, size_t new_size);
 
-// --- Internal Data Structures ---
+// --- Validated access ------------------------------------------------------
 
-// Block Header Structure.
-// Contains metadata required to manage the block and verify its integrity.
-typedef struct header {
-  uint32_t magic;           // Magic number for header validation
-  int in_use;               // 1 if allocated, 0 if free
-  size_t size;              // Total block size (Header + Payload + Pad + Ftr)
-  size_t requested_size;    // Exact payload size requested by user (for Canary)
-  struct header *next;      // Pointer to next block in the list
-  struct header *prev;      // Pointer to previous block in the list
-  uint32_t checksum;        // XOR checksum for metadata integrity
-  uint32_t payload_checksum;  // Checksum of the payload data
-} header;
+// Copies `len` bytes out of a block, starting `offset` into its payload. The
+// block's integrity is verified first.
+//
+// Returns the number of bytes copied, or -1 on a bad pointer, an
+// out-of-bounds range, or detected corruption.
+int64_t mm_read(const void *ptr, size_t offset, void *buf, size_t len);
 
-// Footer is structurally identical to header.
-// Used for mirrored metadata verification at the end of the block.
-typedef header footer;
+// Copies `len` bytes into a block, starting `offset` into its payload, and
+// refreshes the payload checksum. Partial writes are supported at any offset.
+//
+// Returns the number of bytes written, or -1 on a bad pointer, an
+// out-of-bounds range, or detected corruption.
+int64_t mm_write(void *ptr, size_t offset, const void *src, size_t len);
 
-// --- Helper Functions (Internal Use) ---
+// --- Integrity -------------------------------------------------------------
 
-// Uses First-Fit/Best-Fit strategy to locate a free block of sufficient size.
-header *find_best_block(size_t size);
+// Verifies one block: header checksum, mirrored footer, canary, and payload
+// checksum. Returns MM_OK if intact.
+mm_status_t mm_verify(const void *ptr);
 
-// Calculates the XOR checksum of a header's fields.
-uint32_t calculate_checksum(header *ptr);
+// Walks every block and checks each one's metadata and the list topology.
+// Returns MM_OK if the whole arena is consistent.
+mm_status_t mm_check_heap(void);
 
-// Calculates the checksum for the payload data to detect corruption.
-uint32_t calculate_payload_checksum(void *ptr, size_t size);
+#ifdef __cplusplus
+}
+#endif
 
-// Recovers the header pointer from a user payload pointer using the Clue.
-header *obtain_block(void *ptr);
-
-// Verifies if the header's checksum matches its contents.
-int valid_checksum(header *ptr);
-
-// Verifies if the mirrored footer matches the header.
-int valid_footer(header *header_ptr);
-
-// Checks the Payload Canary to detect buffer overflows.
-int valid_canary(void *ptr);
-
-// Verifies the consistency of the doubly linked list topology.
-int check_consistency(header *ptr);
-
-// Quarantines a corrupted block by safely unlinking it from the list.
-void remove_corrupted(header *ptr);
-
-// Checks if a pointer lies within the valid heap boundaries.
-int safe_ptr(header *ptr);
-
-// Updates the checksum and mirrored footer after modifying a header.
-void fix_linkage(header *header_ptr);
-
-#endif  // ALLOCATOR_H_
+#endif  // MARS_ALLOCATOR_H_
