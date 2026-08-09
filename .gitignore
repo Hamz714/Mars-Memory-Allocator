@@ -1,0 +1,41 @@
+# Build output
+build/
+out/
+install/
+
+# Object files, libraries, executables
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.d
+mars_demo
+runme
+
+# Coverage / profiling
+*.gcno
+*.gcda
+*.gcov
+coverage/
+callgrind.out.*
+perf.data*
+
+# Benchmark and fault-injection scratch output.
+# Committed results live in results/ and are added explicitly.
+scratch/
+*.tmp
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# CMake user-local presets
+CMakeUserPresets.json

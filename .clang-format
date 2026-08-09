@@ -1,0 +1,33 @@
+# Matches the existing house style: Google, 2-space indent, 80 columns.
+BasedOnStyle: Google
+Language: Cpp
+Standard: c++03
+
+IndentWidth: 2
+ContinuationIndentWidth: 4
+ColumnLimit: 80
+UseTab: Never
+
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+DerivePointerAlignment: false
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+SortIncludes: CaseSensitive
+
+IncludeBlocks: Regroup
+IncludeCategories:
+  # Our own public header first.
+  - Regex: '^"mars/'
+    Priority: 1
+  # C standard library.
+  - Regex: '^<(assert|ctype|errno|inttypes|limits|stdalign|stdarg|stdatomic|stdbool|stddef|stdint|stdio|stdlib|string|threads|time)\.h>'
+    Priority: 2
+  # Platform headers.
+  - Regex: '^<'
+    Priority: 3
+  # Local headers.
+  - Regex: '^"'
+    Priority: 4

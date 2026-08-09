@@ -4,7 +4,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "allocator.h"
+#include "mars/allocator.h"
 
 // Configuration constants for the test suite
 #define DEFAULT_HEAP_SIZE 8192

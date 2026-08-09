@@ -1,0 +1,9 @@
+# Sources are edited on Windows and built under WSL/Linux; normalise to LF in the
+# repository so the two toolchains see byte-identical files.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+*.so binary
+*.a  binary
