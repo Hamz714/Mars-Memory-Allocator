@@ -1,0 +1,165 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+
+  "configurePresets": [
+    {
+      "name": "_base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "MARS_PROFILE": "hardened"
+      }
+    },
+    {
+      "name": "_linux",
+      "hidden": true,
+      "inherits": "_base",
+      "generator": "Unix Makefiles",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "_windows",
+      "hidden": true,
+      "inherits": "_base",
+      "generator": "MinGW Makefiles",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_MAKE_PROGRAM": "mingw32-make"
+      }
+    },
+
+    {
+      "name": "gcc-debug",
+      "displayName": "gcc / Debug",
+      "inherits": "_linux",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "gcc-release",
+      "displayName": "gcc / Release (canonical -Werror build)",
+      "inherits": "_linux",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_BUILD_TYPE": "Release",
+        "MARS_WERROR": "ON"
+      }
+    },
+    {
+      "name": "gcc-asan-ubsan",
+      "displayName": "gcc / ASan + UBSan",
+      "inherits": "_linux",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MARS_SANITIZE": "address"
+      }
+    },
+    {
+      "name": "gcc-tsan",
+      "displayName": "gcc / ThreadSanitizer",
+      "inherits": "_linux",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MARS_SANITIZE": "thread"
+      }
+    },
+    {
+      "name": "gcc-coverage",
+      "displayName": "gcc / coverage",
+      "inherits": "_linux",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MARS_COVERAGE": "ON"
+      }
+    },
+
+    {
+      "name": "clang-debug",
+      "displayName": "clang / Debug",
+      "inherits": "_linux",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "clang-release",
+      "displayName": "clang / Release",
+      "inherits": "_linux",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "clang-asan-ubsan",
+      "displayName": "clang / ASan + UBSan",
+      "inherits": "_linux",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MARS_SANITIZE": "address"
+      }
+    },
+
+    {
+      "name": "windows-debug",
+      "displayName": "MSYS2 UCRT64 gcc / Debug",
+      "inherits": "_windows",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "windows-release",
+      "displayName": "MSYS2 UCRT64 gcc / Release",
+      "inherits": "_windows",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+
+  "buildPresets": [
+    { "name": "gcc-debug",        "configurePreset": "gcc-debug" },
+    { "name": "gcc-release",      "configurePreset": "gcc-release" },
+    { "name": "gcc-asan-ubsan",   "configurePreset": "gcc-asan-ubsan" },
+    { "name": "gcc-tsan",         "configurePreset": "gcc-tsan" },
+    { "name": "gcc-coverage",     "configurePreset": "gcc-coverage" },
+    { "name": "clang-debug",      "configurePreset": "clang-debug" },
+    { "name": "clang-release",    "configurePreset": "clang-release" },
+    { "name": "clang-asan-ubsan", "configurePreset": "clang-asan-ubsan" },
+    { "name": "windows-debug",    "configurePreset": "windows-debug" },
+    { "name": "windows-release",  "configurePreset": "windows-release" }
+  ],
+
+  "testPresets": [
+    {
+      "name": "_test_base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    { "name": "gcc-debug",        "inherits": "_test_base", "configurePreset": "gcc-debug" },
+    { "name": "gcc-release",      "inherits": "_test_base", "configurePreset": "gcc-release" },
+    { "name": "gcc-asan-ubsan",   "inherits": "_test_base", "configurePreset": "gcc-asan-ubsan" },
+    { "name": "gcc-tsan",         "inherits": "_test_base", "configurePreset": "gcc-tsan" },
+    { "name": "gcc-coverage",     "inherits": "_test_base", "configurePreset": "gcc-coverage" },
+    { "name": "clang-debug",      "inherits": "_test_base", "configurePreset": "clang-debug" },
+    { "name": "clang-release",    "inherits": "_test_base", "configurePreset": "clang-release" },
+    { "name": "clang-asan-ubsan", "inherits": "_test_base", "configurePreset": "clang-asan-ubsan" },
+    { "name": "windows-debug",    "inherits": "_test_base", "configurePreset": "windows-debug" },
+    { "name": "windows-release",  "inherits": "_test_base", "configurePreset": "windows-release" }
+  ]
+}

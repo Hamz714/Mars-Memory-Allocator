@@ -1,0 +1,50 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  # Long fuzzing under instrumentation. Kept out of the per-push workflow so
+  # that CI stays fast; anything this finds is reproducible from the seed it
+  # prints, which is the whole point of seeding the operation stream.
+  soak:
+    name: soak / ${{ matrix.preset }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [gcc-asan-ubsan, gcc-release]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} -- -j$(nproc)
+      - name: Soak
+        run: ./build/${{ matrix.preset }}/bin/fuzz_shadow --seconds 900
+      - name: Soak a small arena
+        run: |
+          ./build/${{ matrix.preset }}/bin/fuzz_shadow --seconds 300 --arena 8192
+      - name: Soak a large arena
+        run: |
+          ./build/${{ matrix.preset }}/bin/fuzz_shadow --seconds 300 --arena 16777216
+
+  valgrind-soak:
+    name: soak / valgrind
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Configure
+        run: cmake --preset gcc-debug
+      - name: Build
+        run: cmake --build --preset gcc-debug -- -j$(nproc)
+      - name: Memcheck a long fuzz run
+        run: |
+          valgrind -q --error-exitcode=1 --leak-check=full \
+                   ./build/gcc-debug/bin/fuzz_shadow --ops 200000
