@@ -64,6 +64,10 @@ typedef struct mm_arena {
   uint8_t *base;
   size_t size;
   mm_header *first;
+  // Space belonging to quarantined blocks. Deliberately never reclaimed, but
+  // tracked, so that the consistency check can tell the difference between
+  // memory that was given up on purpose and memory that has gone missing.
+  size_t lost_bytes;
 } mm_arena;
 
 extern mm_arena g_arena;

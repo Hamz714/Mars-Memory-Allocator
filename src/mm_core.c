@@ -32,6 +32,7 @@ int mm_init(void *heap, size_t heap_size) {
 
   g_arena.base = (uint8_t *)heap;
   g_arena.size = heap_size;
+  g_arena.lost_bytes = 0;
 
   // Clear the arena once, up front. A payload checksum covers the whole
   // payload, including bytes the caller has not written yet, so those bytes

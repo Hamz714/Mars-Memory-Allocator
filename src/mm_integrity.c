@@ -174,6 +174,7 @@ void mm_quarantine(mm_header *block) {
   // Poison the magic so the block can never be mistaken for live again. The
   // space it occupied is deliberately not reclaimed.
   MM_STAT_NOTE(MM_STAT_QUARANTINE, MM_BLOCK_TOTAL(block->size));
+  g_arena.lost_bytes += MM_BLOCK_TOTAL(block->size);
   block->magic = 0xDEADDEADu;
   mm_fail(MM_ERR_QUARANTINED);
 }
@@ -263,8 +264,11 @@ mm_status_t mm_check_heap(void) {
     prev = b;
   }
 
-  // The blocks must tile the arena exactly, modulo the tail too small to hold
-  // one more block.
+  // The blocks must tile the arena exactly, once the space surrendered to
+  // quarantine is accounted for, modulo a tail too small to hold one more
+  // block. Anything else means space has gone missing rather than been given
+  // up deliberately.
+  covered += g_arena.lost_bytes;
   if (covered > g_arena.size) return mm_fail(MM_ERR_CORRUPT_LINKS);
   if (g_arena.size - covered >= MM_BLOCK_TOTAL(MM_MIN_BLOCK_SIZE)) {
     return mm_fail(MM_ERR_CORRUPT_LINKS);

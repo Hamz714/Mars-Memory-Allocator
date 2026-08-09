@@ -233,6 +233,28 @@ if(MARS_BUILD_BENCH)
 endif()
 
 # ---------------------------------------------------------------------------
+# Fault injection
+# ---------------------------------------------------------------------------
+
+# Forks a child per trial so that a crashing or hanging trial is recorded as a
+# result rather than ending the run. That makes it Unix-only.
+if(UNIX)
+  add_executable(faultinject tools/faultinject/fi_main.c)
+  target_link_libraries(faultinject PRIVATE mars mars_flags mars_flags_strict m)
+  target_include_directories(faultinject
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  set_target_properties(faultinject PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+
+  if(BUILD_TESTING)
+    add_test(NAME faultinject_smoke
+             COMMAND faultinject --trials 25 --bits 1 --target alloc_hdr)
+    set_tests_properties(faultinject_smoke PROPERTIES TIMEOUT 300)
+  endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
