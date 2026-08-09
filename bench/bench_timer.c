@@ -1,3 +1,10 @@
+// clock_gettime and CLOCK_MONOTONIC are POSIX, not ISO C, and the project
+// compiles as strict c11 -- so they have to be asked for explicitly, before
+// any header is pulled in.
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "bench_timer.h"
 
 #include <stdio.h>

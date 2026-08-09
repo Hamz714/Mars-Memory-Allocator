@@ -308,6 +308,41 @@ MM_TEST(regression, corrupt_successor_is_dropped_not_written_through) {
   free(heap);
 }
 
+// Space the allocator gives up must be counted. Truncating the block list at a
+// damaged neighbour abandons everything beyond it, and an abandonment that is
+// not recorded is indistinguishable from a heap that lost nothing -- which is
+// how a fault-injection run came to report a heap that had shed most of itself
+// as having survived intact.
+MM_TEST(regression, abandoned_space_is_accounted_for) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  CHECK_EQ(g_arena.lost_bytes, 0);
+
+  void *a = mm_malloc(256);
+  void *b = mm_malloc(256);
+  void *c = mm_malloc(256);
+  REQUIRE_NOT_NULL(a);
+  REQUIRE_NOT_NULL(b);
+  REQUIRE_NOT_NULL(c);
+
+  mm_free(b);
+
+  // Damage c so that freeing a, which merges forward into b, then runs into a
+  // neighbour it cannot trust.
+  mm_header *hc = (mm_header *)(void *)((uint8_t *)c - MM_PREFIX);
+  hc->size ^= 0x20;
+
+  mm_free(a);
+  CHECK_EQ(mm_last_error(), MM_ERR_CORRUPT_LINKS);
+
+  // Whatever was given up has to show up in the ledger.
+  CHECK_GT(g_arena.lost_bytes, 0);
+  CHECK_LE(g_arena.lost_bytes, ARENA_SIZE);
+
+  free(heap);
+}
+
 // A corrupted link must not send a traversal into an unbounded loop. Writing a
 // block's own address into its next pointer is the minimal way to produce one.
 //

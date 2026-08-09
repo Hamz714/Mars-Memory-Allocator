@@ -104,6 +104,15 @@ static void coalesce_forward(mm_header *block);
 static void relink_prev(mm_header *owner, mm_header *node) {
   if (node == NULL) return;
   if (!mm_checksum_ok(node) || !mm_footer_ok(node)) {
+    // The list has to stop here: the damaged node's own size and links are
+    // what would say where the next block begins, and neither can be trusted.
+    // Everything from this point to the end of the arena becomes unreachable,
+    // so account for all of it -- a truncation that is not counted looks
+    // exactly like a heap that lost nothing.
+    size_t offset = (size_t)((uint8_t *)node - g_arena.base);
+    if (offset < g_arena.size) {
+      g_arena.lost_bytes += g_arena.size - offset;
+    }
     owner->next = NULL;
     mm_seal(owner);
     mm_fail(MM_ERR_CORRUPT_LINKS);

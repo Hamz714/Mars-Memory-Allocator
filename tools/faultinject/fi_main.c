@@ -208,8 +208,11 @@ static void run_child(uint64_t seed, target_t target, int bits) {
   // different outcome from one that cannot allocate at all.
   int usable = (mm_malloc(64) != NULL);
 
-  mm_stats_t st;
-  mm_stats_get(&st);
+  // Ask the arena what it gave up, not the counters: space abandoned by
+  // truncating the list is lost just as surely as a quarantined block, and
+  // counting only quarantines would report a heap that shed most of itself as
+  // having lost nothing.
+  size_t lost = g_arena.lost_bytes;
 
   if (silent) _exit(OUT_UNDETECTED_SILENT);
   if (!detected && !mismatch) _exit(OUT_UNDETECTED_BENIGN);
@@ -218,7 +221,7 @@ static void run_child(uint64_t seed, target_t target, int bits) {
   // bucket means the damage was noticed and cost nothing -- the allocator kept
   // working and surrendered no memory. A genuine repair outcome only becomes
   // reachable once a profile carries enough redundancy to rebuild a header.
-  if (st.quarantined_blocks > 0) _exit(OUT_DETECTED_QUARANTINED);
+  if (lost > 0) _exit(OUT_DETECTED_QUARANTINED);
   _exit(OUT_DETECTED_NO_LOSS);
 }
 
