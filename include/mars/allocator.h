@@ -119,6 +119,10 @@ typedef struct mm_stats {
 
   uint64_t quarantined_blocks;
   size_t quarantined_bytes;
+
+  // Blocks whose metadata was rebuilt from its mirror rather than surrendered.
+  uint64_t repaired_blocks;
+  size_t repaired_bytes;
 } mm_stats_t;
 
 void mm_stats_get(mm_stats_t *out);

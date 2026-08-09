@@ -171,12 +171,123 @@ void mm_quarantine(mm_header *block) {
     g_arena.first = next_ok ? next : NULL;
   }
 
-  // Poison the magic so the block can never be mistaken for live again. The
-  // space it occupied is deliberately not reclaimed.
+  // Poison both copies of the metadata so the block can never be mistaken for
+  // live again. Poisoning only the header would leave the mirror intact, and
+  // the recovery path would faithfully rebuild the block from it -- bringing
+  // back to life the very block that was just given up on.
   MM_STAT_NOTE(MM_STAT_QUARANTINE, MM_BLOCK_TOTAL(block->size));
   g_arena.lost_bytes += MM_BLOCK_TOTAL(block->size);
+  if (mm_is_block(block)) mm_footer_of(block)->magic = 0xDEADDEADu;
   block->magic = 0xDEADDEADu;
   mm_fail(MM_ERR_QUARANTINED);
+}
+
+// --- Block recovery --------------------------------------------------------
+
+// Could a block starting at `start` and carrying `n` bytes between its header
+// and footer have left an intact footer where one ought to be?
+//
+// The size the candidate carries must be the size that puts it at this
+// address. That is what ties a candidate to its position: without it, any
+// forty-eight bytes that happened to checksum would be accepted.
+static bool footer_fits(const uint8_t *start, size_t n) {
+  if (n < MM_MIN_BLOCK_SIZE || n % MM_ALIGNMENT != 0) return false;
+  if (!mm_in_arena(start, MM_BLOCK_TOTAL(n))) return false;
+
+  const mm_footer *f =
+      (const mm_footer *)(const void *)(start + sizeof(mm_header) + n);
+  if (f->magic != MM_HEADER_MAGIC) return false;
+  if (f->size != n) return false;
+  return f->checksum == mm_checksum(f);
+}
+
+// Blocks tile the arena, so whatever sits after a block of this extent must be
+// either the end of the arena or another intact block. That tiling is the
+// structural redundancy which makes a recovered size trustworthy rather than
+// merely plausible.
+static bool tiling_agrees(const uint8_t *start, size_t n) {
+  const uint8_t *after = start + MM_BLOCK_TOTAL(n);
+  if (!mm_in_arena(after, 0)) return false;
+
+  size_t offset = (size_t)(after - g_arena.base);
+  if (g_arena.size - offset < MM_BLOCK_TOTAL(MM_MIN_BLOCK_SIZE)) {
+    return true;  // nothing more fits: this was the last block
+  }
+  return mm_checksum_ok((const mm_header *)(const void *)after);
+}
+
+// How far either search will walk, in MM_ALIGNMENT steps. Recovery runs only
+// on the damage path, but it must still terminate promptly on a large arena --
+// every other traversal here is bounded and this one is no exception. The cost
+// is that a damaged block larger than this many steps cannot be rebuilt.
+#define MM_RECOVERY_STEPS 65536u
+
+mm_header *mm_recover_next(mm_header *owner, size_t *lost) {
+  *lost = 0;
+
+  uint8_t *start = (uint8_t *)owner + MM_BLOCK_TOTAL(owner->size);
+  if (!mm_in_arena(start, 0)) return NULL;
+
+  size_t offset = (size_t)(start - g_arena.base);
+  size_t room = g_arena.size - offset;
+  if (room < MM_BLOCK_TOTAL(MM_MIN_BLOCK_SIZE)) return NULL;
+
+  mm_header *cand = (mm_header *)(void *)start;
+
+  // Intact header. If only the mirror has drifted, republish it from the
+  // header and carry on -- the cheap half of the repair.
+  if (mm_checksum_ok(cand)) {
+    if (!mm_footer_ok(cand)) {
+      mm_seal(cand);
+      MM_STAT_NOTE(MM_STAT_REPAIR, 0);
+      mm_fail(MM_ERR_CORRUPT_HEADER);
+    }
+    return cand;
+  }
+
+  // The header is unusable, so its extent has to come from the mirror. The
+  // mirror's position depends on the very size that was lost, so look for it
+  // rather than trusting a field to say where it is.
+  size_t steps = 0;
+  for (size_t n = MM_MIN_BLOCK_SIZE;
+       MM_BLOCK_TOTAL(n) <= room && steps < MM_RECOVERY_STEPS;
+       n += MM_ALIGNMENT, steps++) {
+    if (!footer_fits(start, n)) continue;
+    if (!tiling_agrees(start, n)) continue;
+
+    const mm_footer *f =
+        (const mm_footer *)(const void *)(start + sizeof(mm_header) + n);
+    *cand = *f;          // the footer is the header, mirrored
+    cand->prev = owner;  // known for certain: owner is trusted
+    mm_seal(cand);
+
+    MM_STAT_NOTE(MM_STAT_REPAIR, MM_BLOCK_TOTAL(n));
+    mm_fail(MM_ERR_CORRUPT_HEADER);
+    return cand;
+  }
+
+  // Nothing here can be rebuilt. Rather than abandon everything downstream,
+  // walk forward for the next block that still stands up on its own and give
+  // up only the span in between. A footer read as a header is caught by
+  // requiring the mirror to agree, since a real footer's own size field points
+  // nowhere useful.
+  steps = 0;
+  for (size_t skip = MM_ALIGNMENT;
+       skip + MM_BLOCK_TOTAL(MM_MIN_BLOCK_SIZE) <= room &&
+       steps < MM_RECOVERY_STEPS;
+       skip += MM_ALIGNMENT, steps++) {
+    mm_header *resync = (mm_header *)(void *)(start + skip);
+    if (!mm_checksum_ok(resync) || !mm_footer_ok(resync)) continue;
+    if (!tiling_agrees(start + skip, resync->size)) continue;
+
+    *lost = skip;
+    resync->prev = owner;
+    mm_seal(resync);
+    return resync;
+  }
+
+  *lost = room;
+  return NULL;
 }
 
 // --- Pointer recovery ------------------------------------------------------

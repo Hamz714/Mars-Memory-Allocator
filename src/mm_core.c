@@ -102,24 +102,24 @@ static void coalesce_forward(mm_header *block);
 // scatters writes across the arena. Drop such a node from the list instead --
 // the space it held is lost, which is the price of not trusting it.
 static void relink_prev(mm_header *owner, mm_header *node) {
-  if (node == NULL) return;
-  if (!mm_checksum_ok(node) || !mm_footer_ok(node)) {
-    // The list has to stop here: the damaged node's own size and links are
-    // what would say where the next block begins, and neither can be trusted.
-    // Everything from this point to the end of the arena becomes unreachable,
-    // so account for all of it -- a truncation that is not counted looks
-    // exactly like a heap that lost nothing.
-    size_t offset = (size_t)((uint8_t *)node - g_arena.base);
-    if (offset < g_arena.size) {
-      g_arena.lost_bytes += g_arena.size - offset;
-    }
-    owner->next = NULL;
-    mm_seal(owner);
+  // `node` is deliberately ignored in favour of geometry. Blocks tile the
+  // arena, so where the next one begins follows from `owner` alone, and owner
+  // has just been sealed. A stored link is one more thing that can be wrong.
+  (void)node;
+
+  size_t lost = 0;
+  mm_header *next = mm_recover_next(owner, &lost);
+  if (lost > 0) {
+    g_arena.lost_bytes += lost;
     mm_fail(MM_ERR_CORRUPT_LINKS);
-    return;
   }
-  node->prev = owner;
-  mm_seal(node);
+
+  owner->next = next;
+  mm_seal(owner);
+  if (next != NULL) {
+    next->prev = owner;
+    mm_seal(next);
+  }
 }
 
 // Splits `block` so it holds exactly `need`, provided the remainder is worth

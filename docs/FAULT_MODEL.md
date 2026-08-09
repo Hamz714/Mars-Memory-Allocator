@@ -23,11 +23,12 @@ impressive.
 - **This is not radiation hardening.** Real hardening is ECC memory, redundant
   hardware, and physical shielding. Nothing in software can stop a bit
   flipping; this can only notice afterwards.
-- **There is no repair.** Damage is detected and the affected block is
-  isolated. The memory it occupied is given up permanently. A profile carrying
-  enough redundancy to rebuild a header could repair instead — that is a design
-  direction, not a current property, and the outcome bucket is named
-  `detected_no_loss` rather than "recovered" so this is not implied.
+- **Repair is limited to metadata, and only while one copy survives.** A
+  damaged header is rebuilt from its mirrored footer, and a damaged footer is
+  republished from its header. Nothing reconstructs a payload: if the flip
+  landed in user data, the payload checksum reports it and the data is gone.
+  When both copies of the metadata are destroyed the block cannot be rebuilt
+  at all, and it is surrendered.
 - **Read-after-write verification would not be brownout protection.** An
   earlier version of this allocator wrote each metadata field, read it back,
   and retried up to three times, describing this as protection against power
@@ -51,12 +52,43 @@ impressive.
 | End of payload | 8-byte canary | every access, free, resize |
 | List topology | neighbour cross-checks, adjacency, exact tiling of the arena | `mm_check_heap` |
 
-A block whose metadata fails validation is unlinked and its magic poisoned so
-it can never be mistaken for live again. A neighbour that fails validation is
-never *written through* — a block's size field decides where its footer lands,
-so sealing a corrupted neighbour would scatter writes across the arena. The
-space surrendered this way is counted, so the consistency check can tell
-deliberate loss from memory that has genuinely gone missing.
+A neighbour that fails validation is never *written through* — a block's size
+field decides where its footer lands, so sealing a corrupted neighbour would
+scatter writes across the arena. Space surrendered is counted, so the
+consistency check can tell deliberate loss from memory that has genuinely gone
+missing.
+
+## Rebuilding a damaged block
+
+Blocks tile the arena in address order, which means a damaged block's **start**
+is known from its predecessor even when its own header is unreadable. Only its
+extent is missing — and the mirrored footer still records that.
+
+The difficulty is that the footer's position is derived from the very size that
+was lost, so it cannot simply be looked up. It is searched for instead: step a
+candidate position outwards and accept one only when
+
+- the magic and checksum both hold, **and**
+- the size the candidate carries is exactly the size that would place it at
+  that address, **and**
+- whatever follows the block it describes is either the end of the arena or
+  another intact block.
+
+The second condition ties a candidate to its position, so that forty-eight
+bytes which merely happen to checksum are not enough. The third uses the tiling
+itself as redundancy. A test plants a perfectly-formed decoy footer nearer the
+start than the real one — correct magic, correct checksum over its own fields —
+and requires that it be refused. **A wrong repair is worse than no repair:** it
+would hand back a block of the wrong extent overlapping a live neighbour.
+
+When nothing can be rebuilt, the walk resynchronises on the next block that
+stands up on its own and gives up only the span in between. Truncating the list
+instead would cost the entire remainder of the arena — measured at 99.8% of it
+for a single flipped bit, before this was addressed.
+
+Quarantine poisons **both** copies of a block's metadata. Poisoning only the
+header would leave the mirror intact for the recovery path to faithfully
+rebuild, bringing back the very block that was just given up on.
 
 ## Outcome taxonomy
 
@@ -64,7 +96,7 @@ Every trial lands in exactly one bucket:
 
 | Outcome | Meaning |
 |---|---|
-| `detected_no_loss` | flagged; the allocator kept working and gave up nothing |
+| `detected_no_loss` | flagged; the block was rebuilt or the damage cost nothing, and the allocator gave up no memory |
 | `detected_quarantined` | flagged; a block was isolated and its space surrendered |
 | `detected_fatal` | flagged, but the allocator could no longer serve requests |
 | `undetected_benign` | not flagged, and nothing was wrong — the flip landed in slack, padding, or free space |

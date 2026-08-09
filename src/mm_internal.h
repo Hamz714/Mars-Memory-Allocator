@@ -123,6 +123,15 @@ void mm_seal(mm_header *block);
 // Unlinks a block whose metadata can no longer be trusted.
 void mm_quarantine(mm_header *block);
 
+// Produces the block that should follow `owner`, whose metadata is trusted.
+//
+// Blocks tile the arena, so the following block's address is known even when
+// its header is not. A header that cannot be trusted is rebuilt from its
+// mirrored footer where that footer can be located and corroborated; where it
+// cannot, the walk resynchronises on the next intact block. Any span that had
+// to be abandoned is reported through `lost` rather than silently dropped.
+mm_header *mm_recover_next(mm_header *owner, size_t *lost);
+
 // Recovers a block header from a payload pointer, validating as it goes.
 // Returns NULL and sets the thread status if the pointer is not ours.
 mm_header *mm_block_of(const void *ptr);
@@ -138,7 +147,8 @@ typedef enum mm_stats_event {
   MM_STAT_ALLOC_FAILED,
   MM_STAT_FREE,
   MM_STAT_REALLOC,
-  MM_STAT_QUARANTINE
+  MM_STAT_QUARANTINE,
+  MM_STAT_REPAIR
 } mm_stats_event_t;
 
 #ifdef MM_STATS

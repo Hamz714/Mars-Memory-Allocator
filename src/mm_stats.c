@@ -52,6 +52,10 @@ void mm_stats_note(mm_stats_event_t event, size_t bytes) {
       g_stats.quarantined_blocks++;
       g_stats.quarantined_bytes += bytes;
       break;
+    case MM_STAT_REPAIR:
+      g_stats.repaired_blocks++;
+      g_stats.repaired_bytes += bytes;
+      break;
   }
 }
 
