@@ -32,6 +32,28 @@ jobs:
         run: |
           ./build/${{ matrix.preset }}/bin/fuzz_shadow --seconds 300 --arena 16777216
 
+  # The statistically meaningful run: enough trials that a rate carries a
+  # confidence interval worth quoting.
+  fault-sweep:
+    name: fault sweep
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake --preset gcc-release
+      - name: Build
+        run: cmake --build --preset gcc-release -- -j$(nproc)
+      - name: Sweep
+        run: |
+          ./build/gcc-release/bin/faultinject \
+            --trials 10000 --bits 1,2,4,8 --csv faults-full.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fault-sweep
+          path: faults-full.csv
+
   valgrind-soak:
     name: soak / valgrind
     runs-on: ubuntu-22.04
