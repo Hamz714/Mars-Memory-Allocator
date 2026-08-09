@@ -10,6 +10,8 @@ project(mars_allocator
 # ---------------------------------------------------------------------------
 
 option(MARS_WERROR   "Treat compiler warnings as errors"        OFF)
+option(MARS_STATS    "Compile in allocation counters"           ON)
+option(MARS_BUILD_BENCH "Build the benchmark harness"           ON)
 option(MARS_COVERAGE "Instrument for gcov/lcov coverage"        OFF)
 
 # Integrity profile. Selects the block layout and how much validation is done.
@@ -115,7 +117,8 @@ endif()
 add_library(mars ${MARS_LIB_TYPE}
   src/mm_core.c
   src/mm_integrity.c
-  src/mm_access.c)
+  src/mm_access.c
+  src/mm_stats.c)
 
 add_library(mars::mars ALIAS mars)
 
@@ -127,6 +130,10 @@ target_include_directories(mars
 target_link_libraries(mars
   PUBLIC  mars_flags
   PRIVATE mars_flags_strict)
+
+if(MARS_STATS)
+  target_compile_definitions(mars PUBLIC MM_STATS=1)
+endif()
 
 set_target_properties(mars PROPERTIES
   C_STANDARD 11
@@ -187,6 +194,45 @@ if(BUILD_TESTING)
 endif()
 
 # ---------------------------------------------------------------------------
+# Benchmarks
+# ---------------------------------------------------------------------------
+
+if(MARS_BUILD_BENCH)
+  add_executable(bench
+    bench/bench_main.c
+    bench/bench_timer.c
+    bench/workloads.c)
+  target_link_libraries(bench PRIVATE mars mars_flags mars_flags_strict)
+  target_include_directories(bench
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  set_target_properties(bench PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+
+  # The histogram decides every percentile that gets reported, so it is tested
+  # on its own rather than trusted because the benchmark runs.
+  if(BUILD_TESTING)
+    add_executable(test_bench_hist tests/test_bench_hist.c bench/bench_timer.c)
+    target_link_libraries(test_bench_hist PRIVATE mars_test mars_flags
+                                                  mars_flags_strict)
+    target_include_directories(test_bench_hist
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    set_target_properties(test_bench_hist PROPERTIES
+      C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    add_test(NAME test_bench_hist COMMAND test_bench_hist)
+    set_tests_properties(test_bench_hist PROPERTIES TIMEOUT 60)
+  endif()
+
+  # A tiny run, purely to catch the harness breaking. Real measurements are
+  # taken deliberately, not as a side effect of running the tests.
+  if(BUILD_TESTING)
+    add_test(NAME bench_smoke
+             COMMAND bench --ops 2000 --reps 1 --arena 4194304 --quiet)
+    set_tests_properties(bench_smoke PROPERTIES TIMEOUT 300)
+  endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
@@ -197,3 +243,4 @@ message(STATUS "  profile    : ${MARS_PROFILE}")
 message(STATUS "  sanitizer  : ${MARS_SANITIZE}")
 message(STATUS "  coverage   : ${MARS_COVERAGE}")
 message(STATUS "  warn=error : ${MARS_WERROR}")
+message(STATUS "  counters   : ${MARS_STATS}")
