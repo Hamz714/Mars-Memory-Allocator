@@ -127,4 +127,28 @@ mm_header *mm_block_of(const void *ptr);
 // that a corrupted link cannot produce an unbounded loop.
 size_t mm_max_blocks(void);
 
+// --- Counters (mm_stats.c) -------------------------------------------------
+
+typedef enum mm_stats_event {
+  MM_STAT_ALLOC,
+  MM_STAT_ALLOC_FAILED,
+  MM_STAT_FREE,
+  MM_STAT_REALLOC,
+  MM_STAT_QUARANTINE
+} mm_stats_event_t;
+
+#ifdef MM_STATS
+void mm_stats_block_added(const mm_header *block);
+void mm_stats_block_removed(const mm_header *block);
+void mm_stats_note(mm_stats_event_t event, size_t bytes);
+#  define MM_STAT_ADD(b) mm_stats_block_added(b)
+#  define MM_STAT_SUB(b) mm_stats_block_removed(b)
+#  define MM_STAT_NOTE(e, n) mm_stats_note((e), (n))
+#else
+// Compiled away completely, so the fast path carries no trace of them.
+#  define MM_STAT_ADD(b) ((void)0)
+#  define MM_STAT_SUB(b) ((void)0)
+#  define MM_STAT_NOTE(e, n) ((void)0)
+#endif
+
 #endif  // MARS_MM_INTERNAL_H_

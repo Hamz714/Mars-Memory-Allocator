@@ -173,6 +173,7 @@ void mm_quarantine(mm_header *block) {
 
   // Poison the magic so the block can never be mistaken for live again. The
   // space it occupied is deliberately not reclaimed.
+  MM_STAT_NOTE(MM_STAT_QUARANTINE, MM_BLOCK_TOTAL(block->size));
   block->magic = 0xDEADDEADu;
   mm_fail(MM_ERR_QUARANTINED);
 }

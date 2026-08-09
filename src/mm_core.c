@@ -165,6 +165,7 @@ void *mm_malloc(size_t size) {
 
   mm_header *block = find_best_fit(need);
   if (block == NULL) {
+    MM_STAT_NOTE(MM_STAT_ALLOC_FAILED, 0);
     mm_fail(MM_ERR_NOMEM);
     return NULL;
   }
@@ -187,6 +188,8 @@ void *mm_malloc(size_t size) {
   block->payload_checksum = 0;
   mm_seal(block);
 
+  MM_STAT_NOTE(MM_STAT_ALLOC, size);
+  MM_STAT_ADD(block);
   return payload;
 }
 
@@ -226,6 +229,9 @@ void mm_free(void *ptr) {
     mm_quarantine(block);
     return;
   }
+
+  MM_STAT_NOTE(MM_STAT_FREE, block->requested_size);
+  MM_STAT_SUB(block);
 
   block->in_use = 0;
   block->requested_size = 0;
@@ -295,17 +301,21 @@ void *mm_realloc(void *ptr, size_t new_size) {
     return NULL;
   }
 
+  MM_STAT_NOTE(MM_STAT_REALLOC, new_size);
+
   size_t old_size = block->requested_size;
   uint32_t old_sum = block->payload_checksum;
   uint8_t *payload = mm_payload_of(block);
 
   // Already big enough: shrink in place, handing back any surplus.
   if (block->size >= need) {
+    MM_STAT_SUB(block);
     split_block(block, need);
     block->requested_size = new_size;
     mm_write_canary(block);
     carry_payload_checksum(block, old_size, old_sum, new_size);
     mm_seal(block);
+    MM_STAT_ADD(block);
     return payload;
   }
 
@@ -314,12 +324,14 @@ void *mm_realloc(void *ptr, size_t new_size) {
   if (next != NULL && !next->in_use && mm_checksum_ok(next) &&
       mm_footer_ok(next) && mm_next_adjacent(block) == next &&
       next->prev == block && block->size + MM_BLOCK_TOTAL(next->size) >= need) {
+    MM_STAT_SUB(block);
     coalesce_forward(block);
     split_block(block, need);
     block->requested_size = new_size;
     mm_write_canary(block);
     carry_payload_checksum(block, old_size, old_sum, new_size);
     mm_seal(block);
+    MM_STAT_ADD(block);
     return payload;
   }
 
