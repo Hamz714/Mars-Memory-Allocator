@@ -62,9 +62,6 @@ static inline uint64_t mm_block_index(const mm_block *b) {
                     MM_ALIGNMENT);
 }
 
-// True if `p` points at `span` bytes lying wholly inside the tiled region.
-bool mm_in_arena(const void *p, size_t span);
-
 // True if `b` could be a block header: aligned to the tiling, inside the
 // arena, carrying a sane extent that does not run past the end.
 bool mm_is_block(const mm_block *b);

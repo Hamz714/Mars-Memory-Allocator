@@ -382,6 +382,85 @@ MM_TEST(integrity, a_damaged_boundary_tag_is_reported) {
   free(heap);
 }
 
+// mm_check_heap walks the tiling and then holds the free list up against it.
+// Each of the three ways they can disagree has to be caught, or the check is
+// only pretending to cross-check them.
+MM_TEST(integrity, the_heap_check_catches_every_way_the_list_can_disagree) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+
+  // 1. Two free blocks side by side: a coalesce was missed. Forge it by
+  //    marking an allocated block free by hand, which the merge path would
+  //    never leave behind.
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  {
+    void *a = mm_malloc(256);
+    void *b = mm_malloc(256);
+    void *c = mm_malloc(256);
+    REQUIRE_NOT_NULL(a);
+    REQUIRE_NOT_NULL(b);
+    REQUIRE_NOT_NULL(c);
+    mm_free(a);
+
+    mm_block *hb = mm_block_of(b);
+    REQUIRE_NOT_NULL(hb);
+    mm_set_word(hb, mm_block_size(hb), 0, false, false);
+    mm_write_free_footer(hb);
+    mm_seal(hb);
+
+    CHECK_EQ(mm_check_heap(), MM_ERR_CORRUPT_LINKS);
+  }
+
+  // 2. A free block the list does not know about. The tiling says three, the
+  //    list says two.
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  {
+    void *p[5];
+    for (int i = 0; i < 5; i++) {
+      p[i] = mm_malloc(256);
+      REQUIRE_NOT_NULL(p[i]);
+    }
+    mm_free(p[1]);
+    mm_free(p[3]);
+    REQUIRE_EQ(mm_check_heap(), MM_OK);
+
+    // Unhook the head without touching the tiling.
+    mm_block *head = g_arena.free_head;
+    REQUIRE_NOT_NULL(head);
+    mm_block *next =
+        (mm_block *)mm_free_link_get(head, MM_LINK_NEXT, g_arena.secret);
+    REQUIRE_NOT_NULL(next);
+    mm_free_link_set(next, MM_LINK_PREV, NULL, g_arena.secret);
+    g_arena.free_head = next;
+
+    CHECK_EQ(mm_check_heap(), MM_ERR_CORRUPT_LINKS);
+  }
+
+  // 3. A back-link that does not point where it came from.
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  {
+    void *p[5];
+    for (int i = 0; i < 5; i++) {
+      p[i] = mm_malloc(256);
+      REQUIRE_NOT_NULL(p[i]);
+    }
+    mm_free(p[1]);
+    mm_free(p[3]);
+    REQUIRE_EQ(mm_check_heap(), MM_OK);
+
+    mm_block *head = g_arena.free_head;
+    REQUIRE_NOT_NULL(head);
+    mm_block *next =
+        (mm_block *)mm_free_link_get(head, MM_LINK_NEXT, g_arena.secret);
+    REQUIRE_NOT_NULL(next);
+    mm_free_link_set(next, MM_LINK_PREV, next, g_arena.secret);
+
+    CHECK_EQ(mm_check_heap(), MM_ERR_CORRUPT_LINKS);
+  }
+
+  free(heap);
+}
+
 MM_TEST(integrity, a_scrambled_free_list_is_rebuilt_from_the_tiling) {
   uint8_t *heap = arena_new(ARENA_SIZE);
   REQUIRE_NOT_NULL(heap);

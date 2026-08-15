@@ -96,6 +96,74 @@ MM_TEST(layout, payloads_are_aligned_whatever_the_header_size_is) {
   free(heap);
 }
 
+// A payload pointer is turned back into a header by subtracting a compile-time
+// constant, so everything that makes that subtraction legal has to be checked
+// before it happens: an arena, a pointer inside it, and the right alignment.
+MM_TEST(layout, a_pointer_is_only_a_block_if_the_geometry_says_so) {
+  memset(&g_arena, 0, sizeof(g_arena));
+  uint8_t stack_byte = 0;
+  CHECK_EQ(mm_verify(&stack_byte), MM_ERR_NOT_INITIALIZED);
+
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *p = mm_malloc(128);
+  REQUIRE_NOT_NULL(p);
+
+  // Inside the arena, but not on a payload boundary: the header cannot be
+  // where subtracting MM_HDR_SIZE would put it.
+  CHECK_EQ(mm_verify((uint8_t *)p + 1), MM_ERR_INVALID_PTR);
+  CHECK_EQ(mm_verify((uint8_t *)p + MM_ALIGNMENT / 2), MM_ERR_INVALID_PTR);
+  // Below the first payload, and past the end of the tiling.
+  CHECK_EQ(mm_verify(g_arena.lo), MM_ERR_INVALID_PTR);
+  CHECK_EQ(mm_verify(g_arena.hi), MM_ERR_INVALID_PTR);
+  // Correctly aligned and inside the arena, but landing mid-payload rather
+  // than on a block: only the checksum can tell, and under `fast` there is
+  // none, so this is asserted only where it is true.
+#if MM_HAS_CRC
+  CHECK_NE(mm_verify((uint8_t *)p + MM_ALIGNMENT), MM_OK);
+#endif
+
+  // And the real pointer still works after all that.
+  CHECK_EQ(mm_verify(p), MM_OK);
+  mm_free(p);
+  free(heap);
+}
+
+#if MM_HAS_CRC
+// Two arenas with different secrets must not agree on a checksum, or the
+// secret is not doing the job of separating one arena's metadata from
+// another's. Pinning it is also how the fault injector replays a trial.
+MM_TEST(layout, the_arena_secret_changes_what_a_header_checksums_to) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+
+  uint32_t crc[2];
+  const uint64_t secrets[2] = {0x1111111111111111ULL, 0x2222222222222222ULL};
+  for (int i = 0; i < 2; i++) {
+    mm_pin_secret(secrets[i]);
+    REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+    CHECK_EQ(g_arena.secret, secrets[i]);
+    void *p = mm_malloc(128);
+    REQUIRE_NOT_NULL(p);
+    mm_block *b = mm_block_of(p);
+    REQUIRE_NOT_NULL(b);
+    crc[i] = b->hdr_crc;
+    mm_free(p);
+  }
+  CHECK_NE(crc[0], crc[1]);
+
+  // Back to drawing one per arena, which is the shipped behaviour.
+  mm_pin_secret(0);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  CHECK_NE(g_arena.secret, 0);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  free(heap);
+}
+#endif  // MM_HAS_CRC
+
 // --- requested_size round trip ---------------------------------------------
 
 // Storing only the slack is worth nothing if the exact request cannot be got

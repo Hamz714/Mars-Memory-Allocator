@@ -41,14 +41,6 @@ size_t mm_metadata_overhead(void) { return MM_HDR_SIZE + MM_TRAIL; }
 
 // --- Bounds ----------------------------------------------------------------
 
-bool mm_in_arena(const void *p, size_t span) {
-  if (g_arena.lo == NULL || p == NULL) return false;
-  const uint8_t *q = (const uint8_t *)p;
-  if (q < g_arena.lo || q > g_arena.hi) return false;
-  // Compare as an offset so the arithmetic cannot run past the arena.
-  return span <= (size_t)(g_arena.hi - q);
-}
-
 bool mm_is_block(const mm_block *b) {
   if (g_arena.lo == NULL || b == NULL) return false;
   const uint8_t *p = (const uint8_t *)(const void *)b;
