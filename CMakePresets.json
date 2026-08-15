@@ -58,6 +58,18 @@
       }
     },
     {
+      "name": "gcc-debug-fast",
+      "displayName": "gcc / Debug, fast profile",
+      "inherits": "gcc-debug",
+      "cacheVariables": { "MARS_PROFILE": "fast" }
+    },
+    {
+      "name": "gcc-debug-paranoid",
+      "displayName": "gcc / Debug, paranoid profile",
+      "inherits": "gcc-debug",
+      "cacheVariables": { "MARS_PROFILE": "paranoid" }
+    },
+    {
       "name": "gcc-fast",
       "displayName": "gcc / Release, fast profile (8 B header, no checksum)",
       "inherits": "gcc-release",
@@ -158,6 +170,8 @@
   "buildPresets": [
     { "name": "gcc-debug",        "configurePreset": "gcc-debug" },
     { "name": "gcc-release",      "configurePreset": "gcc-release" },
+    { "name": "gcc-debug-fast",   "configurePreset": "gcc-debug-fast" },
+    { "name": "gcc-debug-paranoid","configurePreset": "gcc-debug-paranoid" },
     { "name": "gcc-fast",         "configurePreset": "gcc-fast" },
     { "name": "gcc-paranoid",     "configurePreset": "gcc-paranoid" },
     { "name": "gcc-asan-ubsan",   "configurePreset": "gcc-asan-ubsan" },
@@ -181,6 +195,8 @@
     },
     { "name": "gcc-debug",        "inherits": "_test_base", "configurePreset": "gcc-debug" },
     { "name": "gcc-release",      "inherits": "_test_base", "configurePreset": "gcc-release" },
+    { "name": "gcc-debug-fast",   "inherits": "_test_base", "configurePreset": "gcc-debug-fast" },
+    { "name": "gcc-debug-paranoid","inherits": "_test_base", "configurePreset": "gcc-debug-paranoid" },
     { "name": "gcc-fast",         "inherits": "_test_base", "configurePreset": "gcc-fast" },
     { "name": "gcc-paranoid",     "inherits": "_test_base", "configurePreset": "gcc-paranoid" },
     { "name": "gcc-asan-ubsan",   "inherits": "_test_base", "configurePreset": "gcc-asan-ubsan" },
