@@ -35,315 +35,412 @@ const char *mm_strerror(mm_status_t status) {
   return "unknown status";
 }
 
-// --- Checksums -------------------------------------------------------------
+const char *mm_profile(void) { return MM_PROFILE_NAME; }
 
-// FNV-1a over a byte range. Not cryptographic, and not the CRC32C the layout
-// work will bring in -- but it is order-sensitive and mixes every input byte,
-// which is what detection needs here.
-static uint32_t fnv1a(const void *data, size_t len, uint32_t seed) {
-  const uint8_t *p = (const uint8_t *)data;
-  uint32_t h = seed;
-  for (size_t i = 0; i < len; i++) {
-    h ^= p[i];
-    h *= 0x01000193u;
-  }
-  return h;
-}
-
-// Covers every header field except the two checksums themselves. Copying the
-// fields into a local keeps this independent of struct padding, which is not
-// guaranteed to be initialised.
-uint32_t mm_checksum(const mm_header *block) {
-  struct {
-    uint32_t magic;
-    uint32_t in_use;
-    size_t size;
-    size_t requested_size;
-    uintptr_t next;
-    uintptr_t prev;
-  } fields;
-
-  memset(&fields, 0, sizeof(fields));
-  fields.magic = block->magic;
-  fields.in_use = block->in_use;
-  fields.size = block->size;
-  fields.requested_size = block->requested_size;
-  fields.next = (uintptr_t)block->next;
-  fields.prev = (uintptr_t)block->prev;
-
-  uint32_t h = fnv1a(&fields, sizeof(fields), 0x811C9DC5u);
-  return h == 0 ? 1u : h;  // keep 0 free as "never computed"
-}
-
-uint32_t mm_payload_checksum(const void *payload, size_t len) {
-  uint32_t h = fnv1a(payload, len, 0x811C9DC5u);
-  return h == 0 ? 1u : h;
-}
+size_t mm_metadata_overhead(void) { return MM_HDR_SIZE + MM_TRAIL; }
 
 // --- Bounds ----------------------------------------------------------------
 
 bool mm_in_arena(const void *p, size_t span) {
-  if (g_arena.base == NULL || p == NULL) return false;
+  if (g_arena.lo == NULL || p == NULL) return false;
   const uint8_t *q = (const uint8_t *)p;
-  if (q < g_arena.base) return false;
-  // Compare as offsets so the arithmetic cannot run past the arena.
-  size_t offset = (size_t)(q - g_arena.base);
-  if (offset > g_arena.size) return false;
-  return span <= g_arena.size - offset;
+  if (q < g_arena.lo || q > g_arena.hi) return false;
+  // Compare as an offset so the arithmetic cannot run past the arena.
+  return span <= (size_t)(g_arena.hi - q);
 }
 
-bool mm_is_block(const mm_header *block) {
-  if (!mm_in_arena(block, sizeof(mm_header))) return false;
-  if (((uintptr_t)block - (uintptr_t)g_arena.base) % MM_ALIGNMENT != 0) {
-    return false;
-  }
-  if (block->magic != MM_HEADER_MAGIC) return false;
-  if (block->size < MM_MIN_BLOCK_SIZE) return false;
-  if (block->size % MM_ALIGNMENT != 0) return false;
-  // The whole block, footer included, must lie inside the arena.
-  return mm_in_arena(block, MM_BLOCK_TOTAL(block->size));
+bool mm_is_block(const mm_block *b) {
+  if (g_arena.lo == NULL || b == NULL) return false;
+  const uint8_t *p = (const uint8_t *)(const void *)b;
+  if (p < g_arena.lo || p >= g_arena.hi) return false;
+  // Every block starts a whole number of alignment units into the tiling, so
+  // an address that does not cannot be one. Checked before the control word is
+  // read, because a header that is not there must not be dereferenced.
+  if ((size_t)(p - g_arena.lo) % MM_ALIGNMENT != 0) return false;
+  if ((size_t)(g_arena.hi - p) < MM_MIN_BLOCK) return false;
+
+  size_t n = mm_block_size(b);
+  if (n < MM_MIN_BLOCK) return false;
+  return n <= (size_t)(g_arena.hi - p);
 }
 
 size_t mm_max_blocks(void) {
-  if (g_arena.size == 0) return 0;
-  return g_arena.size / MM_BLOCK_TOTAL(MM_MIN_BLOCK_SIZE) + 1;
+  if (g_arena.lo == NULL) return 0;
+  return (size_t)(g_arena.hi - g_arena.lo) / MM_MIN_BLOCK + 1;
 }
 
 // --- Validation ------------------------------------------------------------
 
-bool mm_checksum_ok(const mm_header *block) {
-  return mm_is_block(block) && block->checksum == mm_checksum(block);
+bool mm_header_ok(const mm_block *b) {
+  if (!mm_is_block(b)) return false;
+#if MM_HAS_CRC
+  return b->hdr_crc == mm_hdr_crc_of(b, mm_block_index(b), g_arena.secret);
+#else
+  // The fast profile buys its eight-byte header by carrying no checksum at
+  // all, so this is the structural check and nothing more. Claiming otherwise
+  // here would be the one dishonest line in the allocator.
+  return true;
+#endif
 }
 
-bool mm_footer_ok(const mm_header *block) {
-  if (!mm_is_block(block)) return false;
-  const mm_footer *f = mm_footer_of(block);
-  if (!mm_in_arena(f, sizeof(mm_footer))) return false;
-  return memcmp(f, block, sizeof(mm_header)) == 0;
-}
+// --- Canary ----------------------------------------------------------------
+
+#if MM_HAS_CANARY
 
 // The canary sits immediately after the payload, at an offset the caller
 // chose, so it is not necessarily aligned. Always move it with memcpy.
-void mm_read_canary(const mm_header *block, uint64_t *out) {
-  memcpy(out, mm_payload_of(block) + block->requested_size, sizeof(*out));
+static uint8_t *canary_at(const mm_block *b) {
+  return mm_payload_of(b) + mm_requested_size(b);
 }
 
-void mm_write_canary(const mm_header *block) {
-  uint64_t canary = MM_CANARY;
-  memcpy(mm_payload_of(block) + block->requested_size, &canary,
-         sizeof(canary));
+void mm_write_canary(mm_block *b) {
+  uint64_t c = mm_canary_value(mm_block_index(b), g_arena.secret);
+  memcpy(canary_at(b), &c, sizeof(c));
 }
 
-bool mm_canary_ok(const mm_header *block) {
-  if (!block->in_use) return true;  // free blocks carry no canary
-  uint64_t seen = 0;
-  mm_read_canary(block, &seen);
-  return seen == MM_CANARY;
+bool mm_canary_ok(const mm_block *b) {
+  // Free blocks carry no canary, and a quarantined block's slack no longer
+  // describes a payload, so neither has one to check.
+  if (!mm_is_used(b) || mm_is_quarantined(b)) return true;
+  uint64_t seen;
+  memcpy(&seen, canary_at(b), sizeof(seen));
+  return seen == mm_canary_value(mm_block_index(b), g_arena.secret);
 }
 
-void mm_seal(mm_header *block) {
-  block->checksum = mm_checksum(block);
-  *mm_footer_of(block) = *block;
+#else
+
+void mm_write_canary(mm_block *b) { (void)b; }
+
+bool mm_canary_ok(const mm_block *b) {
+  (void)b;
+  return true;
 }
 
-// --- Quarantine ------------------------------------------------------------
+#endif  // MM_HAS_CANARY
 
-void mm_quarantine(mm_header *block) {
-  if (!mm_in_arena(block, sizeof(mm_header))) return;
+// --- Sealing ---------------------------------------------------------------
 
-  mm_header *prev = block->prev;
-  mm_header *next = block->next;
-
-  // Only re-link through neighbours that still look sane; a corrupted block's
-  // own pointers are exactly what cannot be trusted here.
-  bool prev_ok = mm_checksum_ok(prev);
-  bool next_ok = mm_checksum_ok(next);
-
-  if (prev_ok) {
-    prev->next = next_ok ? next : NULL;
-    mm_seal(prev);
+void mm_seal(mm_block *b) {
+  // Under the fast profile there is nothing to seal: the control word is the
+  // whole header. The call sites still make it, so that the sequence of
+  // operations is the same shape in every profile.
+  (void)b;
+#if MM_HAS_CRC
+  b->hdr_crc = mm_hdr_crc_of(b, mm_block_index(b), g_arena.secret);
+#endif
+#if MM_HAS_MIRROR
+  // The mirror occupies the last MM_MIRROR_SIZE bytes of an allocated block. A
+  // free block spends those bytes on its boundary tag instead, and needs no
+  // mirror: the tag already records its extent.
+  if (mm_is_used(b)) {
+    memcpy(mm_block_end(b) - MM_MIRROR_SIZE, b, MM_HDR_SIZE);
   }
-  if (next_ok) {
-    next->prev = prev_ok ? prev : NULL;
-    mm_seal(next);
+#endif
+}
+
+// Seals `b` and brings the block after it back into agreement, without
+// invoking recovery -- this is what recovery itself uses, where recursing
+// would be neither necessary nor safe.
+static void seal_and_link(mm_block *b) {
+  if (!mm_is_used(b)) mm_write_free_footer(b);
+  mm_seal(b);
+
+  uint8_t *end = mm_block_end(b);
+  if (end >= g_arena.hi) return;
+  mm_block *n = (mm_block *)(void *)end;
+  // A neighbour that fails validation is never written through: its control
+  // word decides where its own trailer lands, so sealing a corrupted one
+  // scatters writes across the arena.
+  if (!mm_header_ok(n)) return;
+  if (mm_prev_in_use(n) != mm_is_used(b)) {
+    mm_set_prev_in_use(n, mm_is_used(b));
+    mm_seal(n);
   }
-  if (g_arena.first == block) {
-    g_arena.first = next_ok ? next : NULL;
+}
+
+void mm_publish(mm_block *b) {
+  if (!mm_is_used(b)) mm_write_free_footer(b);
+  mm_seal(b);
+
+  mm_block *n = mm_recover_next(b);
+  if (n == NULL) return;
+  if (mm_prev_in_use(n) != mm_is_used(b)) {
+    mm_set_prev_in_use(n, mm_is_used(b));
+    mm_seal(n);
+  }
+}
+
+// --- Stepping backwards ----------------------------------------------------
+
+mm_block *mm_prev_free_block(const mm_block *b) {
+  // The boundary tag is legible only when PREV_IN_USE is clear. Read it in any
+  // other circumstance and it is payload bytes, or the tail of a mirror.
+  if (mm_prev_in_use(b)) return NULL;
+
+  const uint8_t *p = (const uint8_t *)(const void *)b;
+  if ((size_t)(p - g_arena.lo) < MM_MIN_BLOCK) return NULL;
+
+  uint64_t n = mm_read_prev_footer(b);
+  if (n < MM_MIN_BLOCK || n % MM_ALIGNMENT != 0) return NULL;
+  if (n > (uint64_t)(size_t)(p - g_arena.lo)) return NULL;
+
+  mm_block *prev = (mm_block *)(void *)(p - (size_t)n);
+  // Corroborate the tag against the header it claims to belong to, rather than
+  // trusting either one on its own.
+  if (!mm_header_ok(prev)) return NULL;
+  if (mm_block_size(prev) != (size_t)n) return NULL;
+  if (mm_is_used(prev)) return NULL;
+  return prev;
+}
+
+// --- Recovery primitives ---------------------------------------------------
+
+// How far the resynchronisation scan will walk, in MM_ALIGNMENT steps.
+// Recovery runs only on the damage path, but it must still terminate promptly
+// on a large arena. The cost is that damage spanning more than this many steps
+// surrenders the rest of the arena rather than stepping over it.
+#define MM_RECOVERY_STEPS 65536u
+
+// Blocks tile the arena exactly, so whatever sits after a block of this extent
+// must be either the end of the arena or another intact block. That tiling is
+// the structural redundancy which makes a recovered extent trustworthy rather
+// than merely plausible.
+static bool tiling_agrees(const mm_block *b) {
+  uint8_t *end = mm_block_end(b);
+  if (end == g_arena.hi) return true;
+  if ((size_t)(g_arena.hi - end) < MM_MIN_BLOCK) return false;
+  return mm_header_ok((const mm_block *)(const void *)end);
+}
+
+// The next address at or after `start + MM_MIN_BLOCK` carrying a header that
+// stands up on its own and tiles with what follows it. NULL if there is none:
+// a real block is at least MM_MIN_BLOCK long, so nothing nearer can be one.
+static uint8_t *scan_resync(uint8_t *start) {
+  size_t steps = 0;
+  for (uint8_t *p = start + MM_MIN_BLOCK;
+       p < g_arena.hi && (size_t)(g_arena.hi - p) >= MM_MIN_BLOCK &&
+       steps < MM_RECOVERY_STEPS;
+       p += MM_ALIGNMENT, steps++) {
+    const mm_block *c = (const mm_block *)(const void *)p;
+    if (mm_header_ok(c) && tiling_agrees(c)) return p;
+  }
+  return NULL;
+}
+
+// Turns [start, start + span) into a block that exists only so the arena keeps
+// tiling: permanently allocated, never merged, never handed out again.
+static mm_block *abandon(uint8_t *start, size_t span, bool prev_used) {
+  if (span < MM_MIN_BLOCK) {
+    mm_fail(MM_ERR_CORRUPT_LINKS);
+    return NULL;
   }
 
-  // Poison both copies of the metadata so the block can never be mistaken for
-  // live again. Poisoning only the header would leave the mirror intact, and
-  // the recovery path would faithfully rebuild the block from it -- bringing
-  // back to life the very block that was just given up on.
-  MM_STAT_NOTE(MM_STAT_QUARANTINE, MM_BLOCK_TOTAL(block->size));
-  g_arena.lost_bytes += MM_BLOCK_TOTAL(block->size);
-  if (mm_is_block(block)) mm_footer_of(block)->magic = 0xDEADDEADu;
-  block->magic = 0xDEADDEADu;
+  mm_block *q = (mm_block *)(void *)start;
+  q->word = 0;
+#if MM_HAS_CRC
+  q->payload_crc = 0;
+#endif
+  mm_set_word(q, span, 0, true, true);
+  mm_set_prev_in_use(q, prev_used);
+  seal_and_link(q);
+
+  g_arena.lost_bytes += span;
+  MM_STAT_NOTE(MM_STAT_QUARANTINE, span);
+  mm_fail(MM_ERR_CORRUPT_LINKS);
+  return q;
+}
+
+#if MM_HAS_MIRROR
+// Reads the tail mirror that would belong to a block ending at `resync` and
+// says whether it stands up. Nothing is written: the caller decides what to do
+// with the answer.
+//
+// This is where the paranoid profile earns its extra sixteen bytes. A mirror's
+// position is fixed relative to the *end* of its block, and the end is exactly
+// what the resynchronisation scan has just found -- so once the scan has a
+// foothold the repair is one bounded check, not the search over every possible
+// extent that a header-position mirror would need.
+static bool mirror_says(const uint8_t *lo_bound, const uint8_t *resync,
+                        mm_block *out, uint8_t **out_start) {
+  memcpy(out, resync - MM_MIRROR_SIZE, MM_HDR_SIZE);
+
+  size_t n = mm_block_size(out);
+  if (n < MM_MIN_BLOCK || n > (size_t)(resync - lo_bound)) return false;
+  if (!mm_is_used(out)) return false;  // a free block keeps a tag, not a mirror
+
+  uint8_t *start = (uint8_t *)(uintptr_t)(const void *)(resync - n);
+  if ((size_t)(start - g_arena.lo) % MM_ALIGNMENT != 0) return false;
+
+  // The mirror carries its own checksum, and that checksum is bound to the
+  // block's index within the arena. A mirror lifted from anywhere else
+  // therefore fails here, which is what makes a false repair vanishingly
+  // unlikely rather than merely unlikely.
+  uint64_t index = (uint64_t)((size_t)(start - g_arena.lo) / MM_ALIGNMENT);
+  if (out->hdr_crc != mm_hdr_crc_of(out, index, g_arena.secret)) return false;
+
+  *out_start = start;
+  return true;
+}
+#endif  // MM_HAS_MIRROR
+
+// --- Quarantine and rescue -------------------------------------------------
+
+void mm_quarantine(mm_block *b) {
+  if (!mm_is_block(b)) return;
+  if (mm_is_quarantined(b)) {
+    mm_fail(MM_ERR_QUARANTINED);
+    return;
+  }
+  if (!mm_header_ok(b)) {
+    // The extent cannot be trusted, so neither can the address of anything
+    // this block owns. Surrender the span instead of writing through it.
+    (void)mm_rescue(b);
+    return;
+  }
+
+  size_t n = mm_block_size(b);
+  // A free block is on the free list, and has to come off it before its
+  // interior stops meaning what the list thinks it means.
+  if (!mm_is_used(b)) mm_free_list_remove(b);
+
+  mm_set_word(b, n, 0, true, true);
+#if MM_HAS_CRC
+  b->payload_crc = 0;
+#endif
+  mm_publish(b);
+
+  g_arena.lost_bytes += n;
+  MM_STAT_NOTE(MM_STAT_QUARANTINE, n);
   mm_fail(MM_ERR_QUARANTINED);
 }
 
-// --- Block recovery --------------------------------------------------------
+bool mm_rescue(mm_block *b) {
+  if (mm_header_ok(b)) return true;
+  if (!mm_is_block(b)) return false;
 
-// Could a block starting at `start` and carrying `n` bytes between its header
-// and footer have left an intact footer where one ought to be?
-//
-// The size the candidate carries must be the size that puts it at this
-// address. That is what ties a candidate to its position: without it, any
-// forty-eight bytes that happened to checksum would be accepted.
-static bool footer_fits(const uint8_t *start, size_t n) {
-  if (n < MM_MIN_BLOCK_SIZE || n % MM_ALIGNMENT != 0) return false;
-  if (!mm_in_arena(start, MM_BLOCK_TOTAL(n))) return false;
+  uint8_t *start = (uint8_t *)(void *)b;
+  uint8_t *resync = scan_resync(start);
+  bool prev_used = mm_prev_in_use(b);
 
-  const mm_footer *f =
-      (const mm_footer *)(const void *)(start + sizeof(mm_header) + n);
-  if (f->magic != MM_HEADER_MAGIC) return false;
-  if (f->size != n) return false;
-  return f->checksum == mm_checksum(f);
-}
-
-// Blocks tile the arena, so whatever sits after a block of this extent must be
-// either the end of the arena or another intact block. That tiling is the
-// structural redundancy which makes a recovered size trustworthy rather than
-// merely plausible.
-static bool tiling_agrees(const uint8_t *start, size_t n) {
-  const uint8_t *after = start + MM_BLOCK_TOTAL(n);
-  if (!mm_in_arena(after, 0)) return false;
-
-  size_t offset = (size_t)(after - g_arena.base);
-  if (g_arena.size - offset < MM_BLOCK_TOTAL(MM_MIN_BLOCK_SIZE)) {
-    return true;  // nothing more fits: this was the last block
-  }
-  return mm_checksum_ok((const mm_header *)(const void *)after);
-}
-
-// How far either search will walk, in MM_ALIGNMENT steps. Recovery runs only
-// on the damage path, but it must still terminate promptly on a large arena --
-// every other traversal here is bounded and this one is no exception. The cost
-// is that a damaged block larger than this many steps cannot be rebuilt.
-#define MM_RECOVERY_STEPS 65536u
-
-mm_header *mm_recover_next(mm_header *owner, size_t *lost) {
-  *lost = 0;
-
-  uint8_t *start = (uint8_t *)owner + MM_BLOCK_TOTAL(owner->size);
-  if (!mm_in_arena(start, 0)) return NULL;
-
-  size_t offset = (size_t)(start - g_arena.base);
-  size_t room = g_arena.size - offset;
-  if (room < MM_BLOCK_TOTAL(MM_MIN_BLOCK_SIZE)) return NULL;
-
-  mm_header *cand = (mm_header *)(void *)start;
-
-  // Intact header. If only the mirror has drifted, republish it from the
-  // header and carry on -- the cheap half of the repair.
-  if (mm_checksum_ok(cand)) {
-    if (!mm_footer_ok(cand)) {
-      mm_seal(cand);
-      MM_STAT_NOTE(MM_STAT_REPAIR, 0);
+#if MM_HAS_MIRROR
+  if (resync != NULL) {
+    mm_block rebuilt;
+    uint8_t *at = NULL;
+    if (mirror_says(start, resync, &rebuilt, &at) && at == start) {
+      memcpy(b, &rebuilt, MM_HDR_SIZE);
+      mm_set_prev_in_use(b, prev_used);
+      seal_and_link(b);
+      MM_STAT_NOTE(MM_STAT_REPAIR, mm_block_size(b));
       mm_fail(MM_ERR_CORRUPT_HEADER);
+      return true;
     }
-    return cand;
   }
+#endif
 
-  // The header is unusable, so its extent has to come from the mirror. The
-  // mirror's position depends on the very size that was lost, so look for it
-  // rather than trusting a field to say where it is.
-  size_t steps = 0;
-  for (size_t n = MM_MIN_BLOCK_SIZE;
-       MM_BLOCK_TOTAL(n) <= room && steps < MM_RECOVERY_STEPS;
-       n += MM_ALIGNMENT, steps++) {
-    if (!footer_fits(start, n)) continue;
-    if (!tiling_agrees(start, n)) continue;
+  size_t span = resync != NULL ? (size_t)(resync - start)
+                               : (size_t)(g_arena.hi - start);
+  (void)abandon(start, span, prev_used);
+  return false;
+}
 
-    const mm_footer *f =
-        (const mm_footer *)(const void *)(start + sizeof(mm_header) + n);
-    *cand = *f;          // the footer is the header, mirrored
-    cand->prev = owner;  // known for certain: owner is trusted
-    mm_seal(cand);
+// --- Walking over damage ---------------------------------------------------
 
-    MM_STAT_NOTE(MM_STAT_REPAIR, MM_BLOCK_TOTAL(n));
-    mm_fail(MM_ERR_CORRUPT_HEADER);
-    return cand;
+mm_block *mm_recover_next(mm_block *owner) {
+  uint8_t *start = mm_block_end(owner);
+  if (start >= g_arena.hi) return NULL;
+  if ((size_t)(g_arena.hi - start) < MM_MIN_BLOCK) return NULL;
+
+  mm_block *cand = (mm_block *)(void *)start;
+  if (mm_header_ok(cand)) return cand;
+
+  // The header is unusable, so the extent it recorded is gone and stepping
+  // forward is no longer possible from here. Find the next header that stands
+  // up on its own; that is the only way back in step.
+  uint8_t *resync = scan_resync(start);
+  bool owner_used = mm_is_used(owner);
+
+#if MM_HAS_MIRROR
+  if (resync != NULL) {
+    mm_block rebuilt;
+    uint8_t *at = NULL;
+    if (mirror_says(start, resync, &rebuilt, &at)) {
+      if (at == start) {
+        memcpy(cand, &rebuilt, MM_HDR_SIZE);
+        mm_set_prev_in_use(cand, owner_used);
+        seal_and_link(cand);
+        MM_STAT_NOTE(MM_STAT_REPAIR, mm_block_size(cand));
+        mm_fail(MM_ERR_CORRUPT_HEADER);
+        return cand;
+      }
+      // The mirror belongs to a block further along, so whatever lies between
+      // the owner and it was damaged past rebuilding. Give up that span alone
+      // and keep the block the mirror does describe.
+      if ((size_t)(at - start) >= MM_MIN_BLOCK) {
+        mm_block *r = (mm_block *)(void *)at;
+        memcpy(r, &rebuilt, MM_HDR_SIZE);
+        mm_set_prev_in_use(r, true);  // the abandoned span counts as allocated
+        seal_and_link(r);
+        MM_STAT_NOTE(MM_STAT_REPAIR, mm_block_size(r));
+        return abandon(start, (size_t)(at - start), owner_used);
+      }
+    }
   }
+#endif
 
-  // Nothing here can be rebuilt. Rather than abandon everything downstream,
-  // walk forward for the next block that still stands up on its own and give
-  // up only the span in between. A footer read as a header is caught by
-  // requiring the mirror to agree, since a real footer's own size field points
-  // nowhere useful.
-  steps = 0;
-  for (size_t skip = MM_ALIGNMENT;
-       skip + MM_BLOCK_TOTAL(MM_MIN_BLOCK_SIZE) <= room &&
-       steps < MM_RECOVERY_STEPS;
-       skip += MM_ALIGNMENT, steps++) {
-    mm_header *resync = (mm_header *)(void *)(start + skip);
-    if (!mm_checksum_ok(resync) || !mm_footer_ok(resync)) continue;
-    if (!tiling_agrees(start + skip, resync->size)) continue;
-
-    *lost = skip;
-    resync->prev = owner;
-    mm_seal(resync);
-    return resync;
-  }
-
-  *lost = room;
-  return NULL;
+  size_t span = resync != NULL ? (size_t)(resync - start)
+                               : (size_t)(g_arena.hi - start);
+  return abandon(start, span, owner_used);
 }
 
 // --- Pointer recovery ------------------------------------------------------
 
-mm_header *mm_block_of(const void *ptr) {
+mm_block *mm_block_of(const void *ptr) {
   if (g_arena.base == NULL) {
     mm_fail(MM_ERR_NOT_INITIALIZED);
     return NULL;
   }
-  // Range-check the payload pointer BEFORE reading anything near it: the clue
-  // lives just below it, and a foreign pointer must never be dereferenced.
-  if (!mm_in_arena(ptr, 0)) {
+  // Range-check the payload pointer BEFORE reading anything near it: the
+  // header lies just below it, and a foreign pointer must never be
+  // dereferenced.
+  const uint8_t *p = (const uint8_t *)ptr;
+  if (p == NULL || p < g_arena.lo + MM_HDR_SIZE || p >= g_arena.hi) {
     mm_fail(MM_ERR_INVALID_PTR);
     return NULL;
   }
-  size_t offset = (size_t)((const uint8_t *)ptr - g_arena.base);
-  if (offset < MM_PREFIX || (offset - MM_PREFIX) % MM_ALIGNMENT != 0) {
-    mm_fail(MM_ERR_INVALID_PTR);
-    return NULL;
-  }
-
-  mm_header *block =
-      (mm_header *)(void *)((uint8_t *)(uintptr_t)ptr - MM_PREFIX);
-  if (!mm_is_block(block)) {
+  if ((size_t)(p - (g_arena.lo + MM_HDR_SIZE)) % MM_ALIGNMENT != 0) {
     mm_fail(MM_ERR_INVALID_PTR);
     return NULL;
   }
 
-  // Cross-check the clue written at allocation time. It is redundant with the
-  // fixed prefix, which is what makes it useful as a corruption detector.
-  size_t clue = 0;
-  memcpy(&clue, (const uint8_t *)ptr - sizeof(size_t), sizeof(clue));
-  if (clue != MM_PREFIX) {
-    mm_fail(MM_ERR_CORRUPT_HEADER);
+  // There is no clue byte to cross-check any more. The header size is a
+  // compile-time constant and every payload is 16-aligned by construction, so
+  // the header is exactly here or the pointer was never ours -- and the
+  // checksum, bound to this block's index, decides which.
+  mm_block *b = (mm_block *)(void *)(p - MM_HDR_SIZE);
+  if (!mm_is_block(b)) {
+    mm_fail(MM_ERR_INVALID_PTR);
     return NULL;
   }
-  return block;
+  return b;
 }
 
 // --- Public checks ---------------------------------------------------------
 
 mm_status_t mm_verify(const void *ptr) {
   mm_clear_error();
-  mm_header *block = mm_block_of(ptr);
-  if (block == NULL) return mm_last_error();
+  mm_block *b = mm_block_of(ptr);
+  if (b == NULL) return mm_last_error();
 
-  if (!mm_checksum_ok(block)) return mm_fail(MM_ERR_CORRUPT_HEADER);
-  if (!mm_footer_ok(block)) return mm_fail(MM_ERR_CORRUPT_HEADER);
-  if (!mm_canary_ok(block)) return mm_fail(MM_ERR_CORRUPT_CANARY);
+  if (!mm_header_ok(b)) return mm_fail(MM_ERR_CORRUPT_HEADER);
+  if (mm_is_quarantined(b)) return mm_fail(MM_ERR_QUARANTINED);
+  if (!mm_canary_ok(b)) return mm_fail(MM_ERR_CORRUPT_CANARY);
 
-  uint32_t want = block->payload_checksum;
-  if (block->in_use && want != 0) {
-    uint32_t got =
-        mm_payload_checksum(mm_payload_of(block), block->requested_size);
-    if (want != got) return mm_fail(MM_ERR_CORRUPT_PAYLOAD);
+#if MM_HAS_CRC
+  if (mm_is_used(b) && b->payload_crc != 0) {
+    uint32_t got = mm_payload_crc(mm_payload_of(b), mm_requested_size(b));
+    if (got != b->payload_crc) return mm_fail(MM_ERR_CORRUPT_PAYLOAD);
   }
+#endif
   return MM_OK;
 }
 
@@ -353,37 +450,76 @@ mm_status_t mm_check_heap(void) {
 
   size_t budget = mm_max_blocks();
   size_t covered = 0;
-  mm_header *prev = NULL;
+  size_t lost = 0;
+  size_t free_blocks = 0;
+  bool have_prev = false;
+  bool prev_free = false;
 
-  for (mm_header *b = g_arena.first; b != NULL; b = b->next) {
+  // The implicit list is the walk: step block by block through the tiling
+  // rather than following stored links. The links are cross-checked against
+  // this afterwards, not the other way round -- geometry is the thing that
+  // cannot quietly disagree with itself.
+  for (uint8_t *p = g_arena.lo; p < g_arena.hi;) {
     if (budget-- == 0) return mm_fail(MM_ERR_CORRUPT_LINKS);
+
+    mm_block *b = (mm_block *)(void *)p;
     if (!mm_is_block(b)) return mm_fail(MM_ERR_CORRUPT_HEADER);
-    if (!mm_checksum_ok(b)) return mm_fail(MM_ERR_CORRUPT_HEADER);
-    if (!mm_footer_ok(b)) return mm_fail(MM_ERR_CORRUPT_HEADER);
+    if (!mm_header_ok(b)) return mm_fail(MM_ERR_CORRUPT_HEADER);
+
+    // PREV_IN_USE has to agree with what actually precedes this block. The
+    // first block has nothing before it, and reports its predecessor as in use
+    // so that nobody tries to step backwards off the front.
+    bool expect_prev_used = have_prev ? !prev_free : true;
+    if (mm_prev_in_use(b) != expect_prev_used) {
+      return mm_fail(MM_ERR_CORRUPT_LINKS);
+    }
     if (!mm_canary_ok(b)) return mm_fail(MM_ERR_CORRUPT_CANARY);
 
-    if (b->prev != prev) return mm_fail(MM_ERR_CORRUPT_LINKS);
-    if (b->next != NULL && mm_next_adjacent(b) != b->next) {
-      return mm_fail(MM_ERR_CORRUPT_LINKS);
-    }
-    // Adjacent free blocks mean a coalesce was missed.
-    if (prev != NULL && !prev->in_use && !b->in_use) {
-      return mm_fail(MM_ERR_CORRUPT_LINKS);
+    size_t n = mm_block_size(b);
+    if (mm_is_used(b)) {
+      if (mm_is_quarantined(b)) lost += n;
+      prev_free = false;
+    } else {
+      // The boundary tag must repeat the extent, or stepping backwards over
+      // this block would land somewhere else entirely.
+      uint64_t tag;
+      memcpy(&tag, p + n - sizeof(tag), sizeof(tag));
+      if (tag != (uint64_t)n) return mm_fail(MM_ERR_CORRUPT_LINKS);
+      // Two adjacent free blocks mean a coalesce was missed.
+      if (prev_free) return mm_fail(MM_ERR_CORRUPT_LINKS);
+      free_blocks++;
+      prev_free = true;
     }
 
-    covered += MM_BLOCK_TOTAL(b->size);
-    prev = b;
+    covered += n;
+    have_prev = true;
+    p += n;
   }
 
-  // The blocks must tile the arena exactly, once the space surrendered to
-  // quarantine is accounted for, modulo a tail too small to hold one more
-  // block. Anything else means space has gone missing rather than been given
-  // up deliberately.
-  covered += g_arena.lost_bytes;
-  if (covered > g_arena.size) return mm_fail(MM_ERR_CORRUPT_LINKS);
-  if (g_arena.size - covered >= MM_BLOCK_TOTAL(MM_MIN_BLOCK_SIZE)) {
+  // Blocks tile the arena exactly -- quarantined space included, since giving
+  // up on a block leaves it in the tiling rather than taking it out. Anything
+  // else means space has gone missing rather than been surrendered on purpose.
+  if (covered != (size_t)(g_arena.hi - g_arena.lo)) {
     return mm_fail(MM_ERR_CORRUPT_LINKS);
   }
+  if (lost != g_arena.lost_bytes) return mm_fail(MM_ERR_CORRUPT_LINKS);
+
+  // Now the free list, checked against what the tiling just said.
+  size_t seen = 0;
+  mm_block *back = NULL;
+  budget = mm_max_blocks();
+  for (mm_block *cur = g_arena.free_head; cur != NULL;) {
+    if (budget-- == 0) return mm_fail(MM_ERR_CORRUPT_LINKS);
+    if (!mm_header_ok(cur)) return mm_fail(MM_ERR_CORRUPT_LINKS);
+    if (mm_is_used(cur)) return mm_fail(MM_ERR_CORRUPT_LINKS);
+    if (mm_free_link_get(cur, MM_LINK_PREV, g_arena.secret) != back) {
+      return mm_fail(MM_ERR_CORRUPT_LINKS);
+    }
+    back = cur;
+    cur = (mm_block *)mm_free_link_get(cur, MM_LINK_NEXT, g_arena.secret);
+    seen++;
+  }
+  if (seen != free_blocks) return mm_fail(MM_ERR_CORRUPT_LINKS);
 
   return MM_OK;
 }

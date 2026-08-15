@@ -18,10 +18,10 @@ void mm_stats_get(mm_stats_t *out) {
 
 void mm_stats_reset(void) { memset(&g_stats, 0, sizeof(g_stats)); }
 
-void mm_stats_block_added(const mm_header *block) {
+void mm_stats_block_added(size_t block_bytes, size_t payload_bytes) {
   g_stats.live_blocks++;
-  g_stats.live_payload_bytes += block->requested_size;
-  g_stats.live_block_bytes += MM_BLOCK_TOTAL(block->size);
+  g_stats.live_payload_bytes += payload_bytes;
+  g_stats.live_block_bytes += block_bytes;
   // Occupancy drives the snapshot: when it reaches a new high, record the
   // payload and block count that went with it.
   if (g_stats.live_block_bytes > g_stats.peak_block_bytes) {
@@ -31,10 +31,10 @@ void mm_stats_block_added(const mm_header *block) {
   }
 }
 
-void mm_stats_block_removed(const mm_header *block) {
+void mm_stats_block_removed(size_t block_bytes, size_t payload_bytes) {
   if (g_stats.live_blocks > 0) g_stats.live_blocks--;
-  size_t payload = block->requested_size;
-  size_t total = MM_BLOCK_TOTAL(block->size);
+  size_t payload = payload_bytes;
+  size_t total = block_bytes;
   g_stats.live_payload_bytes =
       g_stats.live_payload_bytes >= payload
           ? g_stats.live_payload_bytes - payload : 0;

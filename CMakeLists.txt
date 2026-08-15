@@ -175,6 +175,7 @@ if(BUILD_TESTING)
   endfunction()
 
   mars_add_test(test_crc32       tests/test_crc32.c)
+  mars_add_test(test_layout      tests/test_layout.c)
   mars_add_test(test_core        tests/test_core.c)
   mars_add_test(test_access      tests/test_access.c)
   mars_add_test(test_realloc     tests/test_realloc.c)

@@ -64,6 +64,15 @@ size_t mm_alignment(void);
 // Smallest arena mm_init will accept.
 size_t mm_min_arena(void);
 
+// Which integrity profile this library was built with: "fast", "hardened" or
+// "paranoid". The profile decides how much metadata a block carries and
+// therefore what corruption can be detected -- see docs/BLOCK_LAYOUT.md.
+const char *mm_profile(void);
+
+// Metadata bytes an allocation carries before alignment rounding: the header
+// plus whatever trails the payload. 8, 24 or 40 depending on the profile.
+size_t mm_metadata_overhead(void);
+
 // --- Allocation ------------------------------------------------------------
 
 // Allocates `size` bytes. Returns NULL if size is 0 or no block is available.
