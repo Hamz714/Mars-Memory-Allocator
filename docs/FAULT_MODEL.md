@@ -12,8 +12,19 @@ study, because it can be reproduced exactly by XOR-ing a bit.
 
 `tools/faultinject` flips *k* bits inside a chosen structure and records what
 the allocator then does. Targets are the allocated header, a free header, the
-list links, the mirrored footer, the payload, the canary, and anywhere in the
-arena at all.
+free-list links, a free block's boundary tag, the payload, the canary, and
+anywhere in the arena at all.
+
+There is no allocated-block footer to aim at any more. Since the layout change
+a footer exists only inside a free block, which is why the old `footer` target
+became `free_footer`; see [BLOCK_LAYOUT.md](BLOCK_LAYOUT.md).
+
+**Everything below depends on the integrity profile.** `hardened` is described
+here because it is the default; `fast` carries no checksum and no canary and
+detects correspondingly less, while `paranoid` adds a tail mirror and can
+repair what the others surrender. The profile is printed at the top of every
+run and recorded in the first column of the CSV, because a detection rate
+without it is not comparable with anything.
 
 ## What this is not
 
@@ -23,12 +34,12 @@ impressive.
 - **This is not radiation hardening.** Real hardening is ECC memory, redundant
   hardware, and physical shielding. Nothing in software can stop a bit
   flipping; this can only notice afterwards.
-- **Repair is limited to metadata, and only while one copy survives.** A
-  damaged header is rebuilt from its mirrored footer, and a damaged footer is
-  republished from its header. Nothing reconstructs a payload: if the flip
-  landed in user data, the payload checksum reports it and the data is gone.
-  When both copies of the metadata are destroyed the block cannot be rebuilt
-  at all, and it is surrendered.
+- **Repair is limited to metadata, only under `paranoid`, and only while the
+  mirror survives.** Nothing reconstructs a payload: if the flip landed in user
+  data, the payload checksum reports it and the data is gone. Under `hardened`
+  and `fast` there is no second copy of the metadata either, so a damaged
+  header means a surrendered block — detection without repair is the trade
+  those profiles make, and it is what buys back 48 bytes per allocation.
 - **Read-after-write verification would not be brownout protection.** An
   earlier version of this allocator wrote each metadata field, read it back,
   and retried up to three times, describing this as protection against power
@@ -46,49 +57,58 @@ impressive.
 
 | Structure | Protection | Verified on |
 |---|---|---|
-| Header metadata | checksum over every field | every access, free, resize, and heap check |
-| Footer | full mirror of the header | same |
-| Payload | checksum over the whole payload | `mm_read`, `mm_verify` |
-| End of payload | 8-byte canary | every access, free, resize |
-| List topology | neighbour cross-checks, adjacency, exact tiling of the arena | `mm_check_heap` |
+| Header metadata | CRC32C over the control word, the payload checksum, the block's index and the arena secret | every access, free, resize, and heap check |
+| Tail mirror (`paranoid`) | full copy of the header, at a fixed offset from the block's end | recovery |
+| Payload | CRC32C over the whole payload | `mm_read`, `mm_verify` |
+| End of payload | 8-byte canary, bound to the block's index | every access, free, resize |
+| Free-list links | structural cross-checks, XOR-masked with the arena secret | every traversal, `mm_check_heap` |
+| Boundary tag | corroborated against the header it claims to describe | every backward step, `mm_check_heap` |
+| Topology | `PREV_IN_USE` agreement, no adjacent free blocks, exact tiling of the arena | `mm_check_heap` |
 
-A neighbour that fails validation is never *written through* — a block's size
-field decides where its footer lands, so sealing a corrupted neighbour would
-scatter writes across the arena. Space surrendered is counted, so the
-consistency check can tell deliberate loss from memory that has genuinely gone
-missing.
+A neighbour that fails validation is never *written through* — a block's
+control word decides where its own trailer lands, so sealing a corrupted
+neighbour would scatter writes across the arena. Space surrendered is counted,
+so the consistency check can tell deliberate loss from memory that has
+genuinely gone missing.
 
 ## Rebuilding a damaged block
 
 Blocks tile the arena in address order, which means a damaged block's **start**
-is known from its predecessor even when its own header is unreadable. Only its
-extent is missing — and the mirrored footer still records that.
+is known from its predecessor even when its own header is unreadable. What is
+missing is its extent — and the extent is exactly what decides where anything
+else belonging to the block can be found.
 
-The difficulty is that the footer's position is derived from the very size that
-was lost, so it cannot simply be looked up. It is searched for instead: step a
-candidate position outwards and accept one only when
+So the walk resynchronises first: it scans forward for the next header that
+stands up on its own *and* tiles with whatever follows it, which is the only
+way back in step once an extent is gone. A real block is at least
+`MM_MIN_BLOCK` long, so the scan starts there rather than at the next alignment
+unit.
 
-- the magic and checksum both hold, **and**
-- the size the candidate carries is exactly the size that would place it at
-  that address, **and**
-- whatever follows the block it describes is either the end of the arena or
-  another intact block.
+Under `paranoid` that foothold is what makes the mirror usable. The mirror sits
+at a fixed offset from the block's **end**, and the resynchronisation point is
+that end, so the repair is one bounded check rather than a search over every
+candidate extent. It is accepted only when
 
-The second condition ties a candidate to its position, so that forty-eight
-bytes which merely happen to checksum are not enough. The third uses the tiling
-itself as redundancy. A test plants a perfectly-formed decoy footer nearer the
-start than the real one — correct magic, correct checksum over its own fields —
-and requires that it be refused. **A wrong repair is worse than no repair:** it
-would hand back a block of the wrong extent overlapping a live neighbour.
+- the extent it carries is at least `MM_MIN_BLOCK` and reaches back no further
+  than the damaged block's known start, **and**
+- its checksum holds *for the index of the position it would restore*.
 
-When nothing can be rebuilt, the walk resynchronises on the next block that
-stands up on its own and gives up only the span in between. Truncating the list
+The second condition is what refuses a mirror belonging to a different block.
+A test copies one block's mirror verbatim over another's — correct extent,
+correct flags, correct checksum over its own fields — and requires it to be
+rejected. **A wrong repair is worse than no repair:** it would hand back a
+block of the wrong extent overlapping a live neighbour.
+
+When nothing can be rebuilt, the span between the damage and the
+resynchronisation point is surrendered, and only that span. Truncating the walk
 instead would cost the entire remainder of the arena — measured at 99.8% of it
 for a single flipped bit, before this was addressed.
 
-Quarantine poisons **both** copies of a block's metadata. Poisoning only the
-header would leave the mirror intact for the recovery path to faithfully
-rebuild, bringing back the very block that was just given up on.
+Quarantine no longer needs to poison anything. A block given up on stays in the
+tiling as permanently-allocated space marked `QUARANTINED`: it can never be
+merged, never be handed out, and never be freed back into circulation, and the
+arena still tiles exactly. That is what turns "space was lost" from an
+inference into an arithmetic identity `mm_check_heap` can check.
 
 ## Outcome taxonomy
 
@@ -131,10 +151,17 @@ distinguished from "harmless", and a detection rate means nothing.
 
 ## A free correctness oracle
 
-Theory says what some of these numbers must be. A checksum over the header
-detects any single-bit change in it, without exception — so single-bit header
-corruption must come out at 100% detection with zero silent corruption. If it
-does not, the harness has found a bug rather than a statistic.
+Theory says what some of these numbers must be. A 32-bit CRC over the header
+detects any single-bit change in it, without exception — so under any profile
+that carries one, single-bit header corruption must come out at 100% detection
+with zero silent corruption. If it does not, the harness has found a bug rather
+than a statistic. CI gates exactly that cell for `hardened` and `paranoid`.
+
+`fast` carries no checksum, so no such prediction exists for it and the cell is
+recorded rather than gated. What *is* gated for all three is the crash count:
+every profile promises never to read or write outside the arena, whatever a
+corrupted control word says, and that promise does not depend on being able to
+detect the corruption.
 
 Cells where theory and measurement can be compared are worth more than cells
 where only measurement exists, and disagreement between them should always be
