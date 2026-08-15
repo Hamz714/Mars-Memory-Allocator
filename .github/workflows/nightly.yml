@@ -54,6 +54,63 @@ jobs:
           name: fault-sweep
           path: faults-full.csv
 
+  # The trade the patrol exists to make, priced rather than asserted: how long
+  # damage sits unnoticed in memory nobody is touching, as a function of how
+  # often the patrol runs. Accumulated into one CSV -- faultinject appends when
+  # the file already exists -- so the whole curve is a single artifact.
+  #
+  # Read `latency_mean_ops` against `latency_n`: the measurement window is
+  # 4096 calls per trial, so an interval near or above that censors the mean
+  # and only the trials counted in latency_n are in it.
+  scrub-sweep:
+    name: scrub sweep
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake --preset gcc-release
+      - name: Build
+        run: cmake --build --preset gcc-release -- -j$(nproc)
+      - name: Sweep the scrub interval
+        run: |
+          set -e
+          for s in 1 256 1024 4096 off; do
+            ./build/gcc-release/bin/faultinject \
+              --trials 2000 --bits 1,2 --scrub-interval "$s" \
+              --csv scrub-sweep.csv
+          done
+      - name: Summarise the curve
+        run: |
+          python3 - <<'PY'
+          import csv, collections
+          rows = list(csv.DictReader(open('scrub-sweep.csv')))
+          by = collections.defaultdict(list)
+          for r in rows:
+              by[r['scrub_interval']].append(r)
+          print(f"{'interval':>9} {'detected':>9} {'silent':>7} {'lat n':>7} {'mean ops':>10}")
+          for k in sorted(by, key=int):
+              g = by[k]
+              n = sum(int(r['latency_n']) for r in g)
+              total = sum(int(r['trials']) for r in g)
+              silent = sum(int(r['undetected_silent']) for r in g)
+              weighted = sum(float(r['latency_mean_ops']) * int(r['latency_n']) for r in g)
+              mean = weighted / n if n else float('nan')
+              print(f"{k:>9} {total:>9} {silent:>7} {n:>7} {mean:>10.1f}")
+          # The patrol changes when damage is found, never whether corruption
+          # is allowed through silently. That must hold at every setting.
+          bad = [r for r in rows if int(r['undetected_silent']) or int(r['crash'])]
+          if bad:
+              for r in bad:
+                  print('FAIL', r)
+              raise SystemExit(1)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scrub-sweep
+          path: scrub-sweep.csv
+
   valgrind-soak:
     name: soak / valgrind
     runs-on: ubuntu-22.04
