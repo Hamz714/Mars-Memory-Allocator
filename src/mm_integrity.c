@@ -234,6 +234,8 @@ static mm_block *abandon(uint8_t *start, size_t span, bool prev_used) {
 #endif
   mm_set_word(q, span, 0, true, true);
   mm_set_prev_in_use(q, prev_used);
+  // Whatever block boundaries used to be inside this span are gone with it.
+  mm_scrub_forget(start, start + span);
   seal_and_link(q);
 
   g_arena.lost_bytes += span;
@@ -291,9 +293,9 @@ void mm_quarantine(mm_block *b) {
   }
 
   size_t n = mm_block_size(b);
-  // A free block is on the free list, and has to come off it before its
-  // interior stops meaning what the list thinks it means.
-  if (!mm_is_used(b)) mm_free_list_remove(b);
+  // A free block is in a bin, and has to come out of it before its interior
+  // stops meaning what that bin thinks it means.
+  if (!mm_is_used(b)) mm_bin_remove(b);
 
   mm_set_word(b, n, 0, true, true);
 #if MM_HAS_CRC
@@ -384,6 +386,147 @@ mm_block *mm_recover_next(mm_block *owner) {
   return abandon(start, span, owner_used);
 }
 
+// --- The patrol ------------------------------------------------------------
+//
+// O(1) allocation means the allocator stops touching most of the arena. A
+// block that is neither allocated, freed, nor next to something being
+// coalesced is never looked at again, so damage to it would sit there
+// indefinitely -- and the linear search this brief removed used to find that
+// damage incidentally, on every single call.
+//
+// Two tiers replace it. Validate-on-touch stays where it was: every block
+// popped by malloc, every block freed, and both coalescing neighbours. On top
+// of that this bounded patrol walks the implicit list a few blocks at a time,
+// resuming where it stopped, so that cold memory is still covered -- at a cost
+// that is a constant per operation rather than a function of arena size. It is
+// what a hardware ECC scrubber does, and the trade it makes (detection latency
+// against throughput) is measurable rather than assumed: the fault injector
+// records the latency, and tools/faultinject takes --scrub-interval so the
+// curve can be swept.
+
+#define MM_SCRUB_INTERVAL_DEFAULT ((size_t)1024)
+#define MM_SCRUB_BUDGET_DEFAULT ((size_t)16)
+
+static size_t g_scrub_interval = MM_SCRUB_INTERVAL_DEFAULT;
+static size_t g_scrub_budget = MM_SCRUB_BUDGET_DEFAULT;
+static size_t g_ops_since_scrub;
+
+void mm_set_scrub_interval(size_t ops, size_t budget_blocks) {
+  g_scrub_interval = ops;
+  g_scrub_budget = budget_blocks == 0 ? MM_SCRUB_BUDGET_DEFAULT : budget_blocks;
+  g_ops_since_scrub = 0;
+}
+
+void mm_scrub_forget(uint8_t *from, uint8_t *to) {
+  if (g_arena.scrub_at > from && g_arena.scrub_at < to) g_arena.scrub_at = from;
+}
+
+// Checks one block and reports the first thing wrong with it, or MM_OK.
+// Repairs what is safely derivable and quarantines what is not; the block is
+// left walkable either way, because the walk has to carry on past it.
+static mm_status_t scrub_block(mm_block *b) {
+  if (!mm_canary_ok(b)) {
+    // Someone overran their payload. The same response as on any other path
+    // that meets a broken canary: the block is given up on.
+    mm_quarantine(b);
+    return MM_ERR_CORRUPT_CANARY;
+  }
+
+  if (!mm_is_used(b)) {
+    // The boundary tag is a pure derivative of an extent the checksum has
+    // already vouched for, so putting it back is a repair rather than a guess
+    // -- and it is the one thing here that can be repaired under every
+    // profile. Left alone it would break the next backward coalesce.
+    uint64_t tag;
+    memcpy(&tag, mm_block_end(b) - sizeof(tag), sizeof(tag));
+    if (tag != (uint64_t)mm_block_size(b)) {
+      mm_write_free_footer(b);
+      MM_STAT_NOTE(MM_STAT_REPAIR, mm_block_size(b));
+      return MM_ERR_CORRUPT_LINKS;
+    }
+    return MM_OK;
+  }
+
+#if MM_HAS_CRC
+  if (b->payload_crc != 0 &&
+      mm_payload_crc(mm_payload_of(b), mm_requested_size(b)) != b->payload_crc) {
+    // Reported, deliberately not quarantined. mm_read quarantines here because
+    // the caller asked for the bytes and must not be handed wrong ones; the
+    // patrol was not asked for anything. A payload checksum only means
+    // something if every write went through mm_write, and a caller who wrote
+    // through their own pointer -- which the API permits -- would otherwise
+    // have a live block destroyed behind their back by a passing patrol. So
+    // this says what it saw and leaves the block to its owner.
+    return MM_ERR_CORRUPT_PAYLOAD;
+  }
+#endif
+  return MM_OK;
+}
+
+// The patrol proper. Does not clear the thread status: it runs underneath an
+// ordinary allocator call, and what it finds has to survive to mm_last_error()
+// alongside whatever that call ran into.
+static mm_status_t scrub_run(size_t budget_blocks) {
+  if (budget_blocks == 0) return MM_OK;
+
+  uint8_t *p = g_arena.scrub_at;
+  if (p == NULL || p < g_arena.lo || p >= g_arena.hi) p = g_arena.lo;
+
+  mm_status_t found = MM_OK;
+  size_t visited = 0;
+  size_t hits = 0;
+  // Bounds the loop whatever the arena turns out to look like, including the
+  // case where the budget exceeds the number of blocks and the walk laps.
+  size_t guard = mm_max_blocks();
+
+  while (visited < budget_blocks && guard-- > 0) {
+    if (p >= g_arena.hi) p = g_arena.lo;
+    mm_block *b = (mm_block *)(void *)p;
+
+    if (!mm_header_ok(b)) {
+      // The extent this block recorded is exactly what the damage destroyed,
+      // so there is no stepping past it. Recovery puts it back where the
+      // profile carries a mirror and surrenders its span where it does not;
+      // either way the arena still tiles afterwards.
+      if (found == MM_OK) found = MM_ERR_CORRUPT_HEADER;
+      hits++;
+      (void)mm_rescue(b);
+      if (!mm_header_ok(b)) {
+        p = g_arena.lo;  // nothing legible here; start the lap again
+        continue;
+      }
+    }
+
+    mm_status_t s = scrub_block(b);
+    if (s != MM_OK) {
+      if (found == MM_OK) found = s;
+      hits++;
+    }
+
+    visited++;
+    p += mm_block_size(b);
+  }
+
+  g_arena.scrub_at = p;
+  MM_STAT_NOTE(MM_STAT_SCRUB, visited);
+  if (hits > 0) MM_STAT_NOTE(MM_STAT_SCRUB_HIT, hits);
+  if (found != MM_OK) return mm_fail(found);
+  return MM_OK;
+}
+
+void mm_scrub_tick(void) {
+  if (g_scrub_interval == 0 || g_arena.base == NULL) return;
+  if (++g_ops_since_scrub < g_scrub_interval) return;
+  g_ops_since_scrub = 0;
+  (void)scrub_run(g_scrub_budget);
+}
+
+mm_status_t mm_scrub(size_t budget_blocks) {
+  mm_clear_error();
+  if (g_arena.base == NULL) return mm_fail(MM_ERR_NOT_INITIALIZED);
+  return scrub_run(budget_blocks);
+}
+
 // --- Pointer recovery ------------------------------------------------------
 
 mm_block *mm_block_of(const void *ptr) {
@@ -443,9 +586,11 @@ mm_status_t mm_check_heap(void) {
   size_t budget = mm_max_blocks();
   size_t covered = 0;
   size_t lost = 0;
-  size_t free_blocks = 0;
   bool have_prev = false;
   bool prev_free = false;
+  // What the tiling says each bin should hold. The bins are checked against
+  // this afterwards, never the other way round.
+  size_t per_bin[MM_BIN_COUNT] = {0};
 
   // The implicit list is the walk: step block by block through the tiling
   // rather than following stored links. The links are cross-checked against
@@ -479,7 +624,7 @@ mm_status_t mm_check_heap(void) {
       if (tag != (uint64_t)n) return mm_fail(MM_ERR_CORRUPT_LINKS);
       // Two adjacent free blocks mean a coalesce was missed.
       if (prev_free) return mm_fail(MM_ERR_CORRUPT_LINKS);
-      free_blocks++;
+      per_bin[mm_bin_of(n)]++;
       prev_free = true;
     }
 
@@ -496,22 +641,8 @@ mm_status_t mm_check_heap(void) {
   }
   if (lost != g_arena.lost_bytes) return mm_fail(MM_ERR_CORRUPT_LINKS);
 
-  // Now the free list, checked against what the tiling just said.
-  size_t seen = 0;
-  mm_block *back = NULL;
-  budget = mm_max_blocks();
-  for (mm_block *cur = g_arena.free_head; cur != NULL;) {
-    if (budget-- == 0) return mm_fail(MM_ERR_CORRUPT_LINKS);
-    if (!mm_header_ok(cur)) return mm_fail(MM_ERR_CORRUPT_LINKS);
-    if (mm_is_used(cur)) return mm_fail(MM_ERR_CORRUPT_LINKS);
-    if (mm_free_link_get(cur, MM_LINK_PREV, g_arena.secret) != back) {
-      return mm_fail(MM_ERR_CORRUPT_LINKS);
-    }
-    back = cur;
-    cur = (mm_block *)mm_free_link_get(cur, MM_LINK_NEXT, g_arena.secret);
-    seen++;
-  }
-  if (seen != free_blocks) return mm_fail(MM_ERR_CORRUPT_LINKS);
-
-  return MM_OK;
+  // Now the bins, checked against what the tiling just said: every free block
+  // in exactly one bin, in the bin its size asks for, no allocated block in
+  // any of them, and a bitmap that agrees about which are empty.
+  return mm_bins_check(per_bin);
 }

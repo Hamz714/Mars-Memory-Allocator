@@ -20,6 +20,14 @@
 
 static uint8_t *arena_new(size_t size) { return (uint8_t *)malloc(size); }
 
+// Which bin a freed block landed in. The free list is no longer a single list,
+// so a test reaching into it has to say which bin it means; the block's size
+// is what decides, and the pointer that was freed still recovers the header.
+static size_t bin_index_for(void *freed) {
+  mm_block *b = mm_block_of(freed);
+  return b == NULL ? 0 : mm_bin_of(mm_block_size(b));
+}
+
 // A tiny reproducible generator, so a failure can be replayed from its seed.
 static uint64_t rng_state;
 static uint64_t next_rand(void) {
@@ -424,14 +432,17 @@ MM_TEST(integrity, the_heap_check_catches_every_way_the_list_can_disagree) {
     mm_free(p[3]);
     REQUIRE_EQ(mm_check_heap(), MM_OK);
 
-    // Unhook the head without touching the tiling.
-    mm_block *head = g_arena.free_head;
+    // Unhook the head of the bin the two holes share, without touching the
+    // tiling. The bin is left internally consistent -- it simply no longer
+    // holds a free block the walk can see.
+    size_t bin = bin_index_for(p[1]);
+    mm_block *head = g_arena.bins[bin];
     REQUIRE_NOT_NULL(head);
     mm_block *next =
         (mm_block *)mm_free_link_get(head, MM_LINK_NEXT, g_arena.secret);
     REQUIRE_NOT_NULL(next);
     mm_free_link_set(next, MM_LINK_PREV, NULL, g_arena.secret);
-    g_arena.free_head = next;
+    g_arena.bins[bin] = next;
 
     CHECK_EQ(mm_check_heap(), MM_ERR_CORRUPT_LINKS);
   }
@@ -448,7 +459,7 @@ MM_TEST(integrity, the_heap_check_catches_every_way_the_list_can_disagree) {
     mm_free(p[3]);
     REQUIRE_EQ(mm_check_heap(), MM_OK);
 
-    mm_block *head = g_arena.free_head;
+    mm_block *head = g_arena.bins[bin_index_for(p[1])];
     REQUIRE_NOT_NULL(head);
     mm_block *next =
         (mm_block *)mm_free_link_get(head, MM_LINK_NEXT, g_arena.secret);
@@ -475,10 +486,10 @@ MM_TEST(integrity, a_scrambled_free_list_is_rebuilt_from_the_tiling) {
   for (int i = 0; i < 6; i += 2) mm_free(p[i]);
   CHECK_EQ(mm_check_heap(), MM_OK);
 
-  // Scribble over the head's forward link. It is not covered by any checksum
-  // -- it lives in payload space -- so the list has to defend itself by
-  // checking that the block it lands on agrees.
-  mm_block *head = g_arena.free_head;
+  // Scribble over the forward link of the head of the bin those holes share.
+  // It is not covered by any checksum -- it lives in payload space -- so the
+  // bin has to defend itself by checking that the block it lands on agrees.
+  mm_block *head = g_arena.bins[bin_index_for(p[0])];
   REQUIRE_NOT_NULL(head);
   uint64_t junk = 0x1234567812345678ULL;
   memcpy(mm_payload_of(head), &junk, sizeof(junk));

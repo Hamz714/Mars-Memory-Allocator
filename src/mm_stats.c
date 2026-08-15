@@ -56,6 +56,13 @@ void mm_stats_note(mm_stats_event_t event, size_t bytes) {
       g_stats.repaired_blocks++;
       g_stats.repaired_bytes += bytes;
       break;
+    case MM_STAT_SCRUB:
+      g_stats.scrub_passes++;
+      g_stats.scrub_blocks += bytes;  // blocks visited, not bytes
+      break;
+    case MM_STAT_SCRUB_HIT:
+      g_stats.scrub_detections += bytes;
+      break;
   }
 }
 

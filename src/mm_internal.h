@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "mm_freelist.h"
 #include "mm_layout.h"
 
 // --- Arena state -----------------------------------------------------------
@@ -24,10 +25,11 @@ typedef struct mm_arena {
   size_t size;
   uint8_t *lo;  // first block; base plus MM_BLOCK_OFFSET
   uint8_t *hi;  // one past the last block
-  // Head of the single doubly-linked free list. The search over it is linear
-  // and stays that way here: binning is a separate change, and keeping them
-  // apart is what makes it possible to attribute a surprise to one of them.
-  mm_block *free_head;
+  // Heads of the size-classed free lists, and one bit per non-empty bin so
+  // that the smallest sufficient one is found with a mask and a bit-scan
+  // rather than by looking. See mm_freelist.h for how the sizes are cut.
+  mm_block *bins[MM_BIN_COUNT];
+  uint64_t bin_bitmap[MM_BIN_WORDS];
   // Drawn once per arena and mixed into every checksum, canary and free-list
   // link. A corruption detector, not a security boundary.
   uint64_t secret;
@@ -35,6 +37,9 @@ typedef struct mm_arena {
   // tracked, so that the consistency check can tell the difference between
   // memory that was given up on purpose and memory that has gone missing.
   size_t lost_bytes;
+  // Where the next patrol resumes. Always a block boundary: anything that
+  // makes it interior to a block moves it back, through mm_scrub_forget.
+  uint8_t *scrub_at;
 } mm_arena;
 
 extern mm_arena g_arena;
@@ -110,20 +115,24 @@ mm_block *mm_block_of(const void *ptr);
 // that a corrupted link cannot produce an unbounded loop.
 size_t mm_max_blocks(void);
 
-// --- Free list (mm_core.c) -------------------------------------------------
+// --- Scrubbing (mm_integrity.c) --------------------------------------------
 //
-// One doubly-linked list of every free block, threaded through the payload
-// space those blocks are not using, so the links cost nothing. It is a cache
-// over the tiling and never the authority: anything that finds it inconsistent
-// rebuilds it from the tiling and says so through MM_ERR_CORRUPT_LINKS.
-//
-// A block must already carry a sealed, free control word before it is
-// inserted, so that a rebuild triggered from inside the insertion still sees
-// a consistent arena.
+// Binning means the allocator stops touching most of the arena: a block that
+// is neither allocated nor freed nor next to something being coalesced is
+// never looked at again. The linear search used to catch damage in cold memory
+// incidentally, and that incidental cover is exactly what O(1) allocation
+// takes away. The patrol puts it back deliberately and at a bounded cost --
+// which is what a hardware ECC scrubber does on real spacecraft.
 
-void mm_free_list_insert(mm_block *b);
-void mm_free_list_remove(mm_block *b);
-void mm_free_list_rebuild(void);
+// Runs the patrol if enough operations have gone by since the last one. Called
+// at the end of every public allocation call. Never clears the thread status:
+// something it finds has to survive to mm_last_error().
+void mm_scrub_tick(void);
+
+// Moves the patrol cursor back to `from` if it currently sits strictly inside
+// [from, to). Called wherever two blocks merge or a span is surrendered, since
+// those are the only things that can make a block boundary stop being one.
+void mm_scrub_forget(uint8_t *from, uint8_t *to);
 
 // Pins the secret the next mm_init will use, so that a harness which has to
 // replay a run byte for byte can. Zero restores the drawn-at-random default.
@@ -153,7 +162,9 @@ typedef enum mm_stats_event {
   MM_STAT_FREE,
   MM_STAT_REALLOC,
   MM_STAT_QUARANTINE,
-  MM_STAT_REPAIR
+  MM_STAT_REPAIR,
+  MM_STAT_SCRUB,     // one patrol; `bytes` carries the blocks it visited
+  MM_STAT_SCRUB_HIT  // that patrol found something wrong
 } mm_stats_event_t;
 
 #ifdef MM_STATS

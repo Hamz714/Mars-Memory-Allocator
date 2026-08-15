@@ -448,6 +448,11 @@ MM_TEST(regression, recovery_refuses_a_mirror_from_another_block) {
 // and must not be spliced through either. The links live in payload space and
 // no checksum covers them, so the list defends itself by checking that every
 // node it lands on agrees -- and rebuilds from the tiling when one does not.
+//
+// The single free list became size-classed bins, so the cycle is now planted
+// in the head of a named bin rather than in "the" head. The property being
+// pinned is unchanged, and it had to survive that rework precisely because
+// binning did not give the links any checksum cover they did not have before.
 MM_TEST(regression, traversal_terminates_on_cyclic_link) {
   uint8_t *heap = arena_new(ARENA_SIZE);
   REQUIRE_NOT_NULL(heap);
@@ -461,9 +466,11 @@ MM_TEST(regression, traversal_terminates_on_cyclic_link) {
   REQUIRE_NOT_NULL(c);
   mm_free(b);  // a hole between two live blocks, plus the arena tail
 
-  // Point the head of the free list at itself. Nothing catches the edit before
-  // the walk meets it, which is exactly the situation being guarded against.
-  mm_block *head = g_arena.free_head;
+  // Point the head of b's bin at itself. Nothing catches the edit before the
+  // walk meets it, which is exactly the situation being guarded against.
+  mm_block *hb = mm_block_of(b);
+  REQUIRE_NOT_NULL(hb);
+  mm_block *head = g_arena.bins[mm_bin_of(mm_block_size(hb))];
   REQUIRE_NOT_NULL(head);
   mm_free_link_set(head, MM_LINK_NEXT, head, g_arena.secret);
 

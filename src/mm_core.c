@@ -40,101 +40,6 @@ static uint64_t draw_secret(void) {
   return z | 1u;  // never 0: that value means "pin nothing"
 }
 
-// --- Free list -------------------------------------------------------------
-
-// Whether `b`'s links agree with the blocks they point at and with the head.
-static bool links_consistent(const mm_block *b) {
-  uint64_t s = g_arena.secret;
-  const mm_block *next = (const mm_block *)mm_free_link_get(b, MM_LINK_NEXT, s);
-  const mm_block *prev = (const mm_block *)mm_free_link_get(b, MM_LINK_PREV, s);
-
-  if (next != NULL) {
-    if (!mm_header_ok(next) || mm_is_used(next)) return false;
-    if (mm_free_link_get(next, MM_LINK_PREV, s) != b) return false;
-  }
-  if (prev != NULL) {
-    if (!mm_header_ok(prev) || mm_is_used(prev)) return false;
-    if (mm_free_link_get(prev, MM_LINK_NEXT, s) != b) return false;
-  } else if (g_arena.free_head != b) {
-    return false;  // only the head has no predecessor
-  }
-  return true;
-}
-
-void mm_free_list_rebuild(void) {
-  uint64_t s = g_arena.secret;
-  g_arena.free_head = NULL;
-
-  mm_block *tail = NULL;
-  size_t budget = mm_max_blocks();
-  for (uint8_t *p = g_arena.lo; p < g_arena.hi;) {
-    if (budget-- == 0) break;
-    mm_block *b = (mm_block *)(void *)p;
-    // Without a legible header there is no way to step past this block, so the
-    // rebuild stops here rather than guessing. Free blocks beyond it drop out
-    // of the list; they are still in the tiling, and mm_check_heap will say so.
-    if (!mm_header_ok(b)) break;
-
-    if (!mm_is_used(b)) {
-      mm_free_link_set(b, MM_LINK_PREV, tail, s);
-      mm_free_link_set(b, MM_LINK_NEXT, NULL, s);
-      if (tail != NULL) {
-        mm_free_link_set(tail, MM_LINK_NEXT, b, s);
-      } else {
-        g_arena.free_head = b;
-      }
-      tail = b;
-    }
-    p += mm_block_size(b);
-  }
-}
-
-void mm_free_list_insert(mm_block *b) {
-  uint64_t s = g_arena.secret;
-  mm_block *head = g_arena.free_head;
-
-  if (head != NULL && (!mm_header_ok(head) || mm_is_used(head))) {
-    // The list cannot be extended through a head that no longer stands up.
-    // `b` is already sealed and marked free, so a rebuild picks it up.
-    mm_fail(MM_ERR_CORRUPT_LINKS);
-    mm_free_list_rebuild();
-    return;
-  }
-
-  mm_free_link_set(b, MM_LINK_NEXT, head, s);
-  mm_free_link_set(b, MM_LINK_PREV, NULL, s);
-  if (head != NULL) mm_free_link_set(head, MM_LINK_PREV, b, s);
-  g_arena.free_head = b;
-}
-
-void mm_free_list_remove(mm_block *b) {
-  uint64_t s = g_arena.secret;
-
-  if (!links_consistent(b)) {
-    // Splicing through links that do not corroborate each other is how a
-    // damaged free list turns into a wild write. Rebuild from the tiling --
-    // which is the authority -- and try once more.
-    mm_fail(MM_ERR_CORRUPT_LINKS);
-    mm_free_list_rebuild();
-    if (!links_consistent(b)) {
-      // The rebuild could not reach `b`, so it is not on the list at all.
-      mm_free_link_set(b, MM_LINK_NEXT, NULL, s);
-      mm_free_link_set(b, MM_LINK_PREV, NULL, s);
-      return;
-    }
-  }
-
-  mm_block *next = (mm_block *)mm_free_link_get(b, MM_LINK_NEXT, s);
-  mm_block *prev = (mm_block *)mm_free_link_get(b, MM_LINK_PREV, s);
-
-  if (prev != NULL) {
-    mm_free_link_set(prev, MM_LINK_NEXT, next, s);
-  } else {
-    g_arena.free_head = next;
-  }
-  if (next != NULL) mm_free_link_set(next, MM_LINK_PREV, prev, s);
-}
-
 // --- Initialisation --------------------------------------------------------
 
 int mm_init(void *heap, size_t heap_size) {
@@ -151,8 +56,8 @@ int mm_init(void *heap, size_t heap_size) {
   g_arena.base = (uint8_t *)heap;
   g_arena.size = heap_size;
   g_arena.lost_bytes = 0;
-  g_arena.free_head = NULL;
   g_arena.secret = draw_secret();
+  mm_bins_reset();
 
   // Clear the arena once, up front. A payload checksum covers the whole
   // payload, including bytes the caller has not written yet, so those bytes
@@ -169,6 +74,7 @@ int mm_init(void *heap, size_t heap_size) {
   usable -= usable % MM_ALIGNMENT;
   g_arena.lo = g_arena.base + MM_BLOCK_OFFSET;
   g_arena.hi = g_arena.lo + usable;
+  g_arena.scrub_at = g_arena.lo;
 
   mm_block *first = (mm_block *)(void *)g_arena.lo;
   first->word = 0;
@@ -180,60 +86,23 @@ int mm_init(void *heap, size_t heap_size) {
   // is what stops anything trying to step backwards off the front.
   mm_set_prev_in_use(first, true);
   mm_publish(first);
-  mm_free_list_insert(first);
+  mm_bin_insert(first);
 
   return 0;
 }
 
-// --- Block search ----------------------------------------------------------
-
-// Smallest free block that fits. The walk is linear over the free list and
-// stays that way in this change: binning is a separate piece of work, and
-// keeping the two apart is what makes it possible to attribute a surprise in
-// the numbers to one of them rather than to both at once.
-static mm_block *find_best_fit(size_t need) {
-  uint64_t s = g_arena.secret;
-
-  for (int attempt = 0; attempt < 2; attempt++) {
-    mm_block *best = NULL;
-    size_t best_size = SIZE_MAX;
-    size_t budget = mm_max_blocks();
-    mm_block *back = NULL;
-    bool damaged = false;
-
-    for (mm_block *cur = g_arena.free_head; cur != NULL;) {
-      if (budget-- == 0) {
-        damaged = true;  // a link has gone circular; stop rather than spin
-        break;
-      }
-      if (!mm_header_ok(cur) || mm_is_used(cur) ||
-          mm_free_link_get(cur, MM_LINK_PREV, s) != back) {
-        damaged = true;
-        break;
-      }
-      size_t n = mm_block_size(cur);
-      if (n >= need && n < best_size) {
-        best = cur;
-        best_size = n;
-        if (n == need) break;  // exact fit, stop looking
-      }
-      back = cur;
-      cur = (mm_block *)mm_free_link_get(cur, MM_LINK_NEXT, s);
-    }
-
-    if (!damaged) return best;
-    mm_fail(MM_ERR_CORRUPT_LINKS);
-    mm_free_list_rebuild();
-  }
-  return NULL;
-}
-
 // --- Splitting and coalescing ----------------------------------------------
+//
+// A block's size decides which bin it belongs in, so merging is where bin
+// membership is easiest to get wrong: both inputs have to come out of their
+// bins *before* their sizes change, and the result goes into the bin its new
+// size asks for. Both absorb helpers below therefore take a free block that is
+// in no bin and leave it that way, and the caller does the single insert once
+// the extent has stopped moving.
 
-// Merges `b` with the block after it when that one is free. `b` must itself be
-// free and on the free list; it stays there, since growing it does not move
-// the links inside it.
-static void coalesce_forward(mm_block *b) {
+// Merges `b` with the block after it when that one is free. `b` must be free
+// and in no bin; the neighbour is taken out of its own bin here.
+static void absorb_next(mm_block *b) {
   uint8_t *end = mm_block_end(b);
   if (end >= g_arena.hi) return;
 
@@ -243,9 +112,28 @@ static void coalesce_forward(mm_block *b) {
   // without needing a case of their own.
   if (!mm_header_ok(n) || mm_is_used(n)) return;
 
-  mm_free_list_remove(n);
+  mm_bin_remove(n);
   mm_set_block_size(b, mm_block_size(b) + mm_block_size(n));
+  // `n` has stopped being a block boundary, so a patrol cursor parked on it
+  // has to come back to one.
+  mm_scrub_forget((uint8_t *)(void *)b, mm_block_end(b));
   mm_publish(b);
+}
+
+// Merges `b` into the free block before it, if there is one. Same contract as
+// absorb_next; returns whichever block survived, still in no bin.
+static mm_block *absorb_into_prev(mm_block *b) {
+  // Backwards is the sharp edge: the predecessor's boundary tag is only
+  // legible because PREV_IN_USE says so, and mm_prev_free_block corroborates
+  // the tag against the header it claims to describe before returning it.
+  mm_block *prev = mm_prev_free_block(b);
+  if (prev == NULL) return b;
+
+  mm_bin_remove(prev);
+  mm_set_block_size(prev, mm_block_size(prev) + mm_block_size(b));
+  mm_scrub_forget((uint8_t *)(void *)prev, mm_block_end(prev));
+  mm_publish(prev);
+  return prev;
 }
 
 // Trims `b` to `need`, handing the remainder back as a free block. `b` must
@@ -266,12 +154,13 @@ static void split_block(mm_block *b, size_t need) {
   mm_set_word(tail, leftover, 0, false, false);
   mm_set_prev_in_use(tail, true);  // `b` is in use whenever a split happens
   mm_publish(tail);
-  mm_free_list_insert(tail);
 
   // The block that followed may itself be free -- shrinking an allocation in
   // place is the case where that happens. Leaving two free blocks side by side
-  // would fragment the arena permanently.
-  coalesce_forward(tail);
+  // would fragment the arena permanently. Nothing precedes `tail` but `b`,
+  // which is in use, so there is no backward merge to consider.
+  absorb_next(tail);
+  mm_bin_insert(tail);
 }
 
 // Stamps a block as holding exactly `size` bytes for the caller, and seals it.
@@ -301,14 +190,15 @@ void *mm_malloc(size_t size) {
     return NULL;
   }
 
-  mm_block *b = find_best_fit(need);
+  mm_block *b = mm_bin_find(need);
   if (b == NULL) {
     MM_STAT_NOTE(MM_STAT_ALLOC_FAILED, 0);
     mm_fail(MM_ERR_NOMEM);
+    mm_scrub_tick();
     return NULL;
   }
 
-  mm_free_list_remove(b);
+  mm_bin_remove(b);
   // Marked in use at its full extent before anything is carved off it, so that
   // the arena remains walkable even in the middle of the split.
   mm_set_word(b, mm_block_size(b), 0, true, false);
@@ -326,7 +216,10 @@ void *mm_malloc(size_t size) {
 
   MM_STAT_NOTE(MM_STAT_ALLOC, size);
   MM_STAT_ADD(b);
-  return mm_payload_of(b);
+
+  uint8_t *payload = mm_payload_of(b);
+  mm_scrub_tick();
+  return payload;
 }
 
 // --- Release ---------------------------------------------------------------
@@ -380,19 +273,15 @@ void mm_free(void *ptr) {
   b->payload_crc = 0;
 #endif
   mm_publish(b);
-  mm_free_list_insert(b);
 
-  coalesce_forward(b);
+  // Merge in both directions before binning anything: the block's final extent
+  // is what decides its bin, and inserting it twice over would be wasted work
+  // on the one path that has to stay cheap.
+  absorb_next(b);
+  b = absorb_into_prev(b);
+  mm_bin_insert(b);
 
-  // Backwards is the sharp edge: the predecessor's boundary tag is only
-  // legible because PREV_IN_USE says so, and mm_prev_free_block corroborates
-  // the tag against the header it claims to describe before returning it.
-  mm_block *prev = mm_prev_free_block(b);
-  if (prev != NULL) {
-    mm_free_list_remove(b);
-    mm_set_block_size(prev, mm_block_size(prev) + mm_block_size(b));
-    mm_publish(prev);
-  }
+  mm_scrub_tick();
 }
 
 // --- Resize ----------------------------------------------------------------
@@ -466,6 +355,7 @@ void *mm_realloc(void *ptr, size_t new_size) {
     carry_payload_crc(b, old_size, old_sum, new_size);
     finish_allocation(b, new_size);
     MM_STAT_ADD(b);
+    mm_scrub_tick();
     return payload;
   }
 
@@ -476,13 +366,15 @@ void *mm_realloc(void *ptr, size_t new_size) {
     if (mm_header_ok(n) && !mm_is_used(n) &&
         mm_block_size(b) + mm_block_size(n) >= need) {
       MM_STAT_SUB(b);
-      mm_free_list_remove(n);
+      mm_bin_remove(n);
       mm_set_block_size(b, mm_block_size(b) + mm_block_size(n));
+      mm_scrub_forget((uint8_t *)(void *)b, mm_block_end(b));
       mm_seal(b);
       split_block(b, need);
       carry_payload_crc(b, old_size, old_sum, new_size);
       finish_allocation(b, new_size);
       MM_STAT_ADD(b);
+      mm_scrub_tick();
       return payload;
     }
   }

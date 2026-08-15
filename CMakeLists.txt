@@ -116,6 +116,7 @@ endif()
 
 add_library(mars ${MARS_LIB_TYPE}
   src/mm_core.c
+  src/mm_freelist.c
   src/mm_integrity.c
   src/mm_access.c
   src/mm_stats.c
