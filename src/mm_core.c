@@ -32,6 +32,7 @@ int mm_init(void *heap, size_t heap_size) {
 
   g_arena.base = (uint8_t *)heap;
   g_arena.size = heap_size;
+  g_arena.lost_bytes = 0;
 
   // Clear the arena once, up front. A payload checksum covers the whole
   // payload, including bytes the caller has not written yet, so those bytes
@@ -101,15 +102,24 @@ static void coalesce_forward(mm_header *block);
 // scatters writes across the arena. Drop such a node from the list instead --
 // the space it held is lost, which is the price of not trusting it.
 static void relink_prev(mm_header *owner, mm_header *node) {
-  if (node == NULL) return;
-  if (!mm_checksum_ok(node) || !mm_footer_ok(node)) {
-    owner->next = NULL;
-    mm_seal(owner);
+  // `node` is deliberately ignored in favour of geometry. Blocks tile the
+  // arena, so where the next one begins follows from `owner` alone, and owner
+  // has just been sealed. A stored link is one more thing that can be wrong.
+  (void)node;
+
+  size_t lost = 0;
+  mm_header *next = mm_recover_next(owner, &lost);
+  if (lost > 0) {
+    g_arena.lost_bytes += lost;
     mm_fail(MM_ERR_CORRUPT_LINKS);
-    return;
   }
-  node->prev = owner;
-  mm_seal(node);
+
+  owner->next = next;
+  mm_seal(owner);
+  if (next != NULL) {
+    next->prev = owner;
+    mm_seal(next);
+  }
 }
 
 // Splits `block` so it holds exactly `need`, provided the remainder is worth
@@ -165,6 +175,7 @@ void *mm_malloc(size_t size) {
 
   mm_header *block = find_best_fit(need);
   if (block == NULL) {
+    MM_STAT_NOTE(MM_STAT_ALLOC_FAILED, 0);
     mm_fail(MM_ERR_NOMEM);
     return NULL;
   }
@@ -187,6 +198,8 @@ void *mm_malloc(size_t size) {
   block->payload_checksum = 0;
   mm_seal(block);
 
+  MM_STAT_NOTE(MM_STAT_ALLOC, size);
+  MM_STAT_ADD(block);
   return payload;
 }
 
@@ -226,6 +239,9 @@ void mm_free(void *ptr) {
     mm_quarantine(block);
     return;
   }
+
+  MM_STAT_NOTE(MM_STAT_FREE, block->requested_size);
+  MM_STAT_SUB(block);
 
   block->in_use = 0;
   block->requested_size = 0;
@@ -295,17 +311,21 @@ void *mm_realloc(void *ptr, size_t new_size) {
     return NULL;
   }
 
+  MM_STAT_NOTE(MM_STAT_REALLOC, new_size);
+
   size_t old_size = block->requested_size;
   uint32_t old_sum = block->payload_checksum;
   uint8_t *payload = mm_payload_of(block);
 
   // Already big enough: shrink in place, handing back any surplus.
   if (block->size >= need) {
+    MM_STAT_SUB(block);
     split_block(block, need);
     block->requested_size = new_size;
     mm_write_canary(block);
     carry_payload_checksum(block, old_size, old_sum, new_size);
     mm_seal(block);
+    MM_STAT_ADD(block);
     return payload;
   }
 
@@ -314,12 +334,14 @@ void *mm_realloc(void *ptr, size_t new_size) {
   if (next != NULL && !next->in_use && mm_checksum_ok(next) &&
       mm_footer_ok(next) && mm_next_adjacent(block) == next &&
       next->prev == block && block->size + MM_BLOCK_TOTAL(next->size) >= need) {
+    MM_STAT_SUB(block);
     coalesce_forward(block);
     split_block(block, need);
     block->requested_size = new_size;
     mm_write_canary(block);
     carry_payload_checksum(block, old_size, old_sum, new_size);
     mm_seal(block);
+    MM_STAT_ADD(block);
     return payload;
   }
 

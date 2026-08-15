@@ -88,6 +88,46 @@ jobs:
       - name: Explore a new seed
         run: ./build/gcc-release/bin/fuzz_shadow --seconds 90
 
+  # A small sweep, enough to catch the classifier or the injector breaking.
+  # Statistically meaningful runs are launched deliberately, not per push.
+  fault-injection:
+    name: fault injection
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake --preset gcc-release
+      - name: Build
+        run: cmake --build --preset gcc-release -- -j$(nproc)
+      - name: Inject
+        run: |
+          ./build/gcc-release/bin/faultinject \
+            --trials 200 --bits 1,2 --csv faults.csv
+      - name: Check the single-bit header result against theory
+        # A checksum over the header detects every single-bit change in it, so
+        # this cell must come out at 100% detection and zero silent corruption.
+        # Anything else is a defect, not a statistic.
+        run: |
+          python3 - <<'PY'
+          import csv, sys
+          rows = list(csv.DictReader(open('faults.csv')))
+          bad = []
+          for r in rows:
+              if r['target'] == 'alloc_hdr' and r['bits'] == '1':
+                  if float(r['detection_pct']) < 100.0 or int(r['undetected_silent']) != 0:
+                      bad.append(r)
+          if bad:
+              print('single-bit header corruption was not fully detected:')
+              for r in bad: print(' ', r)
+              sys.exit(1)
+          print('single-bit header detection matches theory')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fault-injection
+          path: faults.csv
+
   coverage:
     name: coverage
     runs-on: ubuntu-22.04

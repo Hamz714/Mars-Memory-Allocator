@@ -273,11 +273,11 @@ MM_TEST(regression, free_does_not_merge_through_a_broken_prev_link) {
   free(heap);
 }
 
-// A neighbour that fails validation must be dropped from the list, never
-// written through. Its size field is what decides where its footer lands, so
-// sealing a corrupted neighbour scatters writes across -- and past -- the
-// arena. Run under ASan, where such a write is caught rather than tolerated.
-MM_TEST(regression, corrupt_successor_is_dropped_not_written_through) {
+// A neighbour that fails validation must never be written through before it is
+// understood. Its size field is what decides where its footer lands, so sealing
+// a corrupted neighbour scatters writes across -- and past -- the arena. Run
+// under ASan, where such a write is caught rather than tolerated.
+MM_TEST(regression, corrupt_successor_is_never_written_through_blindly) {
   uint8_t *heap = arena_new(ARENA_SIZE);
   REQUIRE_NOT_NULL(heap);
   REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
@@ -299,11 +299,160 @@ MM_TEST(regression, corrupt_successor_is_dropped_not_written_through) {
   // Freeing a merges it with b, after which the list would run on into c.
   mm_free(a);
 
-  CHECK_EQ(mm_last_error(), MM_ERR_CORRUPT_LINKS);
+  // Damage is reported either way; what matters is that the allocator noticed
+  // and did not scatter writes computed from a size it could not trust.
+  CHECK_NE(mm_last_error(), MM_OK);
 
   // The allocator must still answer, rather than having corrupted itself.
   void *fresh = mm_malloc(64);
   (void)fresh;
+
+  free(heap);
+}
+
+// A damaged header whose mirror survives must be rebuilt, not surrendered.
+// Blocks tile the arena, so the damaged block's address follows from its
+// predecessor; only its extent is lost, and the footer still records that.
+MM_TEST(regression, damaged_header_is_rebuilt_from_its_mirror) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *a = mm_malloc(256);
+  void *b = mm_malloc(256);
+  void *c = mm_malloc(256);
+  REQUIRE_NOT_NULL(a);
+  REQUIRE_NOT_NULL(b);
+  REQUIRE_NOT_NULL(c);
+
+  const char msg[] = "c is downstream of the damage";
+  REQUIRE_EQ(mm_write(c, 0, msg, sizeof(msg)), (int64_t)sizeof(msg));
+
+  mm_free(b);
+
+  // Damage c's header only. Its footer is untouched and still records the
+  // block's true extent.
+  mm_header *hc = (mm_header *)(void *)((uint8_t *)c - MM_PREFIX);
+  hc->size ^= 0x20;
+
+  mm_free(a);  // merges forward into b, then meets the damaged header
+
+  // Rebuilt rather than abandoned: the arena tiles again and nothing was lost.
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  CHECK_EQ(g_arena.lost_bytes, 0);
+
+  // And c survived intact, contents included.
+  CHECK_EQ(mm_verify(c), MM_OK);
+  char back[64] = {0};
+  CHECK_EQ(mm_read(c, 0, back, sizeof(msg)), (int64_t)sizeof(msg));
+  CHECK_STR_EQ(back, msg);
+
+  free(heap);
+}
+
+// When both copies are gone the block cannot be rebuilt, and the space really
+// is lost -- but only that block's worth. Abandoning everything downstream
+// would cost the whole arena, and an abandonment nobody counts looks exactly
+// like a heap that lost nothing.
+MM_TEST(regression, unrecoverable_block_costs_only_itself) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *a = mm_malloc(256);
+  void *b = mm_malloc(256);
+  void *c = mm_malloc(256);
+  void *d = mm_malloc(256);
+  REQUIRE_NOT_NULL(a);
+  REQUIRE_NOT_NULL(b);
+  REQUIRE_NOT_NULL(c);
+  REQUIRE_NOT_NULL(d);
+
+  const char msg[] = "d is past the wreckage";
+  REQUIRE_EQ(mm_write(d, 0, msg, sizeof(msg)), (int64_t)sizeof(msg));
+
+  mm_free(b);
+
+  // Destroy both the header and its mirror, leaving nothing to rebuild from.
+  mm_header *hc = (mm_header *)(void *)((uint8_t *)c - MM_PREFIX);
+  mm_footer *fc = mm_footer_of(hc);
+  fc->magic = 0;
+  fc->checksum = 0;
+  hc->size ^= 0x20;
+
+  mm_free(a);
+  CHECK_EQ(mm_last_error(), MM_ERR_CORRUPT_LINKS);
+
+  // Something was surrendered, but nothing like the rest of the arena.
+  CHECK_GT(g_arena.lost_bytes, 0);
+  CHECK_LT(g_arena.lost_bytes, ARENA_SIZE / 4);
+
+  // The walk resynchronised, so d is still reachable and readable.
+  CHECK_EQ(mm_verify(d), MM_OK);
+  char back[64] = {0};
+  CHECK_EQ(mm_read(d, 0, back, sizeof(msg)), (int64_t)sizeof(msg));
+  CHECK_STR_EQ(back, msg);
+
+  free(heap);
+}
+
+// Recovery searches for a mirror rather than being told where one is, so it
+// can be offered a decoy. A wrong repair is worse than no repair: it would
+// hand back a block of the wrong extent and overlap a live neighbour.
+//
+// Plant a perfectly-formed footer, correct magic and correct checksum, at a
+// position that implies a much smaller block than the real one -- and closer
+// to the start, so the search meets it first. It must be refused, because the
+// space after the block it describes is not another block.
+MM_TEST(regression, recovery_refuses_a_plausible_false_mirror) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *a = mm_malloc(256);
+  void *b = mm_malloc(256);
+  void *target = mm_malloc(2048);
+  void *c = mm_malloc(256);
+  REQUIRE_NOT_NULL(a);
+  REQUIRE_NOT_NULL(b);
+  REQUIRE_NOT_NULL(target);
+  REQUIRE_NOT_NULL(c);
+
+  // c is the witness downstream of the damage. target is deliberately never
+  // written, so it carries no payload checksum for the decoy to disturb.
+  const char msg[] = "c must survive a bad guess";
+  REQUIRE_EQ(mm_write(c, 0, msg, sizeof(msg)), (int64_t)sizeof(msg));
+
+  mm_free(b);  // so that freeing a merges forward and then meets target
+
+  uint8_t *start = (uint8_t *)target - MM_PREFIX;
+
+  // A decoy describing a 64-byte block, planted exactly where such a block's
+  // footer would sit -- nearer the start than the real one, so the search
+  // meets it first. Correct magic, and a checksum computed over its own
+  // fields: internally it is beyond reproach.
+  mm_header decoy;
+  memset(&decoy, 0, sizeof(decoy));
+  decoy.magic = MM_HEADER_MAGIC;
+  decoy.in_use = 0;
+  decoy.size = 64;
+  decoy.checksum = mm_checksum(&decoy);
+  memcpy(start + sizeof(mm_header) + 64, &decoy, sizeof(decoy));
+
+  // Now destroy the real header so recovery has to go looking.
+  mm_header *ht = (mm_header *)(void *)start;
+  ht->size ^= 0x40;
+
+  mm_free(a);
+
+  // Believing the decoy would have made target 64 bytes long and put every
+  // block after it in the wrong place. Instead the real mirror is found.
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  CHECK_EQ(g_arena.lost_bytes, 0);
+  CHECK_EQ(mm_verify(c), MM_OK);
+  char back[64] = {0};
+  CHECK_EQ(mm_read(c, 0, back, sizeof(msg)), (int64_t)sizeof(msg));
+  CHECK_STR_EQ(back, msg);
 
   free(heap);
 }

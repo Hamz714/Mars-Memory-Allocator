@@ -95,6 +95,39 @@ int64_t mm_read(const void *ptr, size_t offset, void *buf, size_t len);
 // out-of-bounds range, or detected corruption.
 int64_t mm_write(void *ptr, size_t offset, const void *src, size_t len);
 
+// --- Counters --------------------------------------------------------------
+
+// Snapshot of allocator activity. All fields are zero unless the library was
+// built with counters enabled, which the benchmark harness uses to report
+// utilisation and per-allocation overhead.
+typedef struct mm_stats {
+  uint64_t alloc_calls;
+  uint64_t alloc_failures;
+  uint64_t free_calls;
+  uint64_t realloc_calls;
+
+  uint64_t live_blocks;
+  size_t live_payload_bytes;  // bytes the caller asked for and still holds
+  size_t live_block_bytes;    // what those blocks actually occupy
+
+  // Sampled together, at the moment occupancy was highest. Taking them as one
+  // snapshot is what makes overhead-per-allocation a meaningful ratio; peak
+  // payload and peak occupancy on their own can occur at different times.
+  size_t peak_block_bytes;
+  size_t peak_payload_bytes;
+  uint64_t peak_blocks;
+
+  uint64_t quarantined_blocks;
+  size_t quarantined_bytes;
+
+  // Blocks whose metadata was rebuilt from its mirror rather than surrendered.
+  uint64_t repaired_blocks;
+  size_t repaired_bytes;
+} mm_stats_t;
+
+void mm_stats_get(mm_stats_t *out);
+void mm_stats_reset(void);
+
 // --- Integrity -------------------------------------------------------------
 
 // Verifies one block: header checksum, mirrored footer, canary, and payload

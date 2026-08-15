@@ -64,6 +64,10 @@ typedef struct mm_arena {
   uint8_t *base;
   size_t size;
   mm_header *first;
+  // Space belonging to quarantined blocks. Deliberately never reclaimed, but
+  // tracked, so that the consistency check can tell the difference between
+  // memory that was given up on purpose and memory that has gone missing.
+  size_t lost_bytes;
 } mm_arena;
 
 extern mm_arena g_arena;
@@ -119,6 +123,15 @@ void mm_seal(mm_header *block);
 // Unlinks a block whose metadata can no longer be trusted.
 void mm_quarantine(mm_header *block);
 
+// Produces the block that should follow `owner`, whose metadata is trusted.
+//
+// Blocks tile the arena, so the following block's address is known even when
+// its header is not. A header that cannot be trusted is rebuilt from its
+// mirrored footer where that footer can be located and corroborated; where it
+// cannot, the walk resynchronises on the next intact block. Any span that had
+// to be abandoned is reported through `lost` rather than silently dropped.
+mm_header *mm_recover_next(mm_header *owner, size_t *lost);
+
 // Recovers a block header from a payload pointer, validating as it goes.
 // Returns NULL and sets the thread status if the pointer is not ours.
 mm_header *mm_block_of(const void *ptr);
@@ -126,5 +139,30 @@ mm_header *mm_block_of(const void *ptr);
 // Upper bound on how many blocks the arena can hold; bounds every traversal so
 // that a corrupted link cannot produce an unbounded loop.
 size_t mm_max_blocks(void);
+
+// --- Counters (mm_stats.c) -------------------------------------------------
+
+typedef enum mm_stats_event {
+  MM_STAT_ALLOC,
+  MM_STAT_ALLOC_FAILED,
+  MM_STAT_FREE,
+  MM_STAT_REALLOC,
+  MM_STAT_QUARANTINE,
+  MM_STAT_REPAIR
+} mm_stats_event_t;
+
+#ifdef MM_STATS
+void mm_stats_block_added(const mm_header *block);
+void mm_stats_block_removed(const mm_header *block);
+void mm_stats_note(mm_stats_event_t event, size_t bytes);
+#  define MM_STAT_ADD(b) mm_stats_block_added(b)
+#  define MM_STAT_SUB(b) mm_stats_block_removed(b)
+#  define MM_STAT_NOTE(e, n) mm_stats_note((e), (n))
+#else
+// Compiled away completely, so the fast path carries no trace of them.
+#  define MM_STAT_ADD(b) ((void)0)
+#  define MM_STAT_SUB(b) ((void)0)
+#  define MM_STAT_NOTE(e, n) ((void)0)
+#endif
 
 #endif  // MARS_MM_INTERNAL_H_
