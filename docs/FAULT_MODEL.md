@@ -61,9 +61,10 @@ impressive.
 | Tail mirror (`paranoid`) | full copy of the header, at a fixed offset from the block's end | recovery |
 | Payload | CRC32C over the whole payload | `mm_read`, `mm_verify` |
 | End of payload | 8-byte canary, bound to the block's index | every access, free, resize |
-| Free-list links | structural cross-checks, XOR-masked with the arena secret | every traversal, `mm_check_heap` |
-| Boundary tag | corroborated against the header it claims to describe | every backward step, `mm_check_heap` |
-| Topology | `PREV_IN_USE` agreement, no adjacent free blocks, exact tiling of the arena | `mm_check_heap` |
+| Free-list links | structural cross-checks in a fixed order, XOR-masked with the arena secret | every traversal, `mm_check_heap` |
+| Boundary tag | corroborated against the header it claims to describe | every backward step, `mm_check_heap`, the patrol |
+| Topology | `PREV_IN_USE` agreement, no adjacent free blocks, exact tiling, bin membership against the tiling | `mm_check_heap` |
+| Anything untouched | the bounded patrol, resuming where it stopped | every `N` allocator calls |
 
 A neighbour that fails validation is never *written through* — a block's
 control word decides where its own trailer lands, so sealing a corrupted
@@ -148,6 +149,34 @@ distinguished from "harmless", and a detection rate means nothing.
 - **Detection coverage** is `detected / (detected + silent)` — of the flips
   that actually mattered, how many were caught. Benign flips are excluded,
   because there was nothing there to catch.
+
+## Detection latency
+
+Whether damage is caught stopped being the only question once allocation became
+O(1). The linear search it replaced revalidated every free block on every call,
+so damage was found almost as soon as anything happened; with bins, a block
+nobody is using is a block nobody looks at, and a bounded patrol decides how
+long it stays that way. **How long** is therefore now a measured quantity
+rather than an implicit one.
+
+Each trial runs up to 4096 ordinary allocations and frees after the flip,
+deliberately never touching the damaged block, and records the call on which
+the allocator first reported something wrong. `--scrub-interval` sweeps the
+setting; the interval is a mandatory CSV column, because two runs at different
+settings are not comparable and nothing else in the row would say so.
+
+Read `latency_mean_ops` together with `latency_n`. The measurement window is
+4096 calls, so the mean is **censored**: when `latency_n` falls short of the
+trial count the mean is a lower bound, not an estimate. An interval at or above
+the window produces exactly that.
+
+`bench/results/scrub-sweep.csv` holds the curve. What it shows is two different
+populations. `free_hdr` and `links` sit on the allocation path and are found in
+ten to fifteen calls at every setting, patrol included or not — validate-on-
+touch is what catches them. An allocated block's header, canary and payload
+track the interval almost exactly, and with the patrol off are not found by
+traffic at all. That second row is the honest price of O(1) allocation, and the
+patrol is what buys it back.
 
 ## A free correctness oracle
 

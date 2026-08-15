@@ -170,6 +170,18 @@ The free-list links live in payload space the block is not using, so they cost
 nothing. XOR-ing them with the arena secret means a stray write that happens to
 look like a pointer does not survive validation.
 
+There is no single free list. Blocks are filed by size into 128 bins — 64
+exact classes covering everything up to about a kilobyte, then 64 log-spaced
+bins at four per octave — with a 128-bit bitmap saying which are non-empty, so
+the smallest sufficient bin is found by a mask and a `ctz` rather than by
+looking. `src/mm_freelist.h` sets out how the sizes are cut and why the index
+being monotonic is the property everything else rests on.
+
+The links are the most attacked structure in any allocator and no checksum
+covers them, so unlinking validates in a fixed order before it dereferences
+anything: in the arena and aligned, then the header checksum, then free and in
+*this* bin, then the two back-links. Only after all four does a splice happen.
+
 The last eight bytes are the **boundary tag**: a free block repeats its own
 extent there so the block after it can step backwards in O(1). This is legible
 **only** when the following block's `PREV_IN_USE` is clear. Read at any other
@@ -198,8 +210,41 @@ two sets of pointers can. It checks that
 - no two free blocks are adjacent (a missed coalesce),
 - the blocks tile `[lo, hi)` **exactly**,
 - the quarantined blocks account for exactly `lost_bytes`, and
-- the free list contains precisely the free blocks the walk found, in a chain
-  whose back-links all agree.
+- the bins contain precisely the free blocks the walk found — every one in
+  exactly one bin, in the bin its size asks for, no allocated block in any of
+  them, back-links all agreeing, and a bitmap that says the same thing about
+  which bins are empty.
+
+## Covering what nobody touches
+
+O(1) allocation means the allocator stops touching most of the arena. The
+linear search it replaced revalidated every free block on every call, so damage
+in cold memory was found incidentally; binning takes that away, and ignoring
+the loss would trade the project's whole reliability story for throughput.
+
+Two tiers replace it. **Validate on touch** is unchanged and O(1): every block
+popped by malloc, every block freed, both coalescing neighbours. **`mm_scrub`**
+is a bounded patrol over the implicit list, resuming where it stopped, run
+automatically every `N` allocator calls — 1024 by default, sixteen blocks at a
+time, both settable through `mm_set_scrub_interval`. It is what a hardware ECC
+scrubber does, and the resemblance is the argument for it rather than a
+decoration.
+
+What the patrol does with what it finds is what every other path does: a broken
+canary quarantines the block, an unreadable header goes through recovery, and a
+free block's boundary tag is rewritten from the extent its checksum has already
+vouched for — the one repair available under every profile. A payload that no
+longer matches its checksum is *reported and left alone*, unlike on the read
+path, because the patrol was not asked for those bytes and writing through the
+returned pointer is permitted; destroying a live block on the strength of a
+checksum the caller never promised to maintain would be the wrong trade.
+
+The cost is a curve rather than a constant, and `bench/results/scrub-sweep.csv`
+measures it: mean calls between a flip and the allocator noticing, against the
+scrub interval. Damage to a free header or a link is found in ten to fifteen
+calls whatever the interval, because those sit on the allocation path. Damage
+to an allocated block's header, canary or payload tracks the interval directly
+— and with the patrol off is never found by traffic at all.
 
 Quarantine no longer removes a block from anything. A block given up on stays
 in the tiling as permanently-allocated space nobody owns, flagged
