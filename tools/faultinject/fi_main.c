@@ -49,19 +49,24 @@ static const char *outcome_name[OUT_COUNT] = {
 
 // --- Injection targets ------------------------------------------------------
 
+// The allocated-block footer is gone: with boundary tags a footer exists only
+// inside a free block, so `footer` was replaced by `free_footer`. The rest are
+// the same places as before, at their new offsets.
 typedef enum {
   TGT_ALLOC_HDR = 0,
   TGT_FREE_HDR,
   TGT_LINKS,
-  TGT_FOOTER,
+  TGT_FREE_FOOTER,
   TGT_PAYLOAD,
   TGT_CANARY,
   TGT_ANY,
   TGT_COUNT
 } target_t;
 
-static const char *target_name[TGT_COUNT] = {
-    "alloc_hdr", "free_hdr", "links", "footer", "payload", "canary", "any"};
+static const char *target_name[TGT_COUNT] = {"alloc_hdr", "free_hdr",
+                                             "links",     "free_footer",
+                                             "payload",   "canary",
+                                             "any"};
 
 // --- Trial ------------------------------------------------------------------
 
@@ -112,41 +117,46 @@ static int choose_region(mars_rng *rng, target_t target, uint8_t **out_base,
   }
   if (target == TGT_PAYLOAD || target == TGT_CANARY) {
     if (g_live == 0) return 0;
+    if (target == TGT_CANARY && MM_CANARY_SIZE == 0) {
+      return 0;  // the fast profile has no canary to aim at
+    }
     slot *s = &g_slots[mars_rng_below(rng, (uint64_t)g_live)];
     if (target == TGT_PAYLOAD) {
       *out_base = (uint8_t *)s->ptr;
       *out_len = s->size;
     } else {
       *out_base = (uint8_t *)s->ptr + s->size;
-      *out_len = sizeof(uint64_t);
+      *out_len = MM_CANARY_SIZE;
     }
     return 1;
   }
 
-  // Walk the block list and collect candidates matching the requested kind.
-  mm_header *candidates[256];
+  // Walk the tiling -- there is no block list any more -- collecting
+  // candidates of the requested kind. Free blocks are wanted for the link and
+  // footer targets, since those structures exist only inside a free block.
+  mm_block *candidates[256];
   size_t n = 0;
   size_t budget = mm_max_blocks();
-  for (mm_header *b = g_arena.first; b != NULL && n < 256; b = b->next) {
+  for (uint8_t *p = g_arena.lo; p < g_arena.hi && n < 256;) {
     if (budget-- == 0) break;
-    if (!mm_checksum_ok(b)) break;
-    uint32_t want_used = (target == TGT_ALLOC_HDR) ? 1u : 0u;
-    if (target == TGT_LINKS || target == TGT_FOOTER || b->in_use == want_used) {
-      candidates[n++] = b;
-    }
+    mm_block *b = (mm_block *)(void *)p;
+    if (!mm_header_ok(b)) break;
+    bool want_used = (target == TGT_ALLOC_HDR);
+    if (mm_is_used(b) == want_used) candidates[n++] = b;
+    p += mm_block_size(b);
   }
   if (n == 0) return 0;
 
-  mm_header *b = candidates[mars_rng_below(rng, (uint64_t)n)];
+  mm_block *b = candidates[mars_rng_below(rng, (uint64_t)n)];
   if (target == TGT_LINKS) {
-    *out_base = (uint8_t *)&b->next;
-    *out_len = 2 * sizeof(mm_header *);
-  } else if (target == TGT_FOOTER) {
-    *out_base = (uint8_t *)mm_footer_of(b);
-    *out_len = sizeof(mm_header);
+    *out_base = mm_payload_of(b);
+    *out_len = 2 * sizeof(uint64_t);
+  } else if (target == TGT_FREE_FOOTER) {
+    *out_base = mm_block_end(b) - sizeof(uint64_t);
+    *out_len = sizeof(uint64_t);
   } else {
-    *out_base = (uint8_t *)b;
-    *out_len = sizeof(mm_header);
+    *out_base = (uint8_t *)(void *)b;
+    *out_len = MM_HDR_SIZE;
   }
   return 1;
 }
@@ -163,6 +173,11 @@ static void flip_bits(mars_rng *rng, uint8_t *base, size_t len, int bits) {
 static void run_child(uint64_t seed, target_t target, int bits) {
   mars_rng rng;
   mars_rng_seed(&rng, seed);
+
+  // The arena secret is normally drawn from the clock and a stack address,
+  // which would make a trial unrepeatable. Pin it to the trial seed so a
+  // result found here can be replayed byte for byte.
+  mm_pin_secret(seed | 1u);
 
   build_state(&rng);
 
@@ -304,14 +319,19 @@ int main(int argc, char **argv) {
   if (csv_path != NULL) {
     csv = fopen(csv_path, "w");
     if (csv != NULL) {
-      fprintf(csv, "target,bits,trials,discarded");
+      fprintf(csv, "profile,target,bits,trials,discarded");
       for (int o = 0; o < OUT_COUNT; o++) fprintf(csv, ",%s", outcome_name[o]);
       fprintf(csv, ",detection_pct,detection_lo,detection_hi,"
                    "silent_pct,silent_lo,silent_hi\n");
     }
   }
 
-  printf("fault injection: %llu trials per cell, seed %llu, arena %zu bytes\n",
+  // The profile decides how much metadata a block carries, so it decides what
+  // can be detected. A results table without it on the front is not comparable
+  // with any other results table.
+  printf("fault injection: profile %s, %zu B metadata per block\n",
+         mm_profile(), mm_metadata_overhead());
+  printf("%llu trials per cell, seed %llu, arena %zu bytes\n",
          (unsigned long long)trials, (unsigned long long)base_seed,
          g_heap_size);
   printf("%-10s %5s %8s %8s %8s %8s %8s %8s   %-18s %-18s\n", "target", "bits",
@@ -389,8 +409,9 @@ int main(int argc, char **argv) {
       fflush(stdout);
 
       if (csv != NULL) {
-        fprintf(csv, "%s,%d,%llu,%llu", target_name[t], bits_list[b],
-                (unsigned long long)counted, (unsigned long long)discarded);
+        fprintf(csv, "%s,%s,%d,%llu,%llu", mm_profile(), target_name[t],
+                bits_list[b], (unsigned long long)counted,
+                (unsigned long long)discarded);
         for (int o = 0; o < OUT_COUNT; o++) {
           fprintf(csv, ",%llu", (unsigned long long)counts[o]);
         }

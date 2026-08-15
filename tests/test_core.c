@@ -54,9 +54,7 @@ MM_TEST(core, init_rejects_a_misaligned_arena) {
 }
 
 MM_TEST(core, calls_before_init_report_not_initialized) {
-  g_arena.base = NULL;
-  g_arena.size = 0;
-  g_arena.first = NULL;
+  memset(&g_arena, 0, sizeof(g_arena));
 
   CHECK_NULL(mm_malloc(32));
   CHECK_EQ(mm_last_error(), MM_ERR_NOT_INITIALIZED);

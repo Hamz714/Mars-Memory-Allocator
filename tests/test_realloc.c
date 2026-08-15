@@ -7,6 +7,8 @@
 #include <string.h>
 
 #include "mars/allocator.h"
+// For MM_HAS_CANARY: which failure modes exist at all depends on the profile.
+#include "mm_internal.h"
 
 #define ARENA_SIZE (64u * 1024u)
 
@@ -206,5 +208,39 @@ MM_TEST(realloc, a_failed_grow_leaves_the_original_untouched) {
 
   mm_free(p);
   CHECK_EQ(mm_check_heap(), MM_OK);
+  free(heap);
+}
+
+// The three ways a resize is refused before it touches the block, each of
+// which has to leave the arena exactly as it found it.
+MM_TEST(realloc, refuses_a_freed_pointer_an_overrun_block_and_an_absurd_size) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  // A size whose block would overflow the arithmetic, not merely the arena.
+  void *p = mm_malloc(64);
+  REQUIRE_NOT_NULL(p);
+  CHECK_NULL(mm_realloc(p, SIZE_MAX));
+  CHECK_EQ(mm_last_error(), MM_ERR_NOMEM);
+  CHECK_EQ(mm_verify(p), MM_OK);
+
+  // Already free.
+  mm_free(p);
+  CHECK_NULL(mm_realloc(p, 128));
+  CHECK_EQ(mm_last_error(), MM_ERR_DOUBLE_FREE);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+#if MM_HAS_CANARY
+  // Overrun past the payload: resizing would relocate contents already known
+  // to be wrong, so it is refused and the block given up instead.
+  void *q = mm_malloc(64);
+  REQUIRE_NOT_NULL(q);
+  memset((uint8_t *)q + 64, 0xFF, 4);
+  CHECK_NULL(mm_realloc(q, 256));
+  CHECK_EQ(mm_last_error(), MM_ERR_QUARANTINED);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+#endif
+
   free(heap);
 }

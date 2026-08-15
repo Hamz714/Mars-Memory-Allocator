@@ -77,6 +77,11 @@ static void write_env_comment(FILE *out) {
   fprintf(out, "# tsc_usable=%d tsc_flags_known=%d ns_per_tick=%.6f\n",
           t->tsc_usable ? 1 : 0, t->tsc_flags_known ? 1 : 0, t->ns_per_tick);
   fprintf(out, "# timer_overhead_ns=%.2f\n", t->overhead_ns);
+  // The profile decides how much metadata a block carries and how much
+  // validation each access does, so two runs are only comparable when it
+  // matches. Recording it here is what makes that checkable after the fact.
+  fprintf(out, "# profile=%s metadata_bytes=%zu\n", mm_profile(),
+          mm_metadata_overhead());
 #ifdef MM_STATS
   fprintf(out, "# counters=on\n");
 #else

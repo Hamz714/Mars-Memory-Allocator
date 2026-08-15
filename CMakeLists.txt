@@ -118,7 +118,8 @@ add_library(mars ${MARS_LIB_TYPE}
   src/mm_core.c
   src/mm_integrity.c
   src/mm_access.c
-  src/mm_stats.c)
+  src/mm_stats.c
+  src/mm_crc32.c)
 
 add_library(mars::mars ALIAS mars)
 
@@ -173,6 +174,8 @@ if(BUILD_TESTING)
     set_tests_properties(${name} PROPERTIES TIMEOUT 60)
   endfunction()
 
+  mars_add_test(test_crc32       tests/test_crc32.c)
+  mars_add_test(test_layout      tests/test_layout.c)
   mars_add_test(test_core        tests/test_core.c)
   mars_add_test(test_access      tests/test_access.c)
   mars_add_test(test_realloc     tests/test_realloc.c)

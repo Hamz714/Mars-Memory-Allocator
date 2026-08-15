@@ -20,7 +20,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [gcc-debug, gcc-release, clang-debug, clang-release]
+        # gcc-release is the hardened profile; gcc-fast and gcc-paranoid are
+        # the same build with MARS_PROFILE changed. All three carry -Werror,
+        # because a profile that only compiles with warnings is not a profile
+        # anyone can ship.
+        preset: [gcc-debug, gcc-release, gcc-fast, gcc-paranoid,
+                 clang-debug, clang-release]
     steps:
       - uses: actions/checkout@v5
       - name: Configure
@@ -31,34 +36,42 @@ jobs:
         run: ctest --preset ${{ matrix.preset }}
 
   sanitizers:
-    name: asan + ubsan
+    name: asan + ubsan / ${{ matrix.preset }}
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [gcc-asan-ubsan, gcc-asan-fast, gcc-asan-paranoid]
     steps:
       - uses: actions/checkout@v5
       - name: Configure
-        run: cmake --preset gcc-asan-ubsan
+        run: cmake --preset ${{ matrix.preset }}
       - name: Build
-        run: cmake --build --preset gcc-asan-ubsan -- -j$(nproc)
+        run: cmake --build --preset ${{ matrix.preset }} -- -j$(nproc)
       - name: Test
-        run: ctest --preset gcc-asan-ubsan
+        run: ctest --preset ${{ matrix.preset }}
       - name: Fuzz
-        run: ./build/gcc-asan-ubsan/bin/fuzz_shadow --seconds 60
+        run: ./build/${{ matrix.preset }}/bin/fuzz_shadow --seconds 60
 
   valgrind:
-    name: valgrind
+    name: valgrind / ${{ matrix.preset }}
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [gcc-debug, gcc-debug-fast, gcc-debug-paranoid]
     steps:
       - uses: actions/checkout@v5
       - name: Install valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
       - name: Configure
-        run: cmake --preset gcc-debug
+        run: cmake --preset ${{ matrix.preset }}
       - name: Build
-        run: cmake --build --preset gcc-debug -- -j$(nproc)
+        run: cmake --build --preset ${{ matrix.preset }} -- -j$(nproc)
       - name: Memcheck the test binaries
         run: |
           set -e
-          for t in build/gcc-debug/bin/test_*; do
+          for t in build/${{ matrix.preset }}/bin/test_*; do
             echo "== $t"
             valgrind -q --error-exitcode=1 --leak-check=full \
                      --errors-for-leak-kinds=all "$t"
@@ -66,7 +79,7 @@ jobs:
       - name: Memcheck the fuzzer
         run: |
           valgrind -q --error-exitcode=1 --leak-check=full \
-                   ./build/gcc-debug/bin/fuzz_shadow --seed 20260809 --ops 6000
+            ./build/${{ matrix.preset }}/bin/fuzz_shadow --seed 20260809 --ops 6000
 
   # Replays fixed seeds so a failure found here is reproducible verbatim, then
   # spends a little time on a fresh one to keep finding new ground.
@@ -91,41 +104,66 @@ jobs:
   # A small sweep, enough to catch the classifier or the injector breaking.
   # Statistically meaningful runs are launched deliberately, not per push.
   fault-injection:
-    name: fault injection
+    name: fault injection / ${{ matrix.preset }}
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - preset: gcc-release   # hardened
+            checksum: 'yes'
+          - preset: gcc-fast
+            checksum: 'no'
+          - preset: gcc-paranoid
+            checksum: 'yes'
     steps:
       - uses: actions/checkout@v5
       - name: Configure
-        run: cmake --preset gcc-release
+        run: cmake --preset ${{ matrix.preset }}
       - name: Build
-        run: cmake --build --preset gcc-release -- -j$(nproc)
+        run: cmake --build --preset ${{ matrix.preset }} -- -j$(nproc)
       - name: Inject
         run: |
-          ./build/gcc-release/bin/faultinject \
+          ./build/${{ matrix.preset }}/bin/faultinject \
             --trials 200 --bits 1,2 --csv faults.csv
-      - name: Check the single-bit header result against theory
-        # A checksum over the header detects every single-bit change in it, so
-        # this cell must come out at 100% detection and zero silent corruption.
-        # Anything else is a defect, not a statistic.
+      - name: Check the results against what the profile promises
+        env:
+          HAS_CHECKSUM: ${{ matrix.checksum }}
+        # Two different promises. Every profile promises never to leave the
+        # arena -- a crash is a defect under all of them. Only a profile with a
+        # checksum promises detection, and there the single-bit header cell is
+        # decidable from theory: a CRC over the header catches every one, so
+        # anything below 100% is a defect and not a statistic.
+        #
+        # The fast profile is measured too, and its numbers are recorded rather
+        # than gated. Leaving it out would hide the cost of the trade instead
+        # of pricing it.
         run: |
           python3 - <<'PY'
-          import csv, sys
+          import csv, os, sys
           rows = list(csv.DictReader(open('faults.csv')))
+          if not rows:
+              sys.exit('faultinject produced no rows')
           bad = []
           for r in rows:
-              if r['target'] == 'alloc_hdr' and r['bits'] == '1':
-                  if float(r['detection_pct']) < 100.0 or int(r['undetected_silent']) != 0:
-                      bad.append(r)
+              if int(r['crash']) != 0:
+                  bad.append(('crash', r))
+          if os.environ['HAS_CHECKSUM'] == 'yes':
+              for r in rows:
+                  if r['target'] == 'alloc_hdr' and r['bits'] == '1':
+                      if float(r['detection_pct']) < 100.0 or int(r['undetected_silent']) != 0:
+                          bad.append(('single-bit header', r))
           if bad:
-              print('single-bit header corruption was not fully detected:')
-              for r in bad: print(' ', r)
+              for why, r in bad:
+                  print(why, '->', r)
               sys.exit(1)
-          print('single-bit header detection matches theory')
+          silent = sum(int(r['undetected_silent']) for r in rows)
+          print('profile', rows[0]['profile'], 'ok;', silent, 'silent cases recorded')
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fault-injection
+          name: fault-injection-${{ matrix.preset }}
           path: faults.csv
 
   coverage:
