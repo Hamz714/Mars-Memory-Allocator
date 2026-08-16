@@ -147,9 +147,15 @@ void mm_bin_remove(mm_block *b) {
     mm_fail(MM_ERR_CORRUPT_LINKS);
     mm_bins_rebuild();
     if (!links_ok(b, bin)) {
-      // The rebuild could not reach `b`, so it is on no list at all.
-      mm_free_link_set(b, MM_LINK_NEXT, NULL, s);
-      mm_free_link_set(b, MM_LINK_PREV, NULL, s);
+      // The rebuild could not reach `b`, so there is no list to take it off.
+      // Its links are cleared only if the space they sit in is still the
+      // block's own to write: scribbling over an allocated block's payload to
+      // tidy up a list it was never on would destroy the caller's data to no
+      // purpose whatsoever.
+      if (!mm_is_used(b)) {
+        mm_free_link_set(b, MM_LINK_NEXT, NULL, s);
+        mm_free_link_set(b, MM_LINK_PREV, NULL, s);
+      }
       return;
     }
   }
@@ -214,9 +220,13 @@ mm_block *mm_bin_find(size_t need) {
     mm_block *b = scan_bin(bin, need, &damaged);
     if (b != NULL) return b;
 
+    // The smallest non-empty bin above it, whose every member is strictly
+    // larger and therefore fits. There is no "try the next one after that":
+    // a head that cannot be used means the bins disagree with themselves, and
+    // the answer to that is a rebuild, not another probe.
     if (!damaged) {
-      for (size_t j = next_nonempty(bin + 1); j < MM_BIN_COUNT && !damaged;
-           j = next_nonempty(j + 1)) {
+      size_t j = next_nonempty(bin + 1);
+      if (j < MM_BIN_COUNT) {
         b = bin_head(j, &damaged);
         if (b != NULL) return b;
       }

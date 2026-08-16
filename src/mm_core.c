@@ -94,35 +94,50 @@ int mm_init(void *heap, size_t heap_size) {
 // --- Splitting and coalescing ----------------------------------------------
 //
 // A block's size decides which bin it belongs in, so merging is where bin
-// membership is easiest to get wrong: both inputs have to come out of their
-// bins *before* their sizes change, and the result goes into the bin its new
-// size asks for. Both absorb helpers below therefore take a free block that is
-// in no bin and leave it that way, and the caller does the single insert once
-// the extent has stopped moving.
+// membership is easiest to get wrong. The rule that makes it safe is not
+// obvious and is worth stating plainly:
+//
+//   **a block that is free in the tiling must be in a bin.**
+//
+// Not "usually", but at every point where a bin operation could find damaged
+// links -- because the answer to damaged links is to rebuild the bins from the
+// tiling, and the rebuild files every free block it walks over. A block held
+// deliberately out of the bins while it is being merged would be refiled by
+// that rebuild and then merged away underneath it, leaving a bin pointing into
+// the middle of somebody else's block. It costs one allocation with a damaged
+// free list to reach, and the arena never recovers.
+//
+// So coalescing happens while the block doing the absorbing is still marked
+// **in use**, which is exactly the trick mm_malloc already uses to keep the
+// arena walkable through a split. Every mm_bin_remove below is reached with
+// the bins and the tiling in complete agreement, so a rebuild at that moment
+// reproduces what is already there and the retry succeeds. Between a removal
+// and the tiling change that makes it true, nothing that could rebuild is
+// called.
 
-// Merges `b` with the block after it when that one is free. `b` must be free
-// and in no bin; the neighbour is taken out of its own bin here.
-static void absorb_next(mm_block *b) {
+// Extends `b` over whichever of its neighbours are free, taking each of them
+// out of its bin. `b` must be marked in use, and therefore in no bin; it stays
+// that way. Returns the block now spanning the whole run, which is `b` itself
+// or its predecessor, still marked in use and still in no bin.
+static mm_block *absorb_neighbours(mm_block *b) {
   uint8_t *end = mm_block_end(b);
-  if (end >= g_arena.hi) return;
+  if (end < g_arena.hi) {
+    mm_block *n = (mm_block *)(void *)end;
+    // A neighbour that fails validation is never merged and never written
+    // through. Quarantined blocks report as in use, so they are excluded here
+    // without needing a case of their own.
+    if (mm_header_ok(n) && !mm_is_used(n)) {
+      mm_bin_remove(n);
+      // Immediately, with nothing that could rebuild in between: after this
+      // line `n` is not in the tiling either, and the two agree again.
+      mm_set_block_size(b, mm_block_size(b) + mm_block_size(n));
+      // `n` has stopped being a block boundary, so a patrol cursor parked on
+      // it has to come back to one.
+      mm_scrub_forget((uint8_t *)(void *)b, mm_block_end(b));
+      mm_seal(b);
+    }
+  }
 
-  mm_block *n = (mm_block *)(void *)end;
-  // A neighbour that fails validation is never merged and never written
-  // through. Quarantined blocks report as in use, so they are excluded here
-  // without needing a case of their own.
-  if (!mm_header_ok(n) || mm_is_used(n)) return;
-
-  mm_bin_remove(n);
-  mm_set_block_size(b, mm_block_size(b) + mm_block_size(n));
-  // `n` has stopped being a block boundary, so a patrol cursor parked on it
-  // has to come back to one.
-  mm_scrub_forget((uint8_t *)(void *)b, mm_block_end(b));
-  mm_publish(b);
-}
-
-// Merges `b` into the free block before it, if there is one. Same contract as
-// absorb_next; returns whichever block survived, still in no bin.
-static mm_block *absorb_into_prev(mm_block *b) {
   // Backwards is the sharp edge: the predecessor's boundary tag is only
   // legible because PREV_IN_USE says so, and mm_prev_free_block corroborates
   // the tag against the header it claims to describe before returning it.
@@ -130,10 +145,26 @@ static mm_block *absorb_into_prev(mm_block *b) {
   if (prev == NULL) return b;
 
   mm_bin_remove(prev);
-  mm_set_block_size(prev, mm_block_size(prev) + mm_block_size(b));
+  // In use rather than free, for the same reason as above -- and carrying the
+  // trailer's worth of slack, so that the notional payload of this temporary
+  // block ends inside it rather than at the arena's edge.
+  mm_set_word(prev, mm_block_size(prev) + mm_block_size(b), MM_TRAIL, true,
+              false);
   mm_scrub_forget((uint8_t *)(void *)prev, mm_block_end(prev));
-  mm_publish(prev);
+  mm_seal(prev);
   return prev;
+}
+
+// Marks a block that absorb_neighbours produced as free, publishes it, and
+// files it. The insert is the last thing to happen, and by then the extent has
+// stopped moving.
+static void release_block(mm_block *b) {
+  mm_set_word(b, mm_block_size(b), 0, false, false);
+#if MM_HAS_CRC
+  b->payload_crc = 0;
+#endif
+  mm_publish(b);
+  mm_bin_insert(b);
 }
 
 // Trims `b` to `need`, handing the remainder back as a free block. `b` must
@@ -151,16 +182,16 @@ static void split_block(mm_block *b, size_t need) {
 #if MM_HAS_CRC
   tail->payload_crc = 0;
 #endif
-  mm_set_word(tail, leftover, 0, false, false);
+  // Born in use, like every block that is about to absorb a neighbour.
+  mm_set_word(tail, leftover, MM_TRAIL, true, false);
   mm_set_prev_in_use(tail, true);  // `b` is in use whenever a split happens
-  mm_publish(tail);
+  mm_seal(tail);
 
   // The block that followed may itself be free -- shrinking an allocation in
   // place is the case where that happens. Leaving two free blocks side by side
   // would fragment the arena permanently. Nothing precedes `tail` but `b`,
-  // which is in use, so there is no backward merge to consider.
-  absorb_next(tail);
-  mm_bin_insert(tail);
+  // which is in use, so the backward half of this finds nothing.
+  release_block(absorb_neighbours(tail));
 }
 
 // Stamps a block as holding exactly `size` bytes for the caller, and seals it.
@@ -268,18 +299,10 @@ void mm_free(void *ptr) {
   memset(mm_payload_of(b), 0, mm_block_size(b) - MM_HDR_SIZE);
 #endif
 
-  mm_set_word(b, mm_block_size(b), 0, false, false);
-#if MM_HAS_CRC
-  b->payload_crc = 0;
-#endif
-  mm_publish(b);
-
-  // Merge in both directions before binning anything: the block's final extent
-  // is what decides its bin, and inserting it twice over would be wasted work
-  // on the one path that has to stay cheap.
-  absorb_next(b);
-  b = absorb_into_prev(b);
-  mm_bin_insert(b);
+  // Coalesce first, while `b` is still marked in use, then mark the whole run
+  // free in one step. See absorb_neighbours for why that order is the safe one
+  // rather than merely the tidy one.
+  release_block(absorb_neighbours(b));
 
   mm_scrub_tick();
 }

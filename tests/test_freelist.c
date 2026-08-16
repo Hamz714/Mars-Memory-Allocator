@@ -376,6 +376,197 @@ MM_TEST(freelist, a_damaged_link_is_rejected_rather_than_spliced_through) {
   free(heap);
 }
 
+// The head pointer and the bitmap live outside the arena, in the allocator's
+// own state, so no checksum can cover them and nothing stops a stray write
+// through a stale `mm_arena *`. Every operation that consults them therefore
+// has to survive finding them wrong: allocating from a bin, freeing into one,
+// and falling through to a bin the bitmap only claims is occupied.
+MM_TEST(freelist, a_clobbered_bin_head_is_survived_by_every_operation) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+
+  for (int variant = 0; variant < 3; variant++) {
+    REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+    // Eight blocks with holes punched at 2 and 5, so that both holes have live
+    // neighbours and neither the frees nor the allocations below coalesce into
+    // a different size class.
+    void *keep[8];
+    for (int i = 0; i < 8; i++) {
+      keep[i] = mm_malloc(128);
+      REQUIRE_NOT_NULL(keep[i]);
+    }
+    mm_free(keep[2]);
+    REQUIRE_EQ(mm_check_heap(), MM_OK);
+
+    size_t bin = bin_of_ptr(keep[2]);
+    REQUIRE_TRUE(bin < MM_BIN_COUNT);
+
+    switch (variant) {
+      case 0:
+        // The head now names a block that is allocated. Freeing into this bin
+        // has to refuse to chain through it.
+        g_arena.bins[bin] = mm_block_of(keep[0]);
+        mm_free(keep[5]);
+        break;
+      case 1:
+        // The same, met from the allocation side: the scan of the bin the
+        // request maps to lands on a head that does not stand up.
+        g_arena.bins[bin] = mm_block_of(keep[0]);
+        CHECK_NOT_NULL(mm_malloc(128));
+        break;
+      default: {
+        // The bitmap claims a bin that is empty. A request whose own class is
+        // empty falls through to the next non-empty bin the bitmap names, and
+        // must not follow the null head it finds there.
+        size_t want = mm_bin_of(mm_size_for(200));
+        REQUIRE_TRUE(want + 1 < MM_BIN_COUNT);
+        REQUIRE_TRUE(g_arena.bins[want] == NULL);
+        REQUIRE_TRUE(g_arena.bins[want + 1] == NULL);
+        g_arena.bin_bitmap[(want + 1) / 64] |= (uint64_t)1 << ((want + 1) % 64);
+        CHECK_NOT_NULL(mm_malloc(200));
+        break;
+      }
+    }
+
+    CHECK_NE(mm_last_error(), MM_OK);
+    // Rebuilt from the tiling, which was never what was damaged: nothing
+    // surrendered, everything agreeing again.
+    CHECK_EQ(mm_check_heap(), MM_OK);
+    CHECK_EQ(g_arena.lost_bytes, 0);
+    CHECK_EQ(bitmap_disagrees(), -1);
+    CHECK_EQ(mm_verify(keep[0]), MM_OK);
+  }
+
+  free(heap);
+}
+
+// A block whose predecessor link is null although it is not the head of its
+// bin. Only the head may have no predecessor, and a node claiming otherwise
+// must not be spliced -- the splice would write through g_arena.bins[bin] and
+// lose every block behind the real head.
+MM_TEST(freelist, a_node_that_is_not_the_head_may_not_claim_to_be) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *a = mm_malloc(128);
+  void *b = mm_malloc(128);
+  void *c = mm_malloc(128);
+  REQUIRE_NOT_NULL(a);
+  REQUIRE_NOT_NULL(b);
+  REQUIRE_NOT_NULL(c);
+
+  mm_free(b);
+  size_t bin = bin_of_ptr(b);
+  REQUIRE_TRUE(bin < MM_BIN_COUNT);
+  CHECK_PTR_EQ(g_arena.bins[bin], mm_block_of(b));
+
+  // Lose the head pointer. b still says it has no predecessor, which is now a
+  // claim the bin contradicts.
+  g_arena.bins[bin] = NULL;
+
+  // Freeing a merges forward into b, so b has to come out of its bin first.
+  mm_free(a);
+  CHECK_NE(mm_last_error(), MM_OK);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  CHECK_EQ(g_arena.lost_bytes, 0);
+  CHECK_EQ(bitmap_disagrees(), -1);
+
+  mm_free(c);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  free(heap);
+}
+
+// Taking a block out of a bin it was never in must do nothing at all. In
+// particular it must not clear the links, because for an allocated block those
+// eight-byte slots are the caller's first sixteen payload bytes.
+MM_TEST(freelist, unlinking_a_block_that_is_on_no_list_touches_nothing) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *p = mm_malloc(128);
+  REQUIRE_NOT_NULL(p);
+
+  uint8_t written[32];
+  for (size_t i = 0; i < sizeof(written); i++) written[i] = (uint8_t)(i + 1);
+  REQUIRE_EQ(mm_write(p, 0, written, sizeof(written)), (int64_t)sizeof(written));
+
+  mm_block *hp = mm_block_of(p);
+  REQUIRE_NOT_NULL(hp);
+  mm_bin_remove(hp);
+
+  // The payload is intact and still passes its own checksum.
+  uint8_t back[32] = {0};
+  CHECK_EQ(mm_read(p, 0, back, sizeof(back)), (int64_t)sizeof(back));
+  CHECK_MEM_EQ(back, written, sizeof(written));
+  CHECK_EQ(mm_verify(p), MM_OK);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  mm_free(p);
+  free(heap);
+}
+
+// mm_check_heap holds the bins up against the tiling. Both directions of
+// disagreement have to be caught, or the check would pass a heap that has
+// quietly lost a bin's worth of memory.
+MM_TEST(freelist, the_heap_check_catches_bins_disagreeing_with_the_tiling) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+
+  // 1. The bitmap claims a bin that has no head.
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  {
+    void *p = mm_malloc(128);
+    REQUIRE_NOT_NULL(p);
+    REQUIRE_EQ(mm_check_heap(), MM_OK);
+    size_t empty = 0;
+    while (empty < MM_BIN_COUNT && g_arena.bins[empty] != NULL) empty++;
+    REQUIRE_TRUE(empty < MM_BIN_COUNT);
+    g_arena.bin_bitmap[empty / 64] |= (uint64_t)1 << (empty % 64);
+    CHECK_EQ(mm_check_heap(), MM_ERR_CORRUPT_LINKS);
+  }
+
+  // 2. An allocated block sitting in a bin. No bin may ever name one.
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  {
+    void *p[4];
+    for (int i = 0; i < 4; i++) {
+      p[i] = mm_malloc(128);
+      REQUIRE_NOT_NULL(p[i]);
+    }
+    mm_free(p[1]);
+    REQUIRE_EQ(mm_check_heap(), MM_OK);
+    g_arena.bins[bin_of_ptr(p[1])] = mm_block_of(p[0]);
+    CHECK_EQ(mm_check_heap(), MM_ERR_CORRUPT_LINKS);
+  }
+
+  // 3. A free block filed under the wrong class.
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  {
+    void *p[4];
+    for (int i = 0; i < 4; i++) {
+      p[i] = mm_malloc(128);
+      REQUIRE_NOT_NULL(p[i]);
+    }
+    mm_free(p[1]);
+    REQUIRE_EQ(mm_check_heap(), MM_OK);
+    size_t bin = bin_of_ptr(p[1]);
+    mm_block *held = g_arena.bins[bin];
+    g_arena.bins[bin] = NULL;
+    g_arena.bin_bitmap[bin / 64] &= ~((uint64_t)1 << (bin % 64));
+    size_t wrong = bin + 1;
+    REQUIRE_TRUE(wrong < MM_BIN_COUNT);
+    REQUIRE_TRUE(g_arena.bins[wrong] == NULL);
+    g_arena.bins[wrong] = held;
+    g_arena.bin_bitmap[wrong / 64] |= (uint64_t)1 << (wrong % 64);
+    CHECK_EQ(mm_check_heap(), MM_ERR_CORRUPT_LINKS);
+  }
+
+  free(heap);
+}
+
 // ---------------------------------------------------------------------------
 // The patrol
 
