@@ -8,9 +8,17 @@ Each file records the machine, kernel, compiler, profile and commit it was
 taken on, in `#` comment lines at the top. Comparing rows from different files
 means reading those first.
 
+**One significant figure is what these throughput numbers support.** They were
+taken on a laptop under WSL2, where repeated runs move the *system* allocator's
+own figures by as much as 1.5× — so a difference of tens of percent between two
+runs is the machine, not the code. Ratios that hold across every run, and
+changes measured in orders of magnitude, are what the file is good for. The
+fault-injection numbers do not have this problem: they are counts from seeded,
+deterministic trials and reproduce exactly.
+
 | File | What it is | How to reproduce |
 |---|---|---|
-| `phase05-freelists.csv` | Throughput and utilisation, mars against glibc, on the seven frozen workloads | `bench --ops 20000 --reps 5 --arena 33554432 --out FILE` |
+| `phase05-freelists.csv` | Throughput and utilisation, mars against glibc, on the seven frozen workloads | `bench --ops 20000 --reps 9 --arena 33554432 --out FILE` |
 | `scrub-sweep.csv` | Detection rate and detection latency against the scrub interval | `for s in 1 256 1024 4096 off; do faultinject --trials 200 --bits 1,2 --scrub-interval $s --csv FILE; done` |
 
 ## Reading the scrub sweep
