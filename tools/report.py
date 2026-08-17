@@ -252,17 +252,41 @@ def counters(o, benches, nostats):
       "compiled in.\n")
     _, on = benches["hardened"]
     _, off = nostats
-    o("| Workload | counters on | counters off | cost |")
-    o("|---|---:|---:|---:|")
+    o("| Workload | counters on | counters off | throughput given up | IQR of "
+      "the `on` runs | bigger than the spread? |")
+    o("|---|---:|---:|---:|---:|:-:|")
+    inside = []
+    outside = []
     for wl in workloads(on):
-        a = median([float(r["ops_per_sec"]) for r in on
-                    if r["workload"] == wl and r["allocator"] == "mars"])
+        vals = [float(r["ops_per_sec"]) for r in on
+                if r["workload"] == wl and r["allocator"] == "mars"]
+        a = median(vals)
         b = median([float(r["ops_per_sec"]) for r in off
                     if r["workload"] == wl and r["allocator"] == "mars"])
-        o(f"| `{wl}` | {si(a)} | {si(b)} | {100.0 * (b - a) / a:+.1f}% |")
-    o("\nRead this against the spread in the throughput table above: where the "
-      "difference is smaller than the inter-quartile range, the honest reading "
-      "is that the counters cost less than this machine can measure.\n")
+        cost = 100.0 * (b - a) / a
+        spread = 100.0 * iqr(vals) / 2 / a
+        # Comparing the difference against half the inter-quartile range of the
+        # runs it came from. Not a significance test -- it is the crudest
+        # possible one -- but it is the difference between "measured" and
+        # "smaller than this machine can resolve", and that distinction is the
+        # only thing this table can honestly support.
+        clear = abs(cost) > spread
+        (outside if clear else inside).append(wl)
+        o(f"| `{wl}` | {si(a)} | {si(b)} | {cost:+.1f}% | ±{spread:.1f}% | "
+          f"{'yes' if clear else 'no'} |")
+
+    o(f"\nA positive figure is throughput the counters cost; a negative one is "
+      f"the build with them compiled in coming out *faster*, which is not a "
+      f"result — it is the noise floor showing through. The last two columns "
+      f"are how to tell those apart: the difference is larger than half the "
+      f"inter-quartile range of its own runs on "
+      f"**{len(outside)} of {len(outside) + len(inside)}** workloads "
+      f"({', '.join('`' + w + '`' for w in outside)}) and smaller than it on "
+      f"the rest ({', '.join('`' + w + '`' for w in inside)}).\n")
+    o("So the counters are not free: on the allocation-heavy workloads they "
+      "cost something this machine can actually resolve. On the rest, the "
+      "honest statement is that the cost is below what it can measure — not "
+      "that there is none.\n")
 
 
 def faults(o, matrices):

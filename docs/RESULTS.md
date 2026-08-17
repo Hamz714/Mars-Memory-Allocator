@@ -86,17 +86,19 @@ Utilisation is payload over what those blocks actually occupied, sampled at peak
 
 `MARS_STATS` is on by default and is what supplies the utilisation and overhead columns above. Both builds are Release, hardened, same machine, same seeds; the only difference is whether the counters are compiled in.
 
-| Workload | counters on | counters off | cost |
-|---|---:|---:|---:|
-| `seq_lifo` | 5,566,274 | 6,051,970 | +8.7% |
-| `seq_fifo` | 4,386,148 | 5,328,428 | +21.5% |
-| `random_size` | 3,648,712 | 4,339,191 | +18.9% |
-| `churn` | 5,273,182 | 5,661,258 | +7.4% |
-| `realloc_grow` | 4,663,288 | 4,424,220 | -5.1% |
-| `fragmentation` | 3,700,471 | 4,055,079 | +9.6% |
-| `validated_access` | 301,044 | 295,897 | -1.7% |
+| Workload | counters on | counters off | throughput given up | IQR of the `on` runs | bigger than the spread? |
+|---|---:|---:|---:|---:|:-:|
+| `seq_lifo` | 5,566,274 | 6,051,970 | +8.7% | ±7.5% | yes |
+| `seq_fifo` | 4,386,148 | 5,328,428 | +21.5% | ±11.0% | yes |
+| `random_size` | 3,648,712 | 4,339,191 | +18.9% | ±6.2% | yes |
+| `churn` | 5,273,182 | 5,661,258 | +7.4% | ±4.1% | yes |
+| `realloc_grow` | 4,663,288 | 4,424,220 | -5.1% | ±6.4% | no |
+| `fragmentation` | 3,700,471 | 4,055,079 | +9.6% | ±12.0% | no |
+| `validated_access` | 301,044 | 295,897 | -1.7% | ±2.1% | no |
 
-Read this against the spread in the throughput table above: where the difference is smaller than the inter-quartile range, the honest reading is that the counters cost less than this machine can measure.
+A positive figure is throughput the counters cost; a negative one is the build with them compiled in coming out *faster*, which is not a result — it is the noise floor showing through. The last two columns are how to tell those apart: the difference is larger than half the inter-quartile range of its own runs on **4 of 7** workloads (`seq_lifo`, `seq_fifo`, `random_size`, `churn`) and smaller than it on the rest (`realloc_grow`, `fragmentation`, `validated_access`).
+
+So the counters are not free: on the allocation-heavy workloads they cost something this machine can actually resolve. On the rest, the honest statement is that the cost is below what it can measure — not that there is none.
 
 
 ## Fault injection
