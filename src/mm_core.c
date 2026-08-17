@@ -85,7 +85,7 @@ int mm_init(void *heap, size_t heap_size) {
   // Nothing precedes the first block, and reporting its predecessor as in use
   // is what stops anything trying to step backwards off the front.
   mm_set_prev_in_use(first, true);
-  mm_publish(first);
+  (void)mm_publish(first);  // `usable` was derived from the arena; it cannot fail
   mm_bin_insert(first);
 
   return 0;
@@ -119,7 +119,19 @@ int mm_init(void *heap, size_t heap_size) {
 // out of its bin. `b` must be marked in use, and therefore in no bin; it stays
 // that way. Returns the block now spanning the whole run, which is `b` itself
 // or its predecessor, still marked in use and still in no bin.
+//
+// Returns NULL when `b` itself stopped standing up part-way through. Taking a
+// neighbour out of a bin writes memory, and a bin found damaged is rebuilt from
+// the tiling, which writes into every free block the walk reaches -- so an
+// extent read before a bin operation and added to another one after it is not a
+// block size but whatever that write left behind. That is not a theoretical
+// ordering worry: it is the mechanism by which a two-bit flip under `fast`
+// reached mm_write_free_footer with an extent 400 times the arena. Both extents
+// are therefore re-established after every bin operation, and a block that no
+// longer agrees with itself is given up on rather than merged.
 static mm_block *absorb_neighbours(mm_block *b) {
+  size_t own = mm_block_size(b);
+
   uint8_t *end = mm_block_end(b);
   if (end < g_arena.hi) {
     mm_block *n = (mm_block *)(void *)end;
@@ -127,14 +139,32 @@ static mm_block *absorb_neighbours(mm_block *b) {
     // through. Quarantined blocks report as in use, so they are excluded here
     // without needing a case of their own.
     if (mm_header_ok(n) && !mm_is_used(n)) {
+      size_t theirs = mm_block_size(n);
       mm_bin_remove(n);
-      // Immediately, with nothing that could rebuild in between: after this
-      // line `n` is not in the tiling either, and the two agree again.
-      mm_set_block_size(b, mm_block_size(b) + mm_block_size(n));
-      // `n` has stopped being a block boundary, so a patrol cursor parked on
-      // it has to come back to one.
-      mm_scrub_forget((uint8_t *)(void *)b, mm_block_end(b));
-      mm_seal(b);
+      if (!mm_unchanged(b, own, true)) {
+        // `b` is the block being freed and it has stopped being itself. Nothing
+        // may be written through it, so it is surrendered and the free ends
+        // here.
+        mm_fail(MM_ERR_CORRUPT_HEADER);
+        mm_quarantine(b);
+        return NULL;
+      }
+      if (!mm_unchanged(n, theirs, false)) {
+        // The neighbour is out of its bin and no longer describes itself, so it
+        // is neither mergeable nor safe to leave free in the tiling. Give it up
+        // and release `b` at its own extent below.
+        mm_fail(MM_ERR_CORRUPT_HEADER);
+        mm_quarantine(n);
+      } else {
+        // Immediately, with nothing that could rebuild in between: after this
+        // line `n` is not in the tiling either, and the two agree again.
+        own += theirs;
+        mm_set_block_size(b, own);
+        // `n` has stopped being a block boundary, so a patrol cursor parked on
+        // it has to come back to one.
+        mm_scrub_forget((uint8_t *)(void *)b, mm_block_end(b));
+        mm_seal(b);
+      }
     }
   }
 
@@ -144,12 +174,23 @@ static mm_block *absorb_neighbours(mm_block *b) {
   mm_block *prev = mm_prev_free_block(b);
   if (prev == NULL) return b;
 
+  size_t before = mm_block_size(prev);
   mm_bin_remove(prev);
+  if (!mm_unchanged(b, own, true)) {
+    mm_fail(MM_ERR_CORRUPT_HEADER);
+    mm_quarantine(b);
+    return NULL;
+  }
+  if (!mm_unchanged(prev, before, false)) {
+    mm_fail(MM_ERR_CORRUPT_HEADER);
+    mm_quarantine(prev);
+    return b;
+  }
+
   // In use rather than free, for the same reason as above -- and carrying the
   // trailer's worth of slack, so that the notional payload of this temporary
   // block ends inside it rather than at the arena's edge.
-  mm_set_word(prev, mm_block_size(prev) + mm_block_size(b), MM_TRAIL, true,
-              false);
+  mm_set_word(prev, before + own, MM_TRAIL, true, false);
   mm_scrub_forget((uint8_t *)(void *)prev, mm_block_end(prev));
   mm_seal(prev);
   return prev;
@@ -158,12 +199,16 @@ static mm_block *absorb_neighbours(mm_block *b) {
 // Marks a block that absorb_neighbours produced as free, publishes it, and
 // files it. The insert is the last thing to happen, and by then the extent has
 // stopped moving.
+//
+// A block mm_publish refused is not filed: its span has already been
+// surrendered, and putting a quarantined block into a bin would hand it out
+// again.
 static void release_block(mm_block *b) {
   mm_set_word(b, mm_block_size(b), 0, false, false);
 #if MM_HAS_CRC
   b->payload_crc = 0;
 #endif
-  mm_publish(b);
+  if (!mm_publish(b)) return;
   mm_bin_insert(b);
 }
 
@@ -191,15 +236,18 @@ static void split_block(mm_block *b, size_t need) {
   // place is the case where that happens. Leaving two free blocks side by side
   // would fragment the arena permanently. Nothing precedes `tail` but `b`,
   // which is in use, so the backward half of this finds nothing.
-  release_block(absorb_neighbours(tail));
+  mm_block *run = absorb_neighbours(tail);
+  if (run != NULL) release_block(run);
 }
 
 // Stamps a block as holding exactly `size` bytes for the caller, and seals it.
-static void finish_allocation(mm_block *b, size_t size) {
+// False when the block could not be published, in which case there is nothing
+// to hand back to the caller.
+static bool finish_allocation(mm_block *b, size_t size) {
   size_t total = mm_block_size(b);
   mm_set_word(b, total, total - MM_HDR_SIZE - size, true, false);
   mm_write_canary(b);
-  mm_publish(b);
+  return mm_publish(b);
 }
 
 // --- Allocation ------------------------------------------------------------
@@ -229,10 +277,20 @@ void *mm_malloc(size_t size) {
     return NULL;
   }
 
+  size_t found = mm_block_size(b);
   mm_bin_remove(b);
+  // Taking the block out of its bin wrote memory, so its extent has to be
+  // re-established before it is trusted again -- and it has to be, because
+  // split_block subtracts `need` from it. See mm_unchanged.
+  if (!mm_unchanged(b, found, false)) {
+    mm_quarantine(b);
+    mm_fail(MM_ERR_CORRUPT_LINKS);
+    mm_scrub_tick();
+    return NULL;
+  }
   // Marked in use at its full extent before anything is carved off it, so that
   // the arena remains walkable even in the middle of the split.
-  mm_set_word(b, mm_block_size(b), 0, true, false);
+  mm_set_word(b, found, 0, true, false);
   mm_seal(b);
 
   split_block(b, need);
@@ -243,7 +301,10 @@ void *mm_malloc(size_t size) {
   // every allocation cost O(size).
   b->payload_crc = 0;
 #endif
-  finish_allocation(b, size);
+  if (!finish_allocation(b, size)) {
+    mm_scrub_tick();
+    return NULL;
+  }
 
   MM_STAT_NOTE(MM_STAT_ALLOC, size);
   MM_STAT_ADD(b);
@@ -302,7 +363,11 @@ void mm_free(void *ptr) {
   // Coalesce first, while `b` is still marked in use, then mark the whole run
   // free in one step. See absorb_neighbours for why that order is the safe one
   // rather than merely the tidy one.
-  release_block(absorb_neighbours(b));
+  mm_block *run = absorb_neighbours(b);
+  // NULL means the block stopped standing up mid-coalesce and has been reported
+  // and surrendered. There is nothing left to release, and the caller's pointer
+  // is gone either way.
+  if (run != NULL) release_block(run);
 
   mm_scrub_tick();
 }
@@ -376,7 +441,10 @@ void *mm_realloc(void *ptr, size_t new_size) {
     MM_STAT_SUB(b);
     split_block(b, need);
     carry_payload_crc(b, old_size, old_sum, new_size);
-    finish_allocation(b, new_size);
+    if (!finish_allocation(b, new_size)) {
+      mm_scrub_tick();
+      return NULL;
+    }
     MM_STAT_ADD(b);
     mm_scrub_tick();
     return payload;
@@ -386,16 +454,34 @@ void *mm_realloc(void *ptr, size_t new_size) {
   uint8_t *end = mm_block_end(b);
   if (end < g_arena.hi) {
     mm_block *n = (mm_block *)(void *)end;
-    if (mm_header_ok(n) && !mm_is_used(n) &&
-        mm_block_size(b) + mm_block_size(n) >= need) {
+    size_t own = mm_block_size(b);
+    size_t theirs = mm_header_ok(n) ? mm_block_size(n) : 0;
+    if (mm_header_ok(n) && !mm_is_used(n) && own + theirs >= need) {
       MM_STAT_SUB(b);
       mm_bin_remove(n);
-      mm_set_block_size(b, mm_block_size(b) + mm_block_size(n));
+      // Both extents are re-established after the bin operation, for the reason
+      // absorb_neighbours spells out: a bin operation writes into free blocks,
+      // so neither number survived it vouched for.
+      if (!mm_unchanged(b, own, true)) {
+        mm_fail(MM_ERR_CORRUPT_HEADER);
+        mm_quarantine(b);
+        return NULL;
+      }
+      if (!mm_unchanged(n, theirs, false)) {
+        mm_fail(MM_ERR_CORRUPT_HEADER);
+        mm_quarantine(n);
+        MM_STAT_ADD(b);
+        return NULL;
+      }
+      mm_set_block_size(b, own + theirs);
       mm_scrub_forget((uint8_t *)(void *)b, mm_block_end(b));
       mm_seal(b);
       split_block(b, need);
       carry_payload_crc(b, old_size, old_sum, new_size);
-      finish_allocation(b, new_size);
+      if (!finish_allocation(b, new_size)) {
+        mm_scrub_tick();
+        return NULL;
+      }
       MM_STAT_ADD(b);
       mm_scrub_tick();
       return payload;
