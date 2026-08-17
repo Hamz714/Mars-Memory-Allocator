@@ -30,6 +30,10 @@ perf.data*
 scratch/
 *.tmp
 
+# Python bytecode from the reporting tools
+__pycache__/
+*.pyc
+
 # Editors / OS
 .vscode/
 .idea/

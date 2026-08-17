@@ -169,6 +169,24 @@ jobs:
           name: fault-injection-${{ matrix.preset }}
           path: faults.csv
 
+  # The README's numbers are the project's whole claim, and a claim that has
+  # drifted from the measurement behind it is worse than no claim at all. This
+  # gate holds every number in it against the committed CSVs, the headers, or a
+  # short list of definitions -- and fails on a `__` placeholder, which is what
+  # a table laid out and never filled in looks like.
+  #
+  # docs/RESULTS.md is checked the same way round: it is generated, so it has to
+  # be regenerated when the CSVs change rather than edited to match them.
+  readme-numbers:
+    name: numbers trace to a CSV
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check the README against bench/results/
+        run: python3 tools/check_readme_numbers.py
+      - name: Check docs/RESULTS.md is regenerated
+        run: python3 tools/report.py --check
+
   coverage:
     name: coverage
     runs-on: ubuntu-22.04
