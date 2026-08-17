@@ -196,10 +196,52 @@ with zero silent corruption. If it does not, the harness has found a bug rather
 than a statistic. CI gates exactly that cell for `hardened` and `paranoid`.
 
 `fast` carries no checksum, so no such prediction exists for it and the cell is
-recorded rather than gated. What *is* gated for all three is the crash count:
-every profile promises never to read or write outside the arena, whatever a
-corrupted control word says, and that promise does not depend on being able to
-detect the corruption.
+recorded rather than gated. The crash count is gated for all three, because
+every profile is *supposed* to promise never to read or write outside the
+arena whatever a corrupted control word says — a promise that should not depend
+on being able to detect the corruption.
+
+## Where that promise currently does not hold
+
+Under `fast`, it does not. The measured run in `bench/results/faults-fast.csv`
+records **2 crashes in 240,000 trials**, both from single cells of the
+`free_hdr` target, and both reproduce exactly:
+
+```bash
+cmake --preset gcc-fast && cmake --build --preset gcc-fast -- -j$(nproc)
+./build/gcc-fast/bin/faultinject --trials 1 --bits 2 --target free_hdr --seed 7361282833
+./build/gcc-fast/bin/faultinject --trials 1 --bits 4 --target free_hdr --seed 9169288258
+```
+
+(These are trials 7341 and 9149 of the full run, replayed as single cells. The
+per-trial seed is `base + trial*1000003 + target*97 + bits_index`, so the base
+is shifted by one to compensate for `--bits` having one entry instead of four.)
+
+Both die on a **write**, in `mm_write_free_footer`, reached from `mm_free` →
+`release_block` → `mm_publish`. At that point the block's control word carries
+a `block_size` of 115,020,256 bytes against a 262,128-byte arena, so the footer
+lands about 115 MB past the end of it. `mm_publish` validates the *neighbour*
+it links to and writes the block's own trailer without re-checking that the
+block's extent is still inside the arena — and under `fast` there is no
+checksum, so a control word that has been through a coalesce is only ever
+bounds-checked structurally.
+
+The same two seeds under `hardened` are detected and quarantined, which is
+precisely what the checksum is buying:
+
+```bash
+./build/gcc-release/bin/faultinject --trials 1 --bits 2 --target free_hdr --seed 7361282833
+./build/gcc-release/bin/faultinject --trials 1 --bits 4 --target free_hdr --seed 9169288258
+```
+
+This is recorded rather than quietly fixed because the fix is not a one-liner:
+refusing the write leaves the arena inconsistent instead of wildly written, so
+the right behaviour is to report and quarantine, and that is a change to
+failure semantics on the free path with its own tests to write. It is a defect
+in `fast`, it has reproducers, and until it is fixed **the arena promise holds
+as measured under `hardened` and `paranoid` and does not hold under `fast`.**
+CI's 200-trial smoke sweep is far too small to hit a 1-in-120,000 event, so the
+gate there is correct but is not what found this; the 10,000-trial run was.
 
 Cells where theory and measurement can be compared are worth more than cells
 where only measurement exists, and disagreement between them should always be

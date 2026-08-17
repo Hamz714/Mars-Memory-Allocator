@@ -188,10 +188,15 @@ where, and how the numbers are produced.
 
 Two promises separate cleanly, and they are gated separately in CI:
 
-1. **Never leave the arena.** Every profile promises this unconditionally,
-   whatever a corrupted control word says. Traversals are bounded, extents are
-   clamped. A crash in any fault-injection cell fails the build, under all
-   three profiles.
+1. **Never leave the arena.** Every profile is meant to promise this
+   unconditionally, whatever a corrupted control word says: traversals bounded,
+   extents clamped. A crash in any fault-injection cell fails the build, under
+   all three profiles. **Measured, it holds under `hardened` and `paranoid`
+   (280,000 trials each, zero crashes) and does not hold under `fast`**, where
+   two trials in 240,000 write past the end of the arena — see
+   [FAULT_MODEL.md](FAULT_MODEL.md#where-that-promise-currently-does-not-hold)
+   for the reproducers and the mechanism. Detection is the trade `fast` makes;
+   the bound is not supposed to be part of that trade.
 2. **Detect what the metadata can detect.** This one *depends* on the profile.
    `fast` carries no checksum and no canary, so a flipped header bit is
    undetectable there in principle, and the tests say so explicitly rather than

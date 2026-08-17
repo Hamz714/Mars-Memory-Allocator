@@ -67,10 +67,13 @@ is excluded from it, because a flip that landed in slack, padding or free space
 had nothing there to catch, and counting those as either successes or failures
 would misstate the allocator in opposite directions.
 
-`crash` and `timeout` are separate columns. Every profile promises never to
-read or write outside the arena whatever a corrupted control word says, so a
-`crash` is that promise broken; a `timeout` is a traversal that was still
-running when the five-second alarm fired, which is a different defect.
+`crash` and `timeout` are separate columns. Every profile is meant to promise
+never to read or write outside the arena whatever a corrupted control word
+says, so a `crash` is that promise broken; a `timeout` is a traversal that was
+still running when the five-second alarm fired, which is a different defect.
+`faults-fast.csv` carries two crashes, which is a defect and not a cost of the
+`fast` trade — the reproducers are in
+[FAULT_MODEL.md](../../docs/FAULT_MODEL.md#where-that-promise-currently-does-not-hold).
 
 `latency_mean_ops` is the mean number of allocator calls between a bit flip and
 the allocator first reporting it, over ordinary traffic that never touches the
