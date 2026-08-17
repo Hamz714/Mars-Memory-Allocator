@@ -132,6 +132,13 @@ typedef struct mm_stats {
   // Blocks whose metadata was rebuilt from its mirror rather than surrendered.
   uint64_t repaired_blocks;
   size_t repaired_bytes;
+
+  // What the background patrol has done: how many times it ran, how many
+  // blocks it looked at, and how many problems it found. The first two are
+  // what its cost is measured from, the third is what it is for.
+  uint64_t scrub_passes;
+  uint64_t scrub_blocks;
+  uint64_t scrub_detections;
 } mm_stats_t;
 
 void mm_stats_get(mm_stats_t *out);
@@ -146,6 +153,36 @@ mm_status_t mm_verify(const void *ptr);
 // Walks every block and checks each one's metadata and the list topology.
 // Returns MM_OK if the whole arena is consistent.
 mm_status_t mm_check_heap(void);
+
+// --- Scrubbing -------------------------------------------------------------
+//
+// Allocation is O(1), which means the allocator does not touch a block it has
+// no reason to touch -- so corruption in memory nobody is using would go
+// unnoticed for as long as nobody used it. The patrol is what covers that: a
+// bounded walk of the arena, resuming where it last stopped, checking the
+// metadata of the blocks it passes and the payload checksum of any block whose
+// contents have been established through mm_write.
+//
+// Damage it finds is treated exactly as any other path would treat it: a
+// broken canary quarantines the block, an unreadable header goes through
+// recovery, a free block's boundary tag is put back from the extent its
+// checksum already vouched for. A payload that no longer matches its checksum
+// is reported and left alone -- the patrol was not asked for those bytes, and
+// a caller writing through their own pointer is allowed.
+
+// Checks up to `budget_blocks` blocks, continuing from where the last call
+// stopped and wrapping at the end of the arena. Returns MM_OK if everything it
+// looked at was intact, or the first problem it found.
+mm_status_t mm_scrub(size_t budget_blocks);
+
+// How often the patrol runs by itself, in allocator calls, and how many blocks
+// it looks at each time. Defaults to 1024 and 16. `ops` of 0 turns automatic
+// scrubbing off entirely; `budget_blocks` of 0 restores the default budget.
+//
+// Turning it off is a real choice and not merely a test hook: it trades
+// detection latency for throughput, which is the point of being able to set
+// it. mm_scrub can still be called by hand.
+void mm_set_scrub_interval(size_t ops, size_t budget_blocks);
 
 #ifdef __cplusplus
 }

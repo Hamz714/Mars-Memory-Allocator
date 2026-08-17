@@ -11,6 +11,30 @@
 // Each trial runs in a forked child under an alarm, because a good number of
 // them are expected to crash or hang: that is a result, not a reason to stop.
 // Linux only, for that reason.
+//
+// --- Detection latency ------------------------------------------------------
+//
+// With a linear search every allocation revalidated every free block, so
+// damage was found more or less as soon as anything happened. Binning made
+// allocation O(1) and took that incidental cover away; a bounded patrol puts
+// it back, and *when* it puts it back is now a tunable. So a second number
+// matters alongside "was it detected": how long detection took, measured in
+// allocator calls.
+//
+// Each trial therefore runs a stream of ordinary allocations and frees after
+// the flip, deliberately never touching the damaged block, and records the
+// call on which the allocator first said something was wrong. That is the
+// latency the patrol governs -- a block someone reads is validated on touch
+// regardless. --scrub-interval sweeps it, and the interval is a mandatory CSV
+// column because results taken at different settings are not comparable.
+//
+// Two things to read carefully in that column. The mean is **censored**: it
+// covers only the trials detected inside the window, and `latency_n` says how
+// many that was. When latency_n is short of the trial count the mean is a
+// lower bound, not an estimate -- which is exactly what an interval at or
+// above LATENCY_OPS produces. And the latency phase runs before the
+// classification phase, so the outcome buckets describe the arena after that
+// window of ordinary traffic rather than at the instant of the flip.
 
 // fork, waitpid, alarm and aligned_alloc are POSIX/C11 library features that
 // strict c11 does not expose by default.
@@ -30,6 +54,13 @@
 #define LIVE_BLOCKS 24
 #define ARENA_DEFAULT (256u * 1024u)
 #define TRIAL_TIMEOUT_SEC 5
+
+// How many ordinary calls a trial will make while waiting for the allocator to
+// notice on its own. Four times the default scrub interval, so that a patrol
+// set to the default gets several chances rather than one.
+#define LATENCY_OPS 4096u
+#define LATENCY_NONE UINT32_MAX
+#define LATENCY_SLOTS 8
 
 // --- Outcomes ---------------------------------------------------------------
 
@@ -80,6 +111,8 @@ static uint8_t *g_heap;
 static size_t g_heap_size = ARENA_DEFAULT;
 static slot g_slots[LIVE_BLOCKS];
 static int g_live;
+static size_t g_scrub_interval = 1024;  // the library's own default
+static size_t g_scrub_budget = 16;
 
 // Deterministic starting state: a mixture of sizes with a few holes punched in
 // it, so that both allocated and free blocks are present to aim at.
@@ -169,8 +202,41 @@ static void flip_bits(mars_rng *rng, uint8_t *base, size_t len, int bits) {
   }
 }
 
-// Runs one trial to completion and exits with the outcome. Never returns.
-static void run_child(uint64_t seed, target_t target, int bits) {
+// Ordinary allocator traffic that deliberately avoids the live set, run until
+// the allocator reports something wrong. Returns the call it happened on, or
+// LATENCY_NONE if it never did within LATENCY_OPS.
+//
+// Nothing here reads or writes a block that was corrupted, so validate-on-
+// touch cannot be what finds the damage: whatever this measures, the patrol
+// is what governs it. Scratch blocks are freed as it goes, so the heap the
+// classification phase then inspects is the one the flip left behind.
+static uint32_t measure_latency(mars_rng *rng) {
+  void *scratch[LATENCY_SLOTS] = {0};
+  uint32_t at = LATENCY_NONE;
+
+  for (uint32_t op = 0; op < LATENCY_OPS; op++) {
+    size_t k = (size_t)mars_rng_below(rng, LATENCY_SLOTS);
+    if (scratch[k] != NULL) {
+      mm_free(scratch[k]);
+      scratch[k] = NULL;
+    } else {
+      scratch[k] = mm_malloc(16 + (size_t)mars_rng_below(rng, 240));
+    }
+    if (mm_last_error() != MM_OK) {
+      at = op;
+      break;
+    }
+  }
+
+  for (int i = 0; i < LATENCY_SLOTS; i++) {
+    if (scratch[i] != NULL) mm_free(scratch[i]);
+  }
+  return at;
+}
+
+// Runs one trial to completion and exits with the outcome, having written the
+// detection latency to `fd` first. Never returns.
+static void run_child(uint64_t seed, target_t target, int bits, int fd) {
   mars_rng rng;
   mars_rng_seed(&rng, seed);
 
@@ -179,6 +245,10 @@ static void run_child(uint64_t seed, target_t target, int bits) {
   // result found here can be replayed byte for byte.
   mm_pin_secret(seed | 1u);
 
+  // Off while the starting state is built, so that setting up an undamaged
+  // arena neither costs patrol budget nor advances the counter the latency is
+  // measured from. It goes on immediately before the flip.
+  mm_set_scrub_interval(0, 0);
   build_state(&rng);
 
   uint8_t *base = NULL;
@@ -186,9 +256,17 @@ static void run_child(uint64_t seed, target_t target, int bits) {
   if (!choose_region(&rng, target, &base, &len) || len == 0) {
     _exit(71);  // nothing of that kind existed; parent discards the trial
   }
+  mm_set_scrub_interval(g_scrub_interval, g_scrub_budget);
   flip_bits(&rng, base, len, bits);
 
-  int detected = 0;   // the allocator reported a problem at some point
+  uint32_t latency = measure_latency(&rng);
+  ssize_t ignored = write(fd, &latency, sizeof(latency));
+  (void)ignored;
+  close(fd);
+
+  // Noticing during the latency phase counts: it is the allocator reporting a
+  // problem, which is all "detected" has ever meant here.
+  int detected = (latency != LATENCY_NONE);
   int mismatch = 0;   // data came back wrong
   int silent = 0;     // data came back wrong AND the call claimed success
 
@@ -270,7 +348,10 @@ static void usage(const char *argv0) {
   printf("  --bits LIST    comma-separated flip counts (default 1,2,4,8)\n");
   printf("  --target NAME  restrict to one target (default: all)\n");
   printf("  --arena N      arena bytes (default %u)\n", ARENA_DEFAULT);
-  printf("  --csv FILE     append a machine-readable table here\n");
+  printf("  --scrub-interval N|off  calls between patrols (default 1024)\n");
+  printf("  --scrub-budget N        blocks per patrol (default 16)\n");
+  printf("  --csv FILE     machine-readable table; appended to if it exists,\n");
+  printf("                 so a sweep can accumulate into one file\n");
   printf("  --targets      list targets and exit\n");
 }
 
@@ -289,6 +370,14 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--arena") && i + 1 < argc) g_heap_size = (size_t)strtoull(argv[++i], NULL, 10);
     else if (!strcmp(a, "--target") && i + 1 < argc) only_target = argv[++i];
     else if (!strcmp(a, "--csv") && i + 1 < argc) csv_path = argv[++i];
+    else if (!strcmp(a, "--scrub-budget") && i + 1 < argc) g_scrub_budget = (size_t)strtoull(argv[++i], NULL, 10);
+    else if (!strcmp(a, "--scrub-interval") && i + 1 < argc) {
+      // "off" and 0 are the same thing -- no automatic patrol at all -- and
+      // both are spelled out because a sweep reads better with a word than
+      // with a zero that could be mistaken for "as often as possible".
+      const char *v = argv[++i];
+      g_scrub_interval = strcmp(v, "off") == 0 ? 0 : (size_t)strtoull(v, NULL, 10);
+    }
     else if (!strcmp(a, "--bits") && i + 1 < argc) {
       bits_count = 0;
       char *spec = argv[++i];
@@ -315,14 +404,23 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+  // Appended to rather than truncated, and the header written only when the
+  // file is created, so that a sweep over several scrub intervals accumulates
+  // into one table instead of each run erasing the last.
   FILE *csv = NULL;
   if (csv_path != NULL) {
-    csv = fopen(csv_path, "w");
-    if (csv != NULL) {
-      fprintf(csv, "profile,target,bits,trials,discarded");
+    FILE *probe = fopen(csv_path, "r");
+    bool fresh = (probe == NULL);
+    if (probe != NULL) fclose(probe);
+
+    csv = fopen(csv_path, "a");
+    if (csv != NULL && fresh) {
+      fprintf(csv, "profile,scrub_interval,scrub_budget,target,bits,trials,"
+                   "discarded");
       for (int o = 0; o < OUT_COUNT; o++) fprintf(csv, ",%s", outcome_name[o]);
       fprintf(csv, ",detection_pct,detection_lo,detection_hi,"
-                   "silent_pct,silent_lo,silent_hi\n");
+                   "silent_pct,silent_lo,silent_hi,"
+                   "latency_n,latency_mean_ops,latency_max_ops\n");
     }
   }
 
@@ -334,9 +432,20 @@ int main(int argc, char **argv) {
   printf("%llu trials per cell, seed %llu, arena %zu bytes\n",
          (unsigned long long)trials, (unsigned long long)base_seed,
          g_heap_size);
-  printf("%-10s %5s %8s %8s %8s %8s %8s %8s   %-18s %-18s\n", "target", "bits",
-         "recov", "quaran", "fatal", "benign", "SILENT", "crash",
-         "detection% (95% CI)", "silent% (95% CI)");
+  // The scrub interval decides how long damage nobody touches can sit there
+  // unnoticed, so a detection rate quoted without it is not a comparable
+  // number. It goes on the front of the run and into every CSV row.
+  if (g_scrub_interval == 0) {
+    printf("patrol off; latency measured over %u calls per trial\n",
+           LATENCY_OPS);
+  } else {
+    printf("patrol every %zu calls, %zu blocks each; latency measured over "
+           "%u calls per trial\n",
+           g_scrub_interval, g_scrub_budget, LATENCY_OPS);
+  }
+  printf("%-10s %5s %8s %8s %8s %8s %8s %8s   %-18s %-18s %11s\n", "target",
+         "bits", "recov", "quaran", "fatal", "benign", "SILENT", "crash",
+         "detection% (95% CI)", "silent% (95% CI)", "latency ops");
 
   for (int t = 0; t < TGT_COUNT; t++) {
     if (only_target != NULL && strcmp(only_target, target_name[t]) != 0) continue;
@@ -344,24 +453,53 @@ int main(int argc, char **argv) {
     for (int b = 0; b < bits_count; b++) {
       uint64_t counts[OUT_COUNT] = {0};
       uint64_t discarded = 0;
+      uint64_t latency_n = 0;
+      uint64_t latency_sum = 0;
+      uint32_t latency_max = 0;
 
       for (uint64_t trial = 0; trial < trials; trial++) {
         uint64_t seed = base_seed + trial * 1000003ull + (uint64_t)t * 97ull +
                         (uint64_t)b;
         fflush(stdout);
+
+        // The outcome comes back as an exit code, which leaves no room for a
+        // second number. The latency comes back through a pipe instead; a
+        // child that crashed writes nothing, and there is no latency to
+        // record for a trial that never finished.
+        int fds[2];
+        if (pipe(fds) != 0) {
+          perror("pipe");
+          return 2;
+        }
+
         pid_t pid = fork();
         if (pid < 0) {
           perror("fork");
           return 2;
         }
         if (pid == 0) {
+          close(fds[0]);
           alarm(TRIAL_TIMEOUT_SEC);
-          run_child(seed, (target_t)t, bits_list[b]);
+          run_child(seed, (target_t)t, bits_list[b], fds[1]);
           _exit(72);  // unreachable
         }
+        close(fds[1]);
+
+        uint32_t latency = LATENCY_NONE;
+        if (read(fds[0], &latency, sizeof(latency)) != (ssize_t)sizeof(latency)) {
+          latency = LATENCY_NONE;
+        }
+        close(fds[0]);
 
         int status = 0;
         waitpid(pid, &status, 0);
+
+        if (WIFEXITED(status) && WEXITSTATUS(status) < OUT_COUNT &&
+            latency != LATENCY_NONE) {
+          latency_n++;
+          latency_sum += latency;
+          if (latency > latency_max) latency_max = latency;
+        }
 
         if (WIFEXITED(status)) {
           int code = WEXITSTATUS(status);
@@ -396,8 +534,14 @@ int main(int argc, char **argv) {
       double silent_pct =
           100.0 * (double)counts[OUT_UNDETECTED_SILENT] / (double)counted;
 
+      // Averaged over the trials that were detected without anyone touching
+      // the damage. Trials where nothing was ever noticed are excluded rather
+      // than counted as LATENCY_OPS, which would be a made-up number.
+      double latency_mean =
+          latency_n == 0 ? 0.0 : (double)latency_sum / (double)latency_n;
+
       printf("%-10s %5d %8llu %8llu %8llu %8llu %8llu %8llu   "
-             "%6.2f [%5.2f,%6.2f]  %6.2f [%5.2f,%6.2f]\n",
+             "%6.2f [%5.2f,%6.2f]  %6.2f [%5.2f,%6.2f] %11.1f\n",
              target_name[t], bits_list[b],
              (unsigned long long)counts[OUT_DETECTED_NO_LOSS],
              (unsigned long long)counts[OUT_DETECTED_QUARANTINED],
@@ -405,18 +549,19 @@ int main(int argc, char **argv) {
              (unsigned long long)counts[OUT_UNDETECTED_BENIGN],
              (unsigned long long)counts[OUT_UNDETECTED_SILENT],
              (unsigned long long)counts[OUT_CRASH], detection_pct, dlo, dhi,
-             silent_pct, slo, shi);
+             silent_pct, slo, shi, latency_mean);
       fflush(stdout);
 
       if (csv != NULL) {
-        fprintf(csv, "%s,%s,%d,%llu,%llu", mm_profile(), target_name[t],
-                bits_list[b], (unsigned long long)counted,
-                (unsigned long long)discarded);
+        fprintf(csv, "%s,%zu,%zu,%s,%d,%llu,%llu", mm_profile(),
+                g_scrub_interval, g_scrub_budget, target_name[t], bits_list[b],
+                (unsigned long long)counted, (unsigned long long)discarded);
         for (int o = 0; o < OUT_COUNT; o++) {
           fprintf(csv, ",%llu", (unsigned long long)counts[o]);
         }
-        fprintf(csv, ",%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", detection_pct, dlo,
-                dhi, silent_pct, slo, shi);
+        fprintf(csv, ",%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%llu,%.4f,%u\n",
+                detection_pct, dlo, dhi, silent_pct, slo, shi,
+                (unsigned long long)latency_n, latency_mean, latency_max);
         fflush(csv);
       }
     }
