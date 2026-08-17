@@ -82,6 +82,12 @@
       "cacheVariables": { "MARS_PROFILE": "paranoid" }
     },
     {
+      "name": "gcc-nostats",
+      "displayName": "gcc / Release with the counters compiled out",
+      "inherits": "gcc-release",
+      "cacheVariables": { "MARS_STATS": "OFF" }
+    },
+    {
       "name": "gcc-asan-fast",
       "displayName": "gcc / ASan + UBSan, fast profile",
       "inherits": "gcc-asan-ubsan",
@@ -174,6 +180,7 @@
     { "name": "gcc-debug-paranoid","configurePreset": "gcc-debug-paranoid" },
     { "name": "gcc-fast",         "configurePreset": "gcc-fast" },
     { "name": "gcc-paranoid",     "configurePreset": "gcc-paranoid" },
+    { "name": "gcc-nostats",      "configurePreset": "gcc-nostats" },
     { "name": "gcc-asan-ubsan",   "configurePreset": "gcc-asan-ubsan" },
     { "name": "gcc-asan-fast",    "configurePreset": "gcc-asan-fast" },
     { "name": "gcc-asan-paranoid","configurePreset": "gcc-asan-paranoid" },
@@ -199,6 +206,7 @@
     { "name": "gcc-debug-paranoid","inherits": "_test_base", "configurePreset": "gcc-debug-paranoid" },
     { "name": "gcc-fast",         "inherits": "_test_base", "configurePreset": "gcc-fast" },
     { "name": "gcc-paranoid",     "inherits": "_test_base", "configurePreset": "gcc-paranoid" },
+    { "name": "gcc-nostats",      "inherits": "_test_base", "configurePreset": "gcc-nostats" },
     { "name": "gcc-asan-ubsan",   "inherits": "_test_base", "configurePreset": "gcc-asan-ubsan" },
     { "name": "gcc-asan-fast",    "inherits": "_test_base", "configurePreset": "gcc-asan-fast" },
     { "name": "gcc-asan-paranoid","inherits": "_test_base", "configurePreset": "gcc-asan-paranoid" },

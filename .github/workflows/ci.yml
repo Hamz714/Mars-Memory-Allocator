@@ -125,7 +125,8 @@ jobs:
       - name: Inject
         run: |
           ./build/${{ matrix.preset }}/bin/faultinject \
-            --trials 200 --bits 1,2 --csv faults.csv
+            --trials 200 --bits 1,2 --git-sha "$(git rev-parse --short HEAD)" \
+            --csv faults.csv
       - name: Check the results against what the profile promises
         env:
           HAS_CHECKSUM: ${{ matrix.checksum }}
@@ -141,7 +142,9 @@ jobs:
         run: |
           python3 - <<'PY'
           import csv, os, sys
-          rows = list(csv.DictReader(open('faults.csv')))
+          # The provenance block is `#` comment lines above the real header.
+          body = [l for l in open('faults.csv') if not l.startswith('#')]
+          rows = list(csv.DictReader(body))
           if not rows:
               sys.exit('faultinject produced no rows')
           bad = []
