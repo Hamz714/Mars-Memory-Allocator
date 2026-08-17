@@ -41,6 +41,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,12 +74,22 @@ typedef enum {
   OUT_UNDETECTED_BENIGN,
   OUT_UNDETECTED_SILENT,
   OUT_CRASH,
+  // Assigned by the parent, never exited with, so adding it does not disturb
+  // the exit codes the child uses.
+  OUT_TIMEOUT,
   OUT_COUNT
 } outcome_t;
 
+// `crash` and `timeout` are deliberately separate buckets. Every profile makes
+// one unconditional promise -- never read or write outside the arena, whatever
+// a corrupted control word says -- and a bucket that merges "died on SIGSEGV"
+// with "was still going after five seconds" cannot be evidence for or against
+// it. One is the promise being broken; the other is a walk that terminates too
+// slowly to wait for, which is a different defect with a different fix.
 static const char *outcome_name[OUT_COUNT] = {
-    "detected_no_loss",   "detected_quarantined", "detected_fatal",
-    "undetected_benign",  "undetected_silent",    "crash"};
+    "detected_no_loss",  "detected_quarantined", "detected_fatal",
+    "undetected_benign", "undetected_silent",    "crash",
+    "timeout"};
 
 // --- Injection targets ------------------------------------------------------
 
@@ -508,9 +519,9 @@ int main(int argc, char **argv) {
            "%u calls per trial\n",
            g_scrub_interval, g_scrub_budget, LATENCY_OPS);
   }
-  printf("%-10s %5s %8s %8s %8s %8s %8s %8s   %-18s %-18s %11s\n", "target",
+  printf("%-10s %5s %8s %8s %8s %8s %8s %8s %8s   %-18s %-18s %11s\n", "target",
          "bits", "recov", "quaran", "fatal", "benign", "SILENT", "crash",
-         "detection% (95% CI)", "silent% (95% CI)", "latency ops");
+         "timeout", "detection% (95% CI)", "silent% (95% CI)", "latency ops");
 
   for (int t = 0; t < TGT_COUNT; t++) {
     if (only_target != NULL && strcmp(only_target, target_name[t]) != 0) continue;
@@ -573,9 +584,11 @@ int main(int argc, char **argv) {
           } else {
             discarded++;  // setup failed or no such region existed
           }
+        } else if (WIFSIGNALED(status) && WTERMSIG(status) == SIGALRM) {
+          counts[OUT_TIMEOUT]++;
         } else {
-          // Killed by a signal, alarm included: the allocator went somewhere
-          // it should not have.
+          // Killed by any other signal: the allocator went somewhere it
+          // should not have.
           counts[OUT_CRASH]++;
         }
       }
@@ -605,7 +618,7 @@ int main(int argc, char **argv) {
       double latency_mean =
           latency_n == 0 ? 0.0 : (double)latency_sum / (double)latency_n;
 
-      printf("%-10s %5d %8llu %8llu %8llu %8llu %8llu %8llu   "
+      printf("%-10s %5d %8llu %8llu %8llu %8llu %8llu %8llu %8llu   "
              "%6.2f [%5.2f,%6.2f]  %6.2f [%5.2f,%6.2f] %11.1f\n",
              target_name[t], bits_list[b],
              (unsigned long long)counts[OUT_DETECTED_NO_LOSS],
@@ -613,7 +626,8 @@ int main(int argc, char **argv) {
              (unsigned long long)counts[OUT_DETECTED_FATAL],
              (unsigned long long)counts[OUT_UNDETECTED_BENIGN],
              (unsigned long long)counts[OUT_UNDETECTED_SILENT],
-             (unsigned long long)counts[OUT_CRASH], detection_pct, dlo, dhi,
+             (unsigned long long)counts[OUT_CRASH],
+             (unsigned long long)counts[OUT_TIMEOUT], detection_pct, dlo, dhi,
              silent_pct, slo, shi, latency_mean);
       fflush(stdout);
 

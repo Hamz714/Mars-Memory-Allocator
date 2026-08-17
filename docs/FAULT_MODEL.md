@@ -122,7 +122,16 @@ Every trial lands in exactly one bucket:
 | `detected_fatal` | flagged, but the allocator could no longer serve requests |
 | `undetected_benign` | not flagged, and nothing was wrong — the flip landed in slack, padding, or free space |
 | `undetected_silent` | not flagged, **and the data came back wrong** |
-| `crash` | the trial died on a signal or ran out of time |
+| `crash` | the trial died on a signal — the arena promise broken |
+| `timeout` | the trial was still running after five seconds |
+
+`crash` and `timeout` are separate buckets for the same reason the two
+undetected ones are. Every profile promises never to read or write outside the
+arena whatever a corrupted control word says, and a bucket that merged "died on
+`SIGSEGV`" with "was still going when the alarm fired" could not be evidence
+for or against that promise. One is the promise being broken; the other is a
+traversal that terminates too slowly to wait for, which is a different defect
+with a different fix.
 
 **Separating the two undetected buckets is the point of the whole exercise.**
 Most flips into a large arena land somewhere that never mattered. Counting
