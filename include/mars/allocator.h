@@ -1,9 +1,10 @@
 // A fault-tolerant memory allocator.
 //
 // The allocator manages a caller-supplied arena. Every block carries integrity
-// metadata -- a checksummed header, a mirrored footer, and a canary past the
-// payload -- which is verified on each access, so that memory corrupted after
-// the fact is detected rather than silently used.
+// metadata -- how much depends on the profile it was built with, but under the
+// default a checksummed header and a canary past the payload -- which is
+// verified on each access, so that memory corrupted after the fact is detected
+// rather than silently used. See docs/BLOCK_LAYOUT.md.
 //
 // Payload integrity is only meaningful when reads and writes go through
 // mm_read and mm_write: a raw pointer handed to the caller can be written
