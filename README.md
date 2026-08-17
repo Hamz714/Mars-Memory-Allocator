@@ -178,12 +178,12 @@ ordinary pointer. The header, canary and boundary tags are protected either
 way, because the allocator is their only writer. That is a property of
 returning pointers at all, not a gap to be closed.
 
-**A 32-bit CRC is enough, so the mirrored footer went.** The header checksum
-covers 32 bytes and detects every 1-, 2- and 3-bit error outright. Mirroring
-the header was never adding detection — it was adding *repair*, which is why
-only `paranoid` keeps a mirror, and why `hardened` sheds 48 bytes per
-allocation without shedding a detection guarantee. Mixing the block's index and
-a per-arena secret into the checksum turns it from a bit-flip detector into a
+**A 32-bit CRC is enough, so there is no mirrored footer.** The header checksum
+covers 32 bytes and detects every 1-, 2- and 3-bit error outright. A second
+copy of the header adds no *detection* to that — it adds *repair*, which is the
+one thing `paranoid` spends its extra 16 bytes on and the reason the other two
+profiles carry no mirror at all. Mixing the block's index and a per-arena
+secret into the checksum turns it from a bit-flip detector into a
 block-confusion detector: a header copied verbatim from elsewhere in the arena,
 correct in every field, fails because it was checksummed for another position.
 
@@ -194,13 +194,14 @@ overstate it just as badly, so every trial carries a shadow model and only a
 read that reported success and returned different bytes counts as silent. That
 distinction is what makes a detection rate mean anything.
 
-**O(1) allocation had to buy back the coverage it removed.** The linear
-best-fit search that the bins replaced revalidated every free block on every
-call — that was its cost, and incidentally complete continuous coverage of the
-arena for free. Shipping bins without replacing it would have traded the whole
+**O(1) allocation has to buy back the coverage it does not provide.** A linear
+best-fit search revalidates every free block on every call: that is its cost,
+and incidentally it is complete, continuous coverage of the arena for nothing.
+Bins remove both together — a block nobody is using is a block nobody looks at
+— and offering that trade without replacing the coverage would sell the whole
 reliability argument for throughput. Hence the patrol, and hence detection
-latency becoming a measured quantity with the scrub interval as a mandatory
-column in every fault-injection CSV.
+latency being a measured quantity with the scrub interval as a mandatory column
+in every fault-injection CSV.
 
 ## Verification
 
