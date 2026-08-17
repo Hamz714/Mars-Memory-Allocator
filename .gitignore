@@ -26,9 +26,13 @@ callgrind.out.*
 perf.data*
 
 # Benchmark and fault-injection scratch output.
-# Committed results live in results/ and are added explicitly.
+# Committed results live in bench/results/ and are added explicitly.
 scratch/
 *.tmp
+
+# Python bytecode from the reporting tools
+__pycache__/
+*.pyc
 
 # Editors / OS
 .vscode/

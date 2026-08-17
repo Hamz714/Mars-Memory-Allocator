@@ -41,10 +41,13 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "mars/allocator.h"
@@ -71,12 +74,22 @@ typedef enum {
   OUT_UNDETECTED_BENIGN,
   OUT_UNDETECTED_SILENT,
   OUT_CRASH,
+  // Assigned by the parent, never exited with, so adding it does not disturb
+  // the exit codes the child uses.
+  OUT_TIMEOUT,
   OUT_COUNT
 } outcome_t;
 
+// `crash` and `timeout` are deliberately separate buckets. Every profile makes
+// one unconditional promise -- never read or write outside the arena, whatever
+// a corrupted control word says -- and a bucket that merges "died on SIGSEGV"
+// with "was still going after five seconds" cannot be evidence for or against
+// it. One is the promise being broken; the other is a walk that terminates too
+// slowly to wait for, which is a different defect with a different fix.
 static const char *outcome_name[OUT_COUNT] = {
-    "detected_no_loss",   "detected_quarantined", "detected_fatal",
-    "undetected_benign",  "undetected_silent",    "crash"};
+    "detected_no_loss",  "detected_quarantined", "detected_fatal",
+    "undetected_benign", "undetected_silent",    "crash",
+    "timeout"};
 
 // --- Injection targets ------------------------------------------------------
 
@@ -318,6 +331,65 @@ static void run_child(uint64_t seed, target_t target, int bits, int fd) {
   _exit(OUT_DETECTED_NO_LOSS);
 }
 
+// --- Provenance -------------------------------------------------------------
+
+// Written as `#` comment lines above the CSV header, for the same reason the
+// benchmark writes them: a detection rate whose machine, compiler, profile and
+// commit are unknown cannot be compared with another one or reproduced. Anything
+// reading these files has to skip lines beginning with `#`.
+static void write_env_comment(FILE *out, const char *git_sha, uint64_t trials,
+                              uint64_t base_seed, size_t arena) {
+  char cpu[256] = "unknown";
+  FILE *f = fopen("/proc/cpuinfo", "r");
+  if (f != NULL) {
+    char line[512];
+    while (fgets(line, sizeof(line), f) != NULL) {
+      if (strncmp(line, "model name", 10) != 0) continue;
+      char *colon = strchr(line, ':');
+      if (colon != NULL) {
+        char *v = colon + 1;
+        while (*v == ' ') v++;
+        size_t len = strlen(v);
+        while (len > 0 && (v[len - 1] == '\n' || v[len - 1] == ' ')) len--;
+        snprintf(cpu, sizeof(cpu), "%.*s", (int)len, v);
+      }
+      break;
+    }
+    fclose(f);
+  }
+
+  char kernel[256] = "unknown";
+  struct utsname u;
+  if (uname(&u) == 0) snprintf(kernel, sizeof(kernel), "%s %s", u.sysname, u.release);
+
+  time_t now = time(NULL);
+  char when[64];
+  strftime(when, sizeof(when), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+
+  fprintf(out, "# cpu=%s\n", cpu);
+  fprintf(out, "# kernel=%s\n", kernel);
+  fprintf(out, "# compiler=%s\n",
+#if defined(__clang__)
+          "clang " __clang_version__
+#elif defined(__GNUC__)
+          "gcc " __VERSION__
+#else
+          "unknown"
+#endif
+  );
+  fprintf(out, "# date=%s\n", when);
+  fprintf(out, "# git_sha=%s\n", git_sha);
+  fprintf(out, "# profile=%s metadata_bytes=%zu\n", mm_profile(),
+          mm_metadata_overhead());
+  fprintf(out, "# trials_per_cell=%llu base_seed=%llu arena_bytes=%zu\n",
+          (unsigned long long)trials, (unsigned long long)base_seed, arena);
+  // The scrub interval is deliberately not recorded here. A sweep appends
+  // several intervals into one file and the header is written once, so a
+  // header field would describe only whichever run created the file. It is a
+  // per-row column for exactly that reason.
+  fprintf(out, "# latency_window_ops=%u\n", LATENCY_OPS);
+}
+
 // --- Statistics -------------------------------------------------------------
 
 // Wilson score interval: behaves sensibly at proportions near 0 and 1, where
@@ -352,6 +424,7 @@ static void usage(const char *argv0) {
   printf("  --scrub-budget N        blocks per patrol (default 16)\n");
   printf("  --csv FILE     machine-readable table; appended to if it exists,\n");
   printf("                 so a sweep can accumulate into one file\n");
+  printf("  --git-sha SHA  recorded in the CSV provenance header\n");
   printf("  --targets      list targets and exit\n");
 }
 
@@ -362,6 +435,7 @@ int main(int argc, char **argv) {
   int bits_count = 4;
   const char *only_target = NULL;
   const char *csv_path = NULL;
+  const char *git_sha = "unknown";
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -370,6 +444,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--arena") && i + 1 < argc) g_heap_size = (size_t)strtoull(argv[++i], NULL, 10);
     else if (!strcmp(a, "--target") && i + 1 < argc) only_target = argv[++i];
     else if (!strcmp(a, "--csv") && i + 1 < argc) csv_path = argv[++i];
+    else if (!strcmp(a, "--git-sha") && i + 1 < argc) git_sha = argv[++i];
     else if (!strcmp(a, "--scrub-budget") && i + 1 < argc) g_scrub_budget = (size_t)strtoull(argv[++i], NULL, 10);
     else if (!strcmp(a, "--scrub-interval") && i + 1 < argc) {
       // "off" and 0 are the same thing -- no automatic patrol at all -- and
@@ -415,6 +490,7 @@ int main(int argc, char **argv) {
 
     csv = fopen(csv_path, "a");
     if (csv != NULL && fresh) {
+      write_env_comment(csv, git_sha, trials, base_seed, g_heap_size);
       fprintf(csv, "profile,scrub_interval,scrub_budget,target,bits,trials,"
                    "discarded");
       for (int o = 0; o < OUT_COUNT; o++) fprintf(csv, ",%s", outcome_name[o]);
@@ -443,9 +519,9 @@ int main(int argc, char **argv) {
            "%u calls per trial\n",
            g_scrub_interval, g_scrub_budget, LATENCY_OPS);
   }
-  printf("%-10s %5s %8s %8s %8s %8s %8s %8s   %-18s %-18s %11s\n", "target",
+  printf("%-10s %5s %8s %8s %8s %8s %8s %8s %8s   %-18s %-18s %11s\n", "target",
          "bits", "recov", "quaran", "fatal", "benign", "SILENT", "crash",
-         "detection% (95% CI)", "silent% (95% CI)", "latency ops");
+         "timeout", "detection% (95% CI)", "silent% (95% CI)", "latency ops");
 
   for (int t = 0; t < TGT_COUNT; t++) {
     if (only_target != NULL && strcmp(only_target, target_name[t]) != 0) continue;
@@ -508,9 +584,11 @@ int main(int argc, char **argv) {
           } else {
             discarded++;  // setup failed or no such region existed
           }
+        } else if (WIFSIGNALED(status) && WTERMSIG(status) == SIGALRM) {
+          counts[OUT_TIMEOUT]++;
         } else {
-          // Killed by a signal, alarm included: the allocator went somewhere
-          // it should not have.
+          // Killed by any other signal: the allocator went somewhere it
+          // should not have.
           counts[OUT_CRASH]++;
         }
       }
@@ -540,7 +618,7 @@ int main(int argc, char **argv) {
       double latency_mean =
           latency_n == 0 ? 0.0 : (double)latency_sum / (double)latency_n;
 
-      printf("%-10s %5d %8llu %8llu %8llu %8llu %8llu %8llu   "
+      printf("%-10s %5d %8llu %8llu %8llu %8llu %8llu %8llu %8llu   "
              "%6.2f [%5.2f,%6.2f]  %6.2f [%5.2f,%6.2f] %11.1f\n",
              target_name[t], bits_list[b],
              (unsigned long long)counts[OUT_DETECTED_NO_LOSS],
@@ -548,7 +626,8 @@ int main(int argc, char **argv) {
              (unsigned long long)counts[OUT_DETECTED_FATAL],
              (unsigned long long)counts[OUT_UNDETECTED_BENIGN],
              (unsigned long long)counts[OUT_UNDETECTED_SILENT],
-             (unsigned long long)counts[OUT_CRASH], detection_pct, dlo, dhi,
+             (unsigned long long)counts[OUT_CRASH],
+             (unsigned long long)counts[OUT_TIMEOUT], detection_pct, dlo, dhi,
              silent_pct, slo, shi, latency_mean);
       fflush(stdout);
 

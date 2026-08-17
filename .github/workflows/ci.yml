@@ -125,7 +125,8 @@ jobs:
       - name: Inject
         run: |
           ./build/${{ matrix.preset }}/bin/faultinject \
-            --trials 200 --bits 1,2 --csv faults.csv
+            --trials 200 --bits 1,2 --git-sha "$(git rev-parse --short HEAD)" \
+            --csv faults.csv
       - name: Check the results against what the profile promises
         env:
           HAS_CHECKSUM: ${{ matrix.checksum }}
@@ -141,7 +142,9 @@ jobs:
         run: |
           python3 - <<'PY'
           import csv, os, sys
-          rows = list(csv.DictReader(open('faults.csv')))
+          # The provenance block is `#` comment lines above the real header.
+          body = [l for l in open('faults.csv') if not l.startswith('#')]
+          rows = list(csv.DictReader(body))
           if not rows:
               sys.exit('faultinject produced no rows')
           bad = []
@@ -165,6 +168,24 @@ jobs:
         with:
           name: fault-injection-${{ matrix.preset }}
           path: faults.csv
+
+  # The README's numbers are the project's whole claim, and a claim that has
+  # drifted from the measurement behind it is worse than no claim at all. This
+  # gate holds every number in it against the committed CSVs, the headers, or a
+  # short list of definitions -- and fails on a `__` placeholder, which is what
+  # a table laid out and never filled in looks like.
+  #
+  # docs/RESULTS.md is checked the same way round: it is generated, so it has to
+  # be regenerated when the CSVs change rather than edited to match them.
+  readme-numbers:
+    name: numbers trace to a CSV
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check the README against bench/results/
+        run: python3 tools/check_readme_numbers.py
+      - name: Check docs/RESULTS.md is regenerated
+        run: python3 tools/report.py --check
 
   coverage:
     name: coverage

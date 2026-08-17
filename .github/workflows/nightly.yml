@@ -34,24 +34,34 @@ jobs:
 
   # The statistically meaningful run: enough trials that a rate carries a
   # confidence interval worth quoting.
+  #
+  # All three profiles, because the point of having profiles is that they
+  # detect different amounts and the difference is the thing being priced.
+  # Running only the default would report the best case as if it were the
+  # whole story.
   fault-sweep:
-    name: fault sweep
+    name: fault sweep / ${{ matrix.preset }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [gcc-release, gcc-fast, gcc-paranoid]
     steps:
       - uses: actions/checkout@v5
       - name: Configure
-        run: cmake --preset gcc-release
+        run: cmake --preset ${{ matrix.preset }}
       - name: Build
-        run: cmake --build --preset gcc-release -- -j$(nproc)
+        run: cmake --build --preset ${{ matrix.preset }} -- -j$(nproc)
       - name: Sweep
         run: |
-          ./build/gcc-release/bin/faultinject \
-            --trials 10000 --bits 1,2,4,8 --csv faults-full.csv
+          ./build/${{ matrix.preset }}/bin/faultinject \
+            --trials 10000 --bits 1,2,4,8 \
+            --git-sha "$(git rev-parse --short HEAD)" --csv faults-full.csv
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fault-sweep
+          name: fault-sweep-${{ matrix.preset }}
           path: faults-full.csv
 
   # The trade the patrol exists to make, priced rather than asserted: how long
@@ -63,28 +73,42 @@ jobs:
   # 4096 calls per trial, so an interval near or above that censors the mean
   # and only the trials counted in latency_n are in it.
   scrub-sweep:
-    name: scrub sweep
+    name: scrub sweep / ${{ matrix.preset }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - preset: gcc-release   # hardened
+            checksum: 'yes'
+          - preset: gcc-fast
+            checksum: 'no'
+          - preset: gcc-paranoid
+            checksum: 'yes'
     steps:
       - uses: actions/checkout@v5
       - name: Configure
-        run: cmake --preset gcc-release
+        run: cmake --preset ${{ matrix.preset }}
       - name: Build
-        run: cmake --build --preset gcc-release -- -j$(nproc)
+        run: cmake --build --preset ${{ matrix.preset }} -- -j$(nproc)
       - name: Sweep the scrub interval
         run: |
           set -e
           for s in 1 256 1024 4096 off; do
-            ./build/gcc-release/bin/faultinject \
+            ./build/${{ matrix.preset }}/bin/faultinject \
               --trials 2000 --bits 1,2 --scrub-interval "$s" \
-              --csv scrub-sweep.csv
+              --git-sha "$(git rev-parse --short HEAD)" --csv scrub-sweep.csv
           done
       - name: Summarise the curve
+        env:
+          HAS_CHECKSUM: ${{ matrix.checksum }}
         run: |
           python3 - <<'PY'
-          import csv, collections
-          rows = list(csv.DictReader(open('scrub-sweep.csv')))
+          import csv, collections, os
+          # The provenance block is `#` comment lines above the real header.
+          body = [l for l in open('scrub-sweep.csv') if not l.startswith('#')]
+          rows = list(csv.DictReader(body))
           by = collections.defaultdict(list)
           for r in rows:
               by[r['scrub_interval']].append(r)
@@ -97,18 +121,25 @@ jobs:
               weighted = sum(float(r['latency_mean_ops']) * int(r['latency_n']) for r in g)
               mean = weighted / n if n else float('nan')
               print(f"{k:>9} {total:>9} {silent:>7} {n:>7} {mean:>10.1f}")
-          # The patrol changes when damage is found, never whether corruption
-          # is allowed through silently. That must hold at every setting.
-          bad = [r for r in rows if int(r['undetected_silent']) or int(r['crash'])]
+          # Two different promises, as in ci.yml. Never leaving the arena is
+          # unconditional, so a crash fails under every profile. Detection is
+          # what the metadata buys, so silent corruption is a defect only where
+          # a checksum promised to catch it; under `fast` it is a recorded cost
+          # of the trade, and the patrol is not what governs it either way.
+          bad = [r for r in rows if int(r['crash'])]
+          if os.environ['HAS_CHECKSUM'] == 'yes':
+              bad += [r for r in rows if int(r['undetected_silent'])]
           if bad:
               for r in bad:
                   print('FAIL', r)
               raise SystemExit(1)
+          silent = sum(int(r['undetected_silent']) for r in rows)
+          print('profile', rows[0]['profile'], 'ok;', silent, 'silent cases recorded')
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scrub-sweep
+          name: scrub-sweep-${{ matrix.preset }}
           path: scrub-sweep.csv
 
   valgrind-soak:

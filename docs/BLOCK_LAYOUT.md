@@ -291,11 +291,18 @@ detects less. Stating that plainly is worth more than a table of ticks.
 
 `fast` has no checksum and no canary; there is nothing for it to detect a
 flipped header bit *with*, and `tests/test_integrity.c` says so explicitly
-rather than leaving a silent gap where the detection tests would be. What it
-does keep is the structural promise every profile makes: bounded traversals,
-clamped extents, and no access outside the arena whatever the control word
-says. That promise is gated in CI for all three profiles — a crash in any
-fault-injection cell fails the build.
+rather than leaving a silent gap where the detection tests would be. What it is
+*meant* to keep is the structural promise every profile makes: bounded
+traversals, clamped extents, and no access outside the arena whatever the
+control word says. That promise is gated in CI for all three profiles — a crash
+in any fault-injection cell fails the build.
+
+**Under `fast` that promise does not currently hold.** Two trials in 240,000
+write about 115 MB past a 262 KB arena, both reproducible from a seed; the
+mechanism and the reproducers are in
+[FAULT_MODEL.md](FAULT_MODEL.md#where-that-promise-currently-does-not-hold).
+Losing detection is the trade `fast` is supposed to be making. Losing the
+bound is not, and the two should not be confused.
 
 The single-bit header cell is decidable from theory for the two profiles with a
 checksum, so CI gates it at 100% detection and zero silent corruption. `fast`
