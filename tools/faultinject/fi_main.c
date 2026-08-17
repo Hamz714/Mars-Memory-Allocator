@@ -663,9 +663,10 @@ int main(int argc, char **argv) {
 
   if (fail_on_crash && crashes_seen > 0) {
     fprintf(stderr,
-            "FAIL: %llu trial(s) died on a signal. The arena promise is that no "
-            "corrupted control word makes the allocator read or write outside "
-            "the arena; a crash is that promise broken, under every profile.\n",
+            "FAIL: %llu trial(s) died on a signal. The arena promise is that "
+            "no corrupted control word makes the allocator read or write "
+            "outside the arena; a crash is that promise broken, under every "
+            "profile.\n",
             (unsigned long long)crashes_seen);
     return 1;
   }

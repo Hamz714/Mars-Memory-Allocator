@@ -85,7 +85,8 @@ int mm_init(void *heap, size_t heap_size) {
   // Nothing precedes the first block, and reporting its predecessor as in use
   // is what stops anything trying to step backwards off the front.
   mm_set_prev_in_use(first, true);
-  (void)mm_publish(first);  // `usable` was derived from the arena; it cannot fail
+  // `usable` was measured off the arena itself, so this cannot be refused.
+  (void)mm_publish(first);
   mm_bin_insert(first);
 
   return 0;
@@ -144,17 +145,19 @@ static mm_block *absorb_neighbours(mm_block *b) {
       if (!mm_unchanged(b, own, true)) {
         // `b` is the block being freed and it has stopped being itself. Nothing
         // may be written through it, so it is surrendered and the free ends
-        // here.
-        mm_fail(MM_ERR_CORRUPT_HEADER);
+        // here. The status is set after the quarantine, not before: a damaged
+        // header is why this happened, and it is more use to the caller than
+        // the quarantine that followed from it.
         mm_quarantine(b);
+        mm_fail(MM_ERR_CORRUPT_HEADER);
         return NULL;
       }
       if (!mm_unchanged(n, theirs, false)) {
         // The neighbour is out of its bin and no longer describes itself, so it
         // is neither mergeable nor safe to leave free in the tiling. Give it up
         // and release `b` at its own extent below.
-        mm_fail(MM_ERR_CORRUPT_HEADER);
         mm_quarantine(n);
+        mm_fail(MM_ERR_CORRUPT_HEADER);
       } else {
         // Immediately, with nothing that could rebuild in between: after this
         // line `n` is not in the tiling either, and the two agree again.
@@ -177,13 +180,13 @@ static mm_block *absorb_neighbours(mm_block *b) {
   size_t before = mm_block_size(prev);
   mm_bin_remove(prev);
   if (!mm_unchanged(b, own, true)) {
-    mm_fail(MM_ERR_CORRUPT_HEADER);
     mm_quarantine(b);
+    mm_fail(MM_ERR_CORRUPT_HEADER);
     return NULL;
   }
   if (!mm_unchanged(prev, before, false)) {
-    mm_fail(MM_ERR_CORRUPT_HEADER);
     mm_quarantine(prev);
+    mm_fail(MM_ERR_CORRUPT_HEADER);
     return b;
   }
 
@@ -455,22 +458,23 @@ void *mm_realloc(void *ptr, size_t new_size) {
   if (end < g_arena.hi) {
     mm_block *n = (mm_block *)(void *)end;
     size_t own = mm_block_size(b);
-    size_t theirs = mm_header_ok(n) ? mm_block_size(n) : 0;
-    if (mm_header_ok(n) && !mm_is_used(n) && own + theirs >= need) {
+    bool mergeable = mm_header_ok(n) && !mm_is_used(n);
+    size_t theirs = mergeable ? mm_block_size(n) : 0;
+    if (mergeable && own + theirs >= need) {
       MM_STAT_SUB(b);
       mm_bin_remove(n);
       // Both extents are re-established after the bin operation, for the reason
       // absorb_neighbours spells out: a bin operation writes into free blocks,
       // so neither number survived it vouched for.
       if (!mm_unchanged(b, own, true)) {
-        mm_fail(MM_ERR_CORRUPT_HEADER);
         mm_quarantine(b);
+        mm_fail(MM_ERR_CORRUPT_HEADER);
         return NULL;
       }
       if (!mm_unchanged(n, theirs, false)) {
-        mm_fail(MM_ERR_CORRUPT_HEADER);
+        MM_STAT_ADD(b);  // `b` is untouched; only the neighbour was given up
         mm_quarantine(n);
-        MM_STAT_ADD(b);
+        mm_fail(MM_ERR_CORRUPT_HEADER);
         return NULL;
       }
       mm_set_block_size(b, own + theirs);

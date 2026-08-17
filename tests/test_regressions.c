@@ -604,8 +604,8 @@ MM_TEST(regression, rebuild_does_not_write_into_a_phantom_free_block) {
   //
   // This is deliberately more damage than a bit flip would do, and it is
   // unrepresentative in one way that matters for what the test may assert: the
-  // tag it writes lands inside the live block's payload. So the assertions below
-  // are about what the *rebuild* touched, not about the payload surviving.
+  // tag it writes lands inside the live block's payload. So the assertions
+  // below are about what the *rebuild* touched, not the payload surviving.
   size_t stretched = (size_t)(phantom_at - (uint8_t *)(void *)freed);
   REQUIRE_TRUE(stretched >= MM_MIN_BLOCK);
   mm_bin_remove(freed);
@@ -629,9 +629,9 @@ MM_TEST(regression, rebuild_does_not_write_into_a_phantom_free_block) {
   CHECK_TRUE(guards_intact(raw, ARENA_SIZE));
 
   // And the phantom is in no bin, so nothing overlapping the live block can be
-  // handed out. The rebuild files at the head, and no real block shares its size
-  // class here, so the head is where a filed phantom would be -- the whole bin
-  // is walked all the same, bounded, since the point of the check is that a
+  // handed out. The rebuild files at the head, and no real block shares its
+  // size class here, so the head is where a filed phantom would be -- the whole
+  // bin is walked all the same, bounded, since the point of the check is that a
   // damaged list cannot be believed.
   size_t bin = mm_bin_of(phantom_size);
   bool filed = false;
@@ -678,10 +678,10 @@ MM_TEST(regression, recovery_surrenders_exactly_the_damaged_block) {
 
   // A decoy at the first address the scan will look at, sized so that it ends
   // exactly on the real block after the damage. That is what makes it hard: it
-  // is bounds-plausible *and* it tiles with a genuine header, which is the whole
-  // of what the scan used to require. What it cannot do is repeat its own extent
-  // in its last eight bytes -- those bytes are the damaged block's own boundary
-  // tag, and they say something else.
+  // is bounds-plausible *and* tiles with a genuine header, which is the whole
+  // of what the scan used to require. What it cannot do is repeat its own
+  // extent in its last eight bytes -- those bytes are the damaged block's own
+  // boundary tag, and they say something else.
   mm_block *decoy =
       (mm_block *)(void *)((uint8_t *)(void *)damaged + MM_MIN_BLOCK);
   mm_set_word(decoy, real_span - MM_MIN_BLOCK, 0, false, false);
