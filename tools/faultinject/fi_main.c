@@ -422,6 +422,7 @@ static void usage(const char *argv0) {
   printf("  --arena N      arena bytes (default %u)\n", ARENA_DEFAULT);
   printf("  --scrub-interval N|off  calls between patrols (default 1024)\n");
   printf("  --scrub-budget N        blocks per patrol (default 16)\n");
+  printf("  --fail-on-crash exit non-zero if any trial died on a signal\n");
   printf("  --csv FILE     machine-readable table; appended to if it exists,\n");
   printf("                 so a sweep can accumulate into one file\n");
   printf("  --git-sha SHA  recorded in the CSV provenance header\n");
@@ -436,6 +437,14 @@ int main(int argc, char **argv) {
   const char *only_target = NULL;
   const char *csv_path = NULL;
   const char *git_sha = "unknown";
+  // Turns the arena promise into an exit code. Every profile promises never to
+  // read or write outside the arena whatever a corrupted control word says, so
+  // a crash is a defect under all of them and a run that records one should
+  // fail rather than print. Timeouts are deliberately not covered: a traversal
+  // that terminates too slowly is a different defect, and the taxonomy keeps
+  // the two apart precisely so one gate cannot stand in for the other.
+  bool fail_on_crash = false;
+  uint64_t crashes_seen = 0;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -446,6 +455,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--csv") && i + 1 < argc) csv_path = argv[++i];
     else if (!strcmp(a, "--git-sha") && i + 1 < argc) git_sha = argv[++i];
     else if (!strcmp(a, "--scrub-budget") && i + 1 < argc) g_scrub_budget = (size_t)strtoull(argv[++i], NULL, 10);
+    else if (!strcmp(a, "--fail-on-crash")) fail_on_crash = true;
     else if (!strcmp(a, "--scrub-interval") && i + 1 < argc) {
       // "off" and 0 are the same thing -- no automatic patrol at all -- and
       // both are spelled out because a sweep reads better with a word than
@@ -593,6 +603,8 @@ int main(int argc, char **argv) {
         }
       }
 
+      crashes_seen += counts[OUT_CRASH];
+
       uint64_t counted = 0;
       for (int o = 0; o < OUT_COUNT; o++) counted += counts[o];
       if (counted == 0) continue;
@@ -648,5 +660,14 @@ int main(int argc, char **argv) {
 
   if (csv != NULL) fclose(csv);
   free(g_heap);
+
+  if (fail_on_crash && crashes_seen > 0) {
+    fprintf(stderr,
+            "FAIL: %llu trial(s) died on a signal. The arena promise is that no "
+            "corrupted control word makes the allocator read or write outside "
+            "the arena; a crash is that promise broken, under every profile.\n",
+            (unsigned long long)crashes_seen);
+    return 1;
+  }
   return 0;
 }

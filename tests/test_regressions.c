@@ -488,3 +488,223 @@ MM_TEST(regression, traversal_terminates_on_cyclic_link) {
   mm_free(c);
   free(heap);
 }
+
+// ---------------------------------------------------------------------------
+// The arena promise: no corrupted control word makes the allocator read or
+// write outside the arena. Measured at 10,000 trials per cell it held under
+// `hardened` and `paranoid` and failed twice in 240,000 under `fast`, from a
+// boundary tag written about 115 MB past a 262 KB arena. The two trials that
+// found it are replayed by seed as ctest cases; these three pin the mechanism,
+// and they run on every platform rather than only where fork() does.
+
+// An arena with poison either side of it, so that a write outside it is caught
+// as a changed byte rather than only when it happens to land on a mapping that
+// is not there. The 115 MB overrun crashed; a 40-byte one would not have.
+#define GUARD_BYTES 4096u
+#define GUARD_FILL 0xA5u
+
+static uint8_t *guarded_arena_new(size_t size) {
+  uint8_t *raw = (uint8_t *)malloc(size + 2 * GUARD_BYTES);
+  if (raw == NULL) return NULL;
+  memset(raw, GUARD_FILL, size + 2 * GUARD_BYTES);
+  return raw;
+}
+
+static bool guards_intact(const uint8_t *raw, size_t size) {
+  for (size_t i = 0; i < GUARD_BYTES; i++) {
+    if (raw[i] != GUARD_FILL) return false;
+    if (raw[GUARD_BYTES + size + i] != GUARD_FILL) return false;
+  }
+  return true;
+}
+
+// mm_publish positions both of its writes from the block's own control word:
+// the boundary tag lands at the block's end, and the step to the successor is
+// the whole extent. So an extent that runs past the arena must be refused
+// rather than written through -- and refused loudly, since leaving the tiling
+// broken is not an improvement on writing wildly.
+MM_TEST(regression, publish_refuses_an_extent_outside_the_arena) {
+  uint8_t *raw = guarded_arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(raw);
+  uint8_t *heap = raw + GUARD_BYTES;
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *a = mm_malloc(256);
+  void *hole = mm_malloc(256);
+  void *c = mm_malloc(256);
+  REQUIRE_NOT_NULL(a);
+  REQUIRE_NOT_NULL(hole);
+  REQUIRE_NOT_NULL(c);
+  mm_free(hole);
+
+  mm_block *b = mm_block_of(hole);
+  REQUIRE_NOT_NULL(b);
+  mm_bin_remove(b);
+
+  // An extent four times the arena, which is the shape the measured failure
+  // arrived in: a control word overwritten by something that was never a size.
+  mm_set_block_size(b, (size_t)(g_arena.hi - g_arena.lo) * 4);
+
+  CHECK_FALSE(mm_publish(b));
+  CHECK_TRUE(guards_intact(raw, ARENA_SIZE));
+  // Reported, not swallowed. Which of the two it reports depends on whether the
+  // span could be resynchronised, and both are honest answers.
+  CHECK_TRUE(mm_last_error() == MM_ERR_CORRUPT_HEADER ||
+             mm_last_error() == MM_ERR_CORRUPT_LINKS);
+  // And the refusal left something the allocator can still walk: the span was
+  // surrendered rather than left as a hole in the tiling.
+  CHECK_GT(g_arena.lost_bytes, (size_t)0);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  CHECK_TRUE(guards_intact(raw, ARENA_SIZE));
+
+  free(raw);
+}
+
+// Filing a block into a bin writes two link words into it. The rebuild walks
+// the tiling to find blocks to file, and under `fast` a header is only
+// bounds-checked -- so once anything has lied about an extent, that walk is
+// reading payload bytes as control words and writing links into whatever they
+// look like. That is how a two-bit flip destroyed a live block's header.
+//
+// A free block repeats its extent in its last eight bytes, and the rebuild now
+// requires the two to agree before it writes anything. Here the phantom is
+// planted inside a live payload with a tag that contradicts it: `fast` refuses
+// it on the tag, and the profiles with a checksum refuse it on that, so the
+// assertion is the same under all three.
+MM_TEST(regression, rebuild_does_not_write_into_a_phantom_free_block) {
+  uint8_t *raw = guarded_arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(raw);
+  uint8_t *heap = raw + GUARD_BYTES;
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *a = mm_malloc(256);
+  void *hole = mm_malloc(256);
+  void *live = mm_malloc(1024);
+  void *c = mm_malloc(256);
+  REQUIRE_NOT_NULL(a);
+  REQUIRE_NOT_NULL(hole);
+  REQUIRE_NOT_NULL(live);
+  REQUIRE_NOT_NULL(c);
+  mm_free(hole);
+
+  mm_block *freed = mm_block_of(hole);
+  mm_block *victim = mm_block_of(live);
+  REQUIRE_NOT_NULL(freed);
+  REQUIRE_NOT_NULL(victim);
+
+  // Where the walk will be sent: a 16-aligned address well inside the live
+  // block, so that the link words the rebuild would write land on payload bytes
+  // belonging to somebody.
+  uint8_t *phantom_at = (uint8_t *)(void *)victim + 8 * MM_ALIGNMENT;
+
+  // Stretch the free block over the start of the live one so that stepping past
+  // it lands on the phantom, and make it wholly self-consistent -- tag and
+  // checksum included -- so the walk has no reason of its own to stop before it
+  // gets there. Without this the test would pass for the wrong reason.
+  //
+  // This is deliberately more damage than a bit flip would do, and it is
+  // unrepresentative in one way that matters for what the test may assert: the
+  // tag it writes lands inside the live block's payload. So the assertions below
+  // are about what the *rebuild* touched, not about the payload surviving.
+  size_t stretched = (size_t)(phantom_at - (uint8_t *)(void *)freed);
+  REQUIRE_TRUE(stretched >= MM_MIN_BLOCK);
+  mm_bin_remove(freed);
+  mm_set_block_size(freed, stretched);
+  mm_write_free_footer(freed);
+  mm_seal(freed);
+
+  // The phantom: reads as a free block of a plausible size, with a boundary tag
+  // that does not repeat it and no checksum that would vouch for it.
+  mm_block *phantom = (mm_block *)(void *)phantom_at;
+  size_t phantom_size = 4 * MM_MIN_BLOCK;
+  mm_set_word(phantom, phantom_size, 0, false, false);
+
+  uint8_t before[2 * sizeof(uint64_t)];
+  memcpy(before, phantom_at + MM_HDR_SIZE, sizeof(before));
+
+  mm_bins_rebuild();
+
+  // The two link words the rebuild would have written are somebody's payload.
+  CHECK_MEM_EQ(phantom_at + MM_HDR_SIZE, before, sizeof(before));
+  CHECK_TRUE(guards_intact(raw, ARENA_SIZE));
+
+  // And the phantom is in no bin, so nothing overlapping the live block can be
+  // handed out. The rebuild files at the head, and no real block shares its size
+  // class here, so the head is where a filed phantom would be -- the whole bin
+  // is walked all the same, bounded, since the point of the check is that a
+  // damaged list cannot be believed.
+  size_t bin = mm_bin_of(phantom_size);
+  bool filed = false;
+  size_t budget = mm_max_blocks();
+  for (mm_block *cur = g_arena.bins[bin]; cur != NULL && budget-- > 0;
+       cur = (mm_block *)mm_free_link_get(cur, MM_LINK_NEXT, g_arena.secret)) {
+    if (cur == phantom) filed = true;
+  }
+  CHECK_FALSE(filed);
+
+  free(raw);
+}
+
+// Recovery surrenders the span between the damage and the next block boundary,
+// and only that span. Finding that boundary is a *search*, so a candidate that
+// is merely bounds-plausible is not enough: accepting one that is not a block
+// boundary leaves the tiling permanently out of step, and every later walk then
+// steps through blocks that are not there. That is what turned a single damaged
+// free header into a wild write two frees later.
+//
+// A free block whose header is destroyed has no mirror to rebuild it from under
+// any profile -- free blocks spend those bytes on the boundary tag -- so all
+// three surrender it, and all three must surrender exactly it.
+MM_TEST(regression, recovery_surrenders_exactly_the_damaged_block) {
+  uint8_t *raw = guarded_arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(raw);
+  uint8_t *heap = raw + GUARD_BYTES;
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *a = mm_malloc(256);
+  void *hole = mm_malloc(256);
+  void *keep = mm_malloc(256);
+  void *c = mm_malloc(256);
+  REQUIRE_NOT_NULL(a);
+  REQUIRE_NOT_NULL(hole);
+  REQUIRE_NOT_NULL(keep);
+  REQUIRE_NOT_NULL(c);
+  mm_free(hole);
+
+  mm_block *damaged = mm_block_of(hole);
+  REQUIRE_NOT_NULL(damaged);
+  size_t real_span = mm_block_size(damaged);
+  REQUIRE_TRUE(real_span >= 2 * MM_MIN_BLOCK);
+
+  // A decoy at the first address the scan will look at, sized so that it ends
+  // exactly on the real block after the damage. That is what makes it hard: it
+  // is bounds-plausible *and* it tiles with a genuine header, which is the whole
+  // of what the scan used to require. What it cannot do is repeat its own extent
+  // in its last eight bytes -- those bytes are the damaged block's own boundary
+  // tag, and they say something else.
+  mm_block *decoy =
+      (mm_block *)(void *)((uint8_t *)(void *)damaged + MM_MIN_BLOCK);
+  mm_set_word(decoy, real_span - MM_MIN_BLOCK, 0, false, false);
+
+  // An extent no bounds check can accept, which is what a control word looks
+  // like once something that was never a size has been written over it.
+  mm_set_block_size(damaged, (size_t)(g_arena.hi - g_arena.lo) * 4);
+
+  // Freeing the block in front of it makes the walk in mm_publish meet the
+  // damage, which is the path the measured failure took.
+  mm_free(a);
+
+  CHECK_TRUE(guards_intact(raw, ARENA_SIZE));
+  CHECK_NE(mm_last_error(), MM_OK);
+  // Exactly the damaged block: not the remainder of the arena, and not the
+  // MM_MIN_BLOCK the decoy would have cut it down to.
+  CHECK_EQ(g_arena.lost_bytes, real_span);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  // Still serving requests, which is what makes this quarantine rather than
+  // fatal damage.
+  CHECK_NOT_NULL(mm_malloc(64));
+
+  mm_free(keep);
+  mm_free(c);
+  free(raw);
+}
