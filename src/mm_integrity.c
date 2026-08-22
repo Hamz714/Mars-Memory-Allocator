@@ -59,7 +59,6 @@ bool mm_is_block(const mm_block *b) {
   return n <= (size_t)(g_arena.hi - (const uint8_t *)(const void *)b);
 }
 
-
 size_t mm_max_blocks(void) {
   if (g_arena.lo == NULL) return 0;
   return (size_t)(g_arena.hi - g_arena.lo) / MM_MIN_BLOCK + 1;
@@ -384,9 +383,11 @@ void mm_quarantine(mm_block *b) {
 
 bool mm_rescue(mm_block *b) {
   if (mm_header_ok(b)) return true;
-  // The start is all that is needed: the extent is the thing being recovered,
-  // so requiring it to be legible first would refuse every block this exists
-  // to deal with.
+  // The start is all that is needed *of the block*: the extent is the thing
+  // being recovered, so requiring it to be legible first would refuse every
+  // block this exists to deal with. That the start is a real one is the
+  // caller's to vouch for -- see the declaration, and scrub_run for the one
+  // caller that cannot always do so.
   if (!mm_is_block_start(b)) return false;
 
   uint8_t *start = (uint8_t *)(void *)b;
