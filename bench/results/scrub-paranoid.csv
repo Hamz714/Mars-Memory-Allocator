@@ -1,8 +1,8 @@
 # cpu=11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz
 # kernel=Linux 6.6.87.2-microsoft-standard-WSL2
 # compiler=gcc 11.4.0
-# date=2026-08-17T19:27:53Z
-# git_sha=f182d28
+# date=2026-08-22T14:53:45Z
+# git_sha=415e85c
 # profile=paranoid metadata_bytes=40
 # trials_per_cell=2000 base_seed=20260809 arena_bytes=262144
 # latency_window_ops=4096
