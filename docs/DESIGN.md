@@ -169,6 +169,19 @@ checks all of them, and the differential fuzzer runs it continuously.
 - **Never write through an unvalidated block.** A block's control word decides
   where its own trailer lands, so sealing a block whose header failed would
   scatter writes across the arena.
+- **Corroborate before writing into a block a walk *found*.** Stronger than the
+  line above, and learnt the hard way. `mm_header_ok` establishes that a block is
+  what it says only where a checksum backs it; under `fast` it is a bounds check,
+  and a run of payload bytes can pass it. So a walk that would write into a block
+  because it found one there — the bin rebuild filing free blocks, the
+  resynchronisation scan deciding where an abandoned span ends — asks
+  `mm_extent_corroborated`, which additionally requires a free block's boundary
+  tag to repeat its extent. Every profile has that redundancy; under `fast` it is
+  the only redundancy there is.
+- **A size that crossed a bin operation is not a size.** Bin operations write
+  into free blocks, and one that finds its list damaged rebuilds from the tiling
+  and writes into more of them. An extent read before such a call is
+  re-established after it (`mm_unchanged`) before any arithmetic uses it.
 - **Every surrendered byte is accounted for.** Space the allocator gives up is
   counted in `lost_bytes`, and a quarantined block stays in the tiling as
   permanently-allocated space nobody owns. That turns "space was lost" from an
@@ -188,15 +201,21 @@ where, and how the numbers are produced.
 
 Two promises separate cleanly, and they are gated separately in CI:
 
-1. **Never leave the arena.** Every profile is meant to promise this
-   unconditionally, whatever a corrupted control word says: traversals bounded,
-   extents clamped. A crash in any fault-injection cell fails the build, under
-   all three profiles. **Measured, it holds under `hardened` and `paranoid`
-   (280,000 trials each, zero crashes) and does not hold under `fast`**, where
-   two trials in 240,000 write past the end of the arena — see
-   [FAULT_MODEL.md](FAULT_MODEL.md#where-that-promise-currently-does-not-hold)
-   for the reproducers and the mechanism. Detection is the trade `fast` makes;
-   the bound is not supposed to be part of that trade.
+1. **Never leave the arena.** Every profile promises this unconditionally,
+   whatever a corrupted control word says: traversals bounded, extents clamped,
+   and `mm_publish` refusing to write through an extent that is not inside the
+   arena rather than trusting the paths that reach it. A crash in any
+   fault-injection cell fails the build, under all three profiles, and the two
+   trials that once broke it are replayed by seed as tests.
+
+   It did not always hold. `fast` broke it twice in 240,000 trials, and the
+   cause was that a free block's boundary tag — the only second copy of its
+   extent that exists when there is no header checksum — was not being consulted
+   by the two walks that write into blocks they find. Detection is the trade
+   `fast` makes; the bound was never supposed to be part of that trade.
+   [FAULT_MODEL.md](FAULT_MODEL.md#where-that-promise-once-did-not-hold) has the
+   full mechanism, which is worth reading as an example of a crash sitting four
+   steps downstream of the mistake that caused it.
 2. **Detect what the metadata can detect.** This one *depends* on the profile.
    `fast` carries no checksum and no canary, so a flipped header bit is
    undetectable there in principle, and the tests say so explicitly rather than

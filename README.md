@@ -23,7 +23,7 @@ classified against the shadow model.
 
 | Profile | Metadata / allocation | Trials | Coverage | Silent | Crashes |
 |---|---:|---:|---:|---:|---:|
-| `fast` | 8 B | 240,000 | 73.96% | 41,279 | 2 |
+| `fast` | 8 B | 240,000 | 74.13% | 41,022 | 0 |
 | `hardened` (default) | 24 B | 280,000 | 100.00% | 0 | 0 |
 | `paranoid` | 40 B | 280,000 | 100.00% | 0 | 0 |
 
@@ -33,12 +33,17 @@ excluded, because there was nothing there to catch. `fast` carries no checksum
 and no canary, so it detects far less; it is measured on the same sweep and its
 cost is recorded rather than hidden.
 
-Two of those `fast` trials are not a cost of the trade but a **defect**: they
-write past the end of the arena, which no profile is supposed to do. Both
-reproduce from a seed, both are detected and quarantined under `hardened`, and
-[docs/FAULT_MODEL.md](docs/FAULT_MODEL.md#where-that-promise-currently-does-not-hold)
-has the reproducers and the mechanism. It is recorded here rather than left in
-a table for a reader to notice.
+**0 crashes** is the row that matters most, because it is the one promise every
+profile makes unconditionally: no corrupted control word makes the allocator
+read or write outside the arena. It has not always held. Two `fast` trials in
+240,000 used to write a boundary tag about 115 MB past a 262 KB arena, and the
+cause sat four steps upstream of the crash — a free block's boundary tag is the
+only second copy of its extent when there is no header checksum, and the two
+walks that write into blocks they find were not consulting it. Both trials are
+now replayed by seed as tests under all three profiles, and
+[docs/FAULT_MODEL.md](docs/FAULT_MODEL.md#where-that-promise-once-did-not-hold)
+sets out the mechanism in full. Fixing it also took `fast`'s single-bit
+`free_hdr` silent count from 160 in 10,000 to 0.
 
 Throughput against glibc `malloc` on the same workload code, median of 11
 pinned repetitions, 400,000 operations each, 64 MB arena:
@@ -210,7 +215,7 @@ in every fault-injection CSV.
 | Unit and property tests | 9 suites, run under gcc and clang, Debug and Release, and all three profiles |
 | Differential fuzzer | every operation checked against a shadow model, seeded so any failure replays exactly |
 | Sanitizers | ASan, UBSan under gcc and clang; Valgrind memcheck over every test binary and a long fuzz run |
-| Fault injection | gated in CI on the arena promise under all three profiles, and on the single-bit header cell where a checksum makes it decidable from theory. The promise currently holds as measured under `hardened` and `paranoid` and is broken by two `fast` trials in 240,000 |
+| Fault injection | gated in CI on the arena promise under all three profiles, and on the single-bit header cell where a checksum makes it decidable from theory. 56,000 trials per profile per push, plus the two seeds that once broke the promise replayed exactly |
 | Coverage | gated at 90% lines on `src/`, not merely reported |
 | Portability | Windows UCRT64 builds the core, tests, fuzzer and benchmark |
 

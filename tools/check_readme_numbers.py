@@ -54,6 +54,10 @@ STATED = {
     0: "zero, as a claim about counts that are zero",
     11: "repetitions in the pinned run, a parameter of the run rather than "
         "an output of it",
+    56000: "trials per profile in CI's fault-injection sweep -- 2,000 per "
+           "cell over 7 targets and 4 bit counts. A parameter of "
+           ".github/workflows/ci.yml, not a measurement: the committed "
+           "matrices are the 10,000-per-cell runs",
     # Toolchain identifiers. The kernel and compiler each committed run was
     # actually taken with are in that file's own `#` header; these name the
     # environment somebody reproducing it should stand up.
