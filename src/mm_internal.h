@@ -145,6 +145,14 @@ void mm_quarantine(mm_block *b);
 // profile carries a tail mirror. Otherwise the block's span is surrendered as
 // a quarantined block and false is returned. Either way the arena still tiles
 // when this returns.
+//
+// **The caller vouches that `b` is a block start.** The extent is the thing
+// being recovered, so it cannot be the evidence; what stands in for it is the
+// caller knowing where the block begins -- from a pointer it handed out, or
+// from the block it is itself in the middle of operating on. An address that
+// merely looks plausible is not enough: giving up a span writes a control word
+// at its start, and doing that at an address that is not a boundary destroys
+// eight bytes of somebody's payload to tidy up a block that was never there.
 bool mm_rescue(mm_block *b);
 
 // The block preceding `b`, reached through its boundary tag, or NULL when

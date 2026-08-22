@@ -571,13 +571,27 @@ static mm_status_t scrub_run(size_t budget_blocks) {
     mm_block *b = (mm_block *)(void *)p;
 
     if (!mm_header_ok(b)) {
-      // The extent this block recorded is exactly what the damage destroyed,
-      // so there is no stepping past it. Recovery puts it back where the
-      // profile carries a mirror and surrenders its span where it does not;
-      // either way the arena still tiles afterwards.
       if (found == MM_OK) found = MM_ERR_CORRUPT_HEADER;
       hits++;
-      (void)mm_rescue(b);
+      // Recovery needs a block start the caller vouches for, and the patrol's
+      // cursor is not one. It is wherever the last extent said, so an extent
+      // that is *illegible* means the walk may already be out of step and this
+      // address may be somebody's payload -- and rebuilding from it writes a
+      // control word into that payload. Measured, letting the patrol do it cost
+      // 565 trials of silent corruption in the `fast` alloc_hdr cells, against
+      // 3 when it declines.
+      //
+      // A legible extent with a failed checksum is the opposite case: the walk
+      // is in step and only this block's contents are in doubt, which is
+      // precisely what recovery is for. That is the line mm_is_block draws, and
+      // under `fast` -- where mm_header_ok is that same bounds check -- means
+      // the patrol never rebuilds, which is the honest answer for a profile
+      // with nothing to tell a damaged block from a run of payload bytes.
+      //
+      // Nothing is lost by declining. The first free of a neighbour reaches the
+      // same damage through mm_publish, from an owner the allocator does vouch
+      // for.
+      if (mm_is_block(b)) (void)mm_rescue(b);
       if (!mm_header_ok(b)) {
         p = g_arena.lo;  // nothing legible here; start the lap again
         continue;
