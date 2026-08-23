@@ -708,3 +708,89 @@ MM_TEST(regression, recovery_surrenders_exactly_the_damaged_block) {
   mm_free(c);
   free(raw);
 }
+
+// The layer under the one above. `mm_extent_corroborated` stops the bin rebuild
+// filing something that is not a block, but "corroborated" is not "proved": a
+// free block's tag is a second copy of its extent, not a checksum over it, so a
+// run of bytes that carries both can still be filed. Filing writes two link
+// words into it, and if the block is not there those land on somebody's
+// metadata.
+//
+// So every extent read before a bin operation is re-established after it. Here
+// the phantom is given everything the rebuild asks for, its link write is aimed
+// squarely at a live free block's control word, and the coalesce that would
+// have added that word to an extent has to notice instead.
+//
+// Under `fast` and `paranoid` that is the check in absorb_neighbours firing.
+// Under `hardened` the rebuild lands a step earlier in the sequence and the
+// damage is caught before the merge is attempted at all. Both are the arena
+// surviving a write it should not have taken, which is what the assertions
+// below are about; neither is the one the test is willing to name.
+MM_TEST(regression, coalesce_refuses_a_neighbour_a_bin_operation_changed) {
+  uint8_t *raw = guarded_arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(raw);
+  uint8_t *heap = raw + GUARD_BYTES;
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *lead = mm_malloc(256);   // becomes the free block the walk starts from
+  void *keep = mm_malloc(256);
+  void *doomed = mm_malloc(512);  // `b`: freed at the end, and coalesced
+  void *after = mm_malloc(256);   // becomes `n`, the neighbour being merged
+  void *tail = mm_malloc(256);
+  REQUIRE_NOT_NULL(lead);
+  REQUIRE_NOT_NULL(keep);
+  REQUIRE_NOT_NULL(doomed);
+  REQUIRE_NOT_NULL(after);
+  REQUIRE_NOT_NULL(tail);
+  mm_free(lead);
+  mm_free(after);
+
+  mm_block *walk = mm_block_of(lead);
+  mm_block *b = mm_block_of(doomed);
+  mm_block *n = mm_block_of(after);
+  REQUIRE_NOT_NULL(walk);
+  REQUIRE_NOT_NULL(b);
+  REQUIRE_NOT_NULL(n);
+  size_t n_size = mm_block_size(n);
+
+  // Where a filed block's second link word lands on `n`'s control word. Under
+  // every profile that is sixteen bytes in front of it: the header size and the
+  // link the write uses change together.
+  uint8_t *phantom_at = (uint8_t *)(void *)n - 16;
+  REQUIRE_TRUE(phantom_at > (uint8_t *)(void *)b);
+
+  // Send the rebuild's walk there, by stretching the free block in front until
+  // it ends on the phantom. Tag and checksum both written, so the walk has no
+  // reason of its own to stop.
+  mm_bin_remove(walk);
+  mm_set_block_size(walk, (size_t)(phantom_at - (uint8_t *)(void *)walk));
+  mm_write_free_footer(walk);
+  mm_seal(walk);
+
+  // The phantom, carrying everything a rebuild asks of a free block: a legible
+  // extent, a boundary tag that repeats it, and a checksum where the profile
+  // has one. Its tag lands in `n`'s link words, which is also what makes the
+  // bin operation below take the rebuild path in the first place.
+  mm_block *phantom = (mm_block *)(void *)phantom_at;
+  mm_set_word(phantom, MM_MIN_BLOCK, 0, false, false);
+  mm_write_free_footer(phantom);
+  mm_seal(phantom);
+
+  // Freeing `b` coalesces forward into `n`, which means taking `n` out of its
+  // bin -- and that is the call that rebuilds, files the phantom, and writes
+  // over `n`'s control word.
+  mm_free(doomed);
+
+  CHECK_TRUE(guards_intact(raw, ARENA_SIZE));
+  // The merge was refused rather than made against a control word that is no
+  // longer an extent.
+  CHECK_NE(mm_last_error(), MM_OK);
+  CHECK_TRUE(mm_block_size(b) < n_size + ARENA_SIZE);
+  // `n` was given up rather than left free in the tiling and out of every bin.
+  CHECK_GT(g_arena.lost_bytes, (size_t)0);
+  // And the allocator is still an allocator.
+  CHECK_NOT_NULL(mm_malloc(64));
+
+  mm_free(keep);
+  free(raw);
+}
