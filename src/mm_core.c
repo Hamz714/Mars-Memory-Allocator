@@ -278,12 +278,24 @@ static void split_block(mm_block *b, size_t need) {
   if (run != NULL) release_block(run);
 }
 
-// Stamps a block as holding exactly `size` bytes for the caller, and seals it.
-// False when the block could not be published, in which case there is nothing
-// to hand back to the caller.
+// Stamps a block as holding `size` bytes for the caller, and seals it. False
+// when the block could not be published, in which case there is nothing to
+// hand back to the caller.
+//
+// Under MM_MODE_LIBC the block records the whole of itself, less its trailer,
+// as payload -- not the size that was asked for. That is what makes
+// malloc_usable_size answerable, and it is the answer to a hazard rather than
+// a convenience. A libc program is entitled to write into every byte
+// malloc_usable_size reports; if the payload ended at the requested size, the
+// canary would sit inside that entitlement and a correct program overrunning
+// into its own slack would be reported as corruption. Ending the payload where
+// the trailer begins puts the canary back out of reach, where it can only be
+// reached by an overrun that really is one.
 static bool finish_allocation(mm_block *b, size_t size) {
   size_t total = mm_block_size(b);
-  mm_set_word(b, total, total - MM_HDR_SIZE - size, true, false);
+  size_t give =
+      g_arena.mode == MM_MODE_LIBC ? total - MM_HDR_SIZE - MM_TRAIL : size;
+  mm_set_word(b, total, total - MM_HDR_SIZE - give, true, false);
   mm_write_canary(b);
   return mm_publish(b);
 }
@@ -311,7 +323,10 @@ static mm_block *grow_for(size_t need) {
   return b;
 }
 
-void *mm_malloc(size_t size) {
+void *mm_malloc(size_t size) { return mm_malloc_fresh(size, NULL); }
+
+void *mm_malloc_fresh(size_t size, size_t *dirty_prefix) {
+  if (dirty_prefix != NULL) *dirty_prefix = SIZE_MAX;
   mm_clear_error();
   if (!mm_arena_live()) {
     mm_fail(MM_ERR_NOT_INITIALIZED);
@@ -362,6 +377,17 @@ void *mm_malloc(size_t size) {
     mm_scrub_tick();
     return NULL;
   }
+  // A block carved out of a mapping nothing has been allocated from yet is
+  // still the zeroes the kernel supplied, and calloc is entitled to know.
+  // Asked here rather than in calloc, and asked whether or not anybody wanted
+  // the answer, because freshness is a property of the moment the block is
+  // carved: once it has been handed out the allocator cannot say what the
+  // caller did with it. The count makes this one load in the ordinary case.
+  if (g_arena.fresh_spans != 0) {
+    size_t dirty = mm_span_take_fresh(b);
+    if (dirty_prefix != NULL) *dirty_prefix = dirty;
+  }
+
   // Marked in use at its full extent before anything is carved off it, so that
   // the arena remains walkable even in the middle of the split.
   mm_set_word(b, found, 0, true, false);
@@ -386,6 +412,106 @@ void *mm_malloc(size_t size) {
   uint8_t *payload = mm_payload_of(b);
   mm_scrub_tick();
   return payload;
+}
+
+// --- Aligned allocation ----------------------------------------------------
+
+size_t mm_usable_size(const void *ptr) {
+  mm_clear_error();
+  mm_block *b = mm_block_of(ptr);
+  if (b == NULL || !mm_header_ok(b)) return 0;
+  if (!mm_is_used(b) || mm_is_quarantined(b)) return 0;
+  return mm_requested_size(b);
+}
+
+// Allocates at an address that is a multiple of `align`.
+//
+// The way this is usually done in a preload allocator is to over-allocate, put
+// a header immediately below the aligned address, and set a flag in it saying
+// how far the block was shifted so that free can find the real start again.
+// That costs a bit in the control word, and this control word has none to
+// spare: every field in it is load-bearing and the whole thing is checksummed.
+//
+// It is also unnecessary here. Blocks tile their span exactly, so the aligned
+// address can be made into a genuine block start instead of a shifted one: cut
+// the over-allocated block in two at that point, hand the back half out, and
+// release the front half as ordinary free space. What comes back is a block
+// like any other -- free, realloc, the consistency check and coalescing all
+// treat it as one, with no case of their own and no flag to get wrong.
+void *mm_memalign(size_t align, size_t size) {
+  if (align <= MM_ALIGNMENT) return mm_malloc(size);
+
+  // Enough slack that an aligned address with room for a whole block in front
+  // of it is guaranteed to exist: one alignment step to reach the boundary,
+  // and another in case the first one lands too close to the front to leave a
+  // block there.
+  size_t pad = 2 * align + MM_MIN_BLOCK;
+  if (size > SIZE_MAX - pad) {
+    mm_clear_error();
+    mm_fail(MM_ERR_NOMEM);
+    return NULL;
+  }
+
+  uint8_t *raw = (uint8_t *)mm_malloc(size + pad);
+  if (raw == NULL) return NULL;
+
+  uint8_t *want = (uint8_t *)mm_round_up((uintptr_t)raw, align);
+  // The front piece has to be able to stand on its own as a block.
+  while ((size_t)(want - raw) < MM_MIN_BLOCK) want += align;
+
+  mm_block *b = mm_block_of(raw);
+  if (b == NULL) return raw;  // reported already; nothing left to do safely
+
+  size_t total = mm_block_size(b);
+  size_t front = (size_t)(want - raw);
+  size_t need = mm_size_for(size);
+  if (need == 0 || front + need > total) {
+    // Cannot be cut where it needs cutting. The block is correct and correctly
+    // aligned for anything up to MM_ALIGNMENT, so it is released rather than
+    // returned: handing back an under-aligned pointer would be worse than
+    // failing.
+    mm_free(raw);
+    mm_fail(MM_ERR_NOMEM);
+    return NULL;
+  }
+
+  MM_STAT_SUB(b);
+
+  // Shrink the front, keeping its flags -- PREV_IN_USE belongs to whatever is
+  // before it and IN_USE keeps the arena walkable through the cut.
+  mm_set_block_size(b, front);
+  mm_seal(b);
+
+  mm_block *tail = (mm_block *)(void *)(want - MM_HDR_SIZE);
+  tail->word = 0;
+#if MM_HAS_CRC
+  tail->payload_crc = 0;
+#endif
+  // Born in use, at the whole of what is left, like every block that is about
+  // to be trimmed.
+  mm_set_word(tail, total - front, MM_TRAIL, true, false);
+  mm_set_prev_in_use(tail, true);
+  mm_seal(tail);
+
+  split_block(tail, need);
+  if (!finish_allocation(tail, size)) {
+    mm_scrub_tick();
+    return NULL;
+  }
+  MM_STAT_ADD(tail);
+
+  // Only now is the front given away. It is marked in use and is in no bin,
+  // which is exactly the state absorb_neighbours expects; the block after it
+  // is `tail`, which is in use, so nothing merges forward over the allocation
+  // that was just made.
+  mm_block *run = absorb_neighbours(b);
+  if (run != NULL) {
+    release_block(run);
+    reclaim(run);
+  }
+
+  mm_scrub_tick();
+  return mm_payload_of(tail);
 }
 
 // --- Release ---------------------------------------------------------------

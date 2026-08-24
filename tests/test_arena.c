@@ -394,3 +394,61 @@ MM_TEST(arena, growth_is_unavailable_on_this_platform) {
 }
 
 #endif  // !_WIN32
+
+#if !defined(_WIN32)
+
+// --- Fresh pages -----------------------------------------------------------
+
+MM_TEST(arena, the_first_block_out_of_a_new_mapping_is_still_zero) {
+  REQUIRE_EQ(mm_arena_init_growable(), 0);
+
+  // Straight out of an anonymous mapping, so every byte of it is the zero the
+  // kernel supplied -- except the two words the allocator wrote when it filed
+  // the free block this was carved from.
+  size_t dirty = 0;
+  size_t big = MM_CHUNK_SIZE * 2;
+  uint8_t *p = (uint8_t *)mm_malloc_fresh(big, &dirty);
+  REQUIRE_NOT_NULL(p);
+  CHECK_EQ(dirty, MM_FRESH_DIRTY_PREFIX);
+
+  for (size_t i = dirty; i < big; i++) {
+    if (p[i] != 0) {
+      MARS_FAIL_("byte %zu of a fresh block was %u, not zero", i, p[i]);
+      break;
+    }
+  }
+
+  // And the freshness is spent. A second allocation out of the same mapping
+  // may be recycled memory, and the allocator says so rather than guessing.
+  size_t again = 0;
+  void *q = mm_malloc_fresh(64, &again);
+  REQUIRE_NOT_NULL(q);
+  CHECK_EQ(again, SIZE_MAX);
+
+  mm_free(q);
+  mm_free(p);
+  mm_arena_reset();
+}
+
+MM_TEST(arena, freshness_is_spent_by_a_plain_malloc_too) {
+  REQUIRE_EQ(mm_arena_init_growable(), 0);
+
+  // The block that consumes a mapping's freshness need not be the one that
+  // wanted to know about it. If a plain mm_malloc could take the first block
+  // and leave the flag standing, a later calloc would be told that recycled
+  // memory was untouched.
+  void *first = mm_malloc(64);
+  REQUIRE_NOT_NULL(first);
+  memset(first, 0xff, 64);
+  mm_free(first);
+
+  size_t dirty = 0;
+  void *second = mm_malloc_fresh(64, &dirty);
+  REQUIRE_NOT_NULL(second);
+  CHECK_EQ(dirty, SIZE_MAX);
+
+  mm_free(second);
+  mm_arena_reset();
+}
+
+#endif  // !_WIN32

@@ -7,9 +7,10 @@
 #include <string.h>
 
 #include "mars/allocator.h"
-// For MM_HAS_CRC and MM_HAS_CANARY: which of the mode's claims are even
-// available to be dropped depends on what the profile carries.
-#include "mm_layout.h"
+// For MM_HAS_CRC and MM_HAS_CANARY, which decide which of the mode's claims
+// are even available to be dropped, and for mm_usable_size, which is the libc
+// side of the same question.
+#include "mm_internal.h"
 
 #define ARENA_SIZE (64u * 1024u)
 
@@ -221,25 +222,39 @@ MM_TEST(access, libc_mode_verifies_what_it_can_and_says_so) {
   free(heap);
 }
 
-MM_TEST(access, libc_mode_does_not_soften_damage_it_can_still_see) {
+MM_TEST(access, libc_mode_puts_the_canary_past_what_the_caller_may_write) {
   uint8_t *heap = arena_new(ARENA_SIZE);
   REQUIRE_NOT_NULL(heap);
   REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
-  mm_set_mode(MM_MODE_LIBC);
 
+  // A managed block's payload is exactly what was asked for, and the canary
+  // sits immediately after it.
+  uint8_t *m = (uint8_t *)mm_malloc(64);
+  REQUIRE_NOT_NULL(m);
+  CHECK_EQ(mm_usable_size(m), (size_t)64);
+  mm_free(m);
+
+  mm_set_mode(MM_MODE_LIBC);
   uint8_t *p = (uint8_t *)mm_malloc(64);
   REQUIRE_NOT_NULL(p);
 
-  // Metadata is covered in both modes -- that is the point of having two of
-  // them rather than one weak one. "I could not look at the payload" must
-  // never outrank "I looked at the canary and it was broken".
-  p[64] ^= 0xffu;
-#if MM_HAS_CANARY
-  CHECK_EQ(mm_verify(p), MM_ERR_CORRUPT_CANARY);
-#else
-  // No canary under this profile, so an overrun of one byte is invisible here
-  // in either mode -- and the mode is still what mm_verify reports.
+  // A libc block's payload is the whole block less its trailer, because a
+  // program that asks malloc_usable_size is entitled to write every byte of
+  // the answer. Rounding and the minimum block size mean that is usually more
+  // than was asked for, and writing into it must not be corruption.
+  size_t usable = mm_usable_size(p);
+  CHECK_GE(usable, (size_t)64);
+  memset(p, 0xa5, usable);
   CHECK_EQ(mm_verify(p), MM_ERR_DEGRADED);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+#if MM_HAS_CANARY
+  // One byte past it is a genuine overrun, and is still caught. Metadata is
+  // covered in both modes -- that is the point of having two of them rather
+  // than one weak one. "I could not look at the payload" must never outrank
+  // "I looked at the canary and it was broken".
+  p[usable] ^= 0xffu;
+  CHECK_EQ(mm_verify(p), MM_ERR_CORRUPT_CANARY);
 #endif
 
   mm_set_mode(MM_MODE_MANAGED);

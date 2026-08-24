@@ -120,6 +120,12 @@ typedef struct mm_arena {
   // caller-supplied arena, which is fixed by definition.
   bool growable;
 
+  // How many spans have never had a block allocated out of them, and are
+  // therefore still exactly the zeroes the kernel supplied. Kept as a count so
+  // that the allocation path can skip the question entirely with one load,
+  // which is what it does for every allocation after the first few.
+  size_t fresh_spans;
+
   // Whether payload integrity can be maintained at all. See mm_set_mode.
   mm_mode_t mode;
 } mm_arena;
@@ -188,6 +194,38 @@ static inline size_t mm_round_up(size_t n, size_t to) {
 // Block size needed to satisfy a request of `payload` bytes, or 0 if the
 // computation would overflow.
 size_t mm_size_for(size_t payload);
+
+// --- The libc-facing entry points ------------------------------------------
+//
+// Not in the public header. They exist for the preload shim, which is in this
+// tree and is the only caller; the managed API is what the header describes,
+// and widening it with three functions that only make sense underneath a
+// malloc would misrepresent what this allocator is for.
+
+// mm_malloc, plus the answer to the one question calloc has to ask: how many
+// bytes at the front of the returned payload did the allocator itself write,
+// and therefore cannot be assumed to be the zeroes the kernel supplied?
+//
+// SIZE_MAX means "assume nothing", which is the answer for every block cut out
+// of memory that has been used before. Anything else means the rest of the
+// payload is already zero and memset can stop early. `dirty_prefix` may be
+// NULL, and the freshness is consumed either way -- it is a property of the
+// moment the block was carved, not of what the caller meant to do with it.
+void *mm_malloc_fresh(size_t size, size_t *dirty_prefix);
+
+// Bytes of a fresh block's payload the allocator has written: the two
+// free-list link words that were sitting in the free block it was carved from.
+#define MM_FRESH_DIRTY_PREFIX (2 * sizeof(uint64_t))
+
+// Allocates `size` bytes at an address that is a multiple of `align`, which
+// must be a power of two. Alignments up to MM_ALIGNMENT are already
+// guaranteed and cost nothing extra.
+void *mm_memalign(size_t align, size_t size);
+
+// Bytes the caller of `ptr` may legally use, or 0 if `ptr` is not a live block
+// of ours. Under MM_MODE_LIBC that is the whole block less its trailer -- see
+// finish_allocation -- which is what makes it safe to report.
+size_t mm_usable_size(const void *ptr);
 
 // True if `b` could be the *start* of a block: inside some span, on that
 // span's alignment, with room after it for the smallest block there is. Says

@@ -391,6 +391,7 @@ static mm_span *map_span(size_t block_size, mm_span_kind_t kind) {
     sys_unmap(base, bytes);
     return NULL;
   }
+  g_arena.fresh_spans++;
   return s;
 }
 
@@ -419,9 +420,23 @@ mm_span *mm_arena_map_large(size_t block_size) {
 
 // --- Release ---------------------------------------------------------------
 
+size_t mm_span_take_fresh(const mm_block *b) {
+  mm_span *s = mm_span_of(b);
+  if (s == NULL || !s->fresh) return SIZE_MAX;
+
+  s->fresh = false;
+  g_arena.fresh_spans--;
+  // The span was fresh, so the only free block in it covered the whole of it
+  // and started at s->lo. A block starting anywhere else means that reasoning
+  // does not hold, and the honest answer is then to promise nothing.
+  if ((const uint8_t *)(const void *)b != s->lo) return SIZE_MAX;
+  return MM_FRESH_DIRTY_PREFIX;
+}
+
 void mm_arena_release_span(mm_span *s) {
   if (s == NULL || s->kind == MM_SPAN_USER) return;
 
+  if (s->fresh) g_arena.fresh_spans--;
   mm_scrub_leave(s);
   mm_span_unregister(s);
 
@@ -457,6 +472,7 @@ void mm_arena_reset(void) {
 
   g_arena.spans = NULL;
   g_arena.span_count = 0;
+  g_arena.fresh_spans = 0;
   g_arena.total_bytes = 0;
   g_arena.span_cache = NULL;
   g_arena.scrub_span = NULL;

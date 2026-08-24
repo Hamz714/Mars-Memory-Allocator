@@ -302,3 +302,59 @@ MM_TEST(core, best_fit_prefers_the_tightest_hole) {
   mm_free(sep2);
   free(heap);
 }
+
+// --- Aligned allocation ----------------------------------------------------
+
+MM_TEST(core, memalign_returns_an_aligned_block_that_is_an_ordinary_block) {
+  uint8_t *heap = arena_new(256u * 1024u);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, 256u * 1024u), 0);
+
+  // Every power of two from below the guaranteed alignment to a page. The
+  // small ones are the cases that must cost nothing extra; the large ones are
+  // the cases that have to cut a block in two.
+  static const size_t aligns[] = {8, 16, 32, 64, 128, 256, 512, 1024, 4096};
+  void *live[sizeof(aligns) / sizeof(aligns[0])];
+
+  for (size_t i = 0; i < sizeof(aligns) / sizeof(aligns[0]); i++) {
+    live[i] = mm_memalign(aligns[i], 100);
+    REQUIRE_NOT_NULL(live[i]);
+    CHECK_EQ((uintptr_t)live[i] % aligns[i], 0);
+    // What comes back is a block like any other: it verifies, it reports a
+    // usable size, and the arena still tiles around it. That is the whole
+    // argument for cutting the block rather than shifting its header.
+    CHECK_EQ(mm_verify(live[i]), MM_OK);
+    CHECK_GE(mm_usable_size(live[i]), (size_t)100);
+    memset(live[i], (int)i, 100);
+    CHECK_EQ(mm_check_heap(), MM_OK);
+  }
+
+  for (size_t i = 0; i < sizeof(aligns) / sizeof(aligns[0]); i++) {
+    const uint8_t *q = (const uint8_t *)live[i];
+    for (size_t j = 0; j < 100; j++) CHECK_EQ(q[j], (uint8_t)i);
+  }
+
+  // Freeing them puts the space back: the front halves that were cut off are
+  // ordinary free blocks and coalesce with everything around them.
+  for (size_t i = 0; i < sizeof(aligns) / sizeof(aligns[0]); i++) {
+    mm_free(live[i]);
+  }
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  free(heap);
+}
+
+MM_TEST(core, memalign_refuses_rather_than_returning_a_misaligned_block) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  // No room to over-allocate by twice the alignment, so there is no aligned
+  // address to hand out. Returning an under-aligned pointer would be worse
+  // than failing, because the caller cannot tell.
+  CHECK_NULL(mm_memalign(1u << 20, 64));
+  CHECK_EQ(mm_last_error(), MM_ERR_NOMEM);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  free(heap);
+}

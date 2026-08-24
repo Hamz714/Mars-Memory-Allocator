@@ -114,14 +114,19 @@ void mm_arena_reset(void);
 
 // --- Pages -----------------------------------------------------------------
 
-// Whether every byte of `s` is still exactly as the kernel supplied it, which
-// for a fresh anonymous mapping means zero. calloc uses this to skip its
-// memset; the first allocation that is not the whole span clears it, because
-// after that the allocator has written free-list links and headers into pages
-// it can no longer name.
-static inline bool mm_span_fresh(const mm_span *s) {
-  return s != NULL && s->fresh;
-}
+// Consumes the freshness of the span `b` was carved from, and reports how many
+// bytes at the front of `b`'s payload the allocator wrote into it.
+//
+// A span is fresh while nothing has been allocated out of it, which for an
+// anonymous mapping means every byte of it is still the zero the kernel
+// supplied. The one exception is the block at the very start: it was the free
+// block the whole span began as, so its first two payload words hold the
+// free-list links that filed it. That is the prefix this returns.
+//
+// SIZE_MAX means nothing may be assumed. Calling this consumes the freshness
+// whatever the answer, because after this block is handed out the allocator can
+// no longer say which pages the caller has touched.
+size_t mm_span_take_fresh(const mm_block *b);
 
 // Hands the whole pages inside [from, to) back to the operating system without
 // unmapping them, so a large free returns resident memory rather than only
