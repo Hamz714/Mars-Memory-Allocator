@@ -31,6 +31,9 @@ is `$(git rev-parse --short HEAD)`.
 | `bench-hardened.csv` | `gcc-release` | the same, default profile | as above |
 | `bench-paranoid.csv` | `gcc-paranoid` | the same, tail mirror | as above |
 | `bench-hardened-nostats.csv` | `gcc-nostats` | the same again with `MARS_STATS` off, to price the counters | as above |
+| `preload-fast.csv` | `gcc-fast` | Wall time of nine real programs under `LD_PRELOAD`, against the same programs on glibc | `taskset -c 2 python3 tools/preload_bench.py --preload build/gcc-fast/bin/libmars_preload.so --probe build/gcc-fast/bin/calloc_probe --profile fast --reps 11 --git-sha SHA --out FILE` |
+| `preload-hardened.csv` | `gcc-release` | the same, default profile | as above, with `gcc-release` and `--profile hardened` |
+| `preload-paranoid.csv` | `gcc-paranoid` | the same, tail mirror | as above, with `gcc-paranoid` and `--profile paranoid` |
 | `faults-fast.csv` | `gcc-fast` | The full injection matrix: 7 targets × {1,2,4,8} bits × 10,000 trials | `faultinject --trials 10000 --bits 1,2,4,8 --git-sha SHA --csv FILE` |
 | `faults-hardened.csv` | `gcc-release` | the same | as above |
 | `faults-paranoid.csv` | `gcc-paranoid` | the same | as above |
@@ -47,6 +50,49 @@ trust a single figure, and it means the median and the inter-quartile range in
 only when creating it, which is what lets the five scrub intervals accumulate
 into one table. The scrub interval is a per-row column rather than a header
 field for exactly that reason.
+
+## Reading the `preload-*.csv` files
+
+These are the only numbers here that come from software nobody wrote for this
+project, and they are read differently from everything else.
+
+`wall_ns` is the wall time of a **whole process**: fork, exec, dynamic linking,
+the program's own work, and its allocation. Allocation is a small part of that
+for every program in the set, which is the point — it is what makes the
+comparison a statement about real software — and also the limitation. **A ratio
+near 1.0 means the allocator disappeared into the noise, not that it is as fast
+as glibc.** The per-operation cost is in `bench-*.csv`, where it is visible.
+
+The harness alternates allocators repetition by repetition rather than running
+all of one and then all of the other, and warms the page cache before the first
+timed repetition, so that a machine drifting mid-run does not land on whichever
+allocator went second. It still cannot make process wall time a quiet
+instrument: `git_log_stat` reads git objects off a Windows filesystem through
+WSL and its inter-quartile range is wide enough to swallow anything the
+allocator does. It is kept because dropping the noisiest program because it is
+noisy is how a benchmark set becomes flattering.
+
+`max_rss_kb` is the child's peak resident set, from `wait4`. It is the honest
+place to look for what 24 bytes per allocation costs on a real program, and
+`python_dict` is the row where it is large enough to see.
+
+The `calloc_*` rows carry a **third** allocator, `mars_nofresh`: the same build
+run with `MARS_SHIM_NOFRESH=1`, which makes `calloc` memset every byte it hands
+back rather than trusting pages the kernel has just supplied. The pair is the
+measurement of that one optimisation. `calloc_4mb_x200` is the case it exists
+for -- each allocation gets a mapping of its own, straight from the kernel and
+already zero -- and `calloc_4kb_x200000` is the case it cannot help, where
+every block is recycled arena memory and the memset has to happen. Both are
+recorded, because a shortcut is only worth quoting next to the case where it
+does nothing.
+
+`exit_code` is checked rather than decorative: the programs are run with output
+discarded, so a program that failed would otherwise look like a fast one. Each
+program is additionally run once more, outside the timing, with
+`MARS_SHIM_CHECK` pointing at a log, and `mm_check_heap()` walks the whole
+arena at exit. The `# heap_checks_passed=` and `# heap_checks_failed=` fields
+record the outcome, and the harness refuses to write a file where anything
+failed.
 
 ## Earlier reference runs
 

@@ -15,6 +15,7 @@ that goes stale:
 
   bench-<profile>.csv            throughput and space, mars and glibc
   bench-<profile>-nostats.csv    the same, counters compiled out
+  preload-<profile>.csv          wall time of real programs under LD_PRELOAD
   faults-<profile>.csv           the full target x bits matrix
   scrub-<profile>.csv            the same targets swept over scrub intervals
 
@@ -415,6 +416,89 @@ def scrub(o, sweeps):
               f"these numbers rather than gating them.\n")
 
 
+def preload(o, preloads):
+    """Wall time of real programs, this allocator against glibc.
+
+    Kept separate from the throughput section above and never merged with it:
+    those are per-operation figures from a workload written to be measured,
+    these are whole-process wall times from programs that know nothing about
+    any of this. Putting them in one table would invite a reader to compare
+    them, and they are not comparable."""
+    if not any(v[1] for v in preloads.values()):
+        return
+
+    o("\n## Real programs under LD_PRELOAD\n")
+    o("Wall time of a whole process, median of the repetitions, with the "
+      "inter-quartile range beside it. `LD_PRELOAD=libmars_preload.so` against "
+      "the same program with the system allocator, alternating repetition by "
+      "repetition so that a machine drifting during the run does not land on "
+      "one of them.\n")
+    o("This is the measurement this allocator is least able to flatter. "
+      "Nothing here was written to be allocated for: the programs, their "
+      "allocation patterns and their sizes were all decided by somebody else "
+      "for other reasons. It is also the measurement where the allocator "
+      "matters least — most of what these processes do is not allocation — so "
+      "**a ratio near 1.0 means the allocator disappeared into the noise, not "
+      "that it is as fast as glibc.** The microbenchmarks above are where the "
+      "per-operation cost is visible.\n")
+    o("Every program was also run once more with `MARS_SHIM_CHECK` set, and "
+      "`mm_check_heap()` walked the whole arena afterwards. The count is in "
+      "each file's `#` block.\n")
+
+    for profile in PROFILES:
+        meta, rows = preloads[profile]
+        if not rows:
+            continue
+        o(f"\n### `{profile}`\n")
+        o("| Program | glibc | mars | IQR (mars) | mars / glibc | peak RSS |")
+        o("|---|---:|---:|---:|---:|---:|")
+        for name in program_names(rows):
+            base = [float(r["wall_ns"]) for r in rows
+                    if r["program"] == name and r["allocator"] == "glibc"]
+            ours = [float(r["wall_ns"]) for r in rows
+                    if r["program"] == name and r["allocator"] == "mars"]
+            if not base or not ours:
+                continue
+            b, m = median(base), median(ours)
+            rss = median([float(r["max_rss_kb"]) for r in rows
+                          if r["program"] == name and r["allocator"] == "mars"])
+            o(f"| `{name}` | {b / 1e6:,.0f} ms | {m / 1e6:,.0f} ms | "
+              f"±{iqr(ours) / 1e6:,.0f} ms | {m / b:.2f}× | "
+              f"{rss / 1024.0:,.0f} MB |")
+
+        checks = meta.get("heap_checks_passed", "0")
+        failed = meta.get("heap_checks_failed", "0")
+        o(f"\nHeap checks after these runs: **{checks} consistent, "
+          f"{failed} inconsistent**.\n")
+
+        # The calloc rows carry a third allocator, and the whole point of them
+        # is the comparison between the two mars columns.
+        fresh = [r for r in rows if r["allocator"] == "mars_nofresh"]
+        if fresh:
+            o("\nWhat knowing a mapping is fresh saves `calloc`. "
+              "`mars_nofresh` is the same build with `MARS_SHIM_NOFRESH=1`, "
+              "which makes it memset every byte it hands back rather than "
+              "trusting pages the kernel has just supplied.\n")
+            o("| Program | glibc | mars | mars, memset always | saved |")
+            o("|---|---:|---:|---:|---:|")
+            for name in program_names(fresh):
+                def med(alloc):
+                    return median([float(r["wall_ns"]) for r in rows
+                                   if r["program"] == name
+                                   and r["allocator"] == alloc])
+                g, m, n = med("glibc"), med("mars"), med("mars_nofresh")
+                o(f"| `{name}` | {g / 1e6:,.1f} ms | {m / 1e6:,.1f} ms | "
+                  f"{n / 1e6:,.1f} ms | {n / m:.1f}× |")
+
+
+def program_names(rows):
+    seen = []
+    for r in rows:
+        if r["program"] not in seen:
+            seen.append(r["program"])
+    return seen
+
+
 def fmt_lat(c):
     """Mean calls to detection, marked `≥` when the window truncated it.
 
@@ -446,6 +530,10 @@ def build():
     nostats = read(RESULTS / "bench-hardened-nostats.csv")
     matrices = {p: load("faults", p) for p in PROFILES}
     sweeps = {p: load("scrub", p) for p in PROFILES}
+    # Not required: the preload library is Unix-only, so a tree measured on a
+    # platform that cannot build it has no such file and the section is simply
+    # absent rather than the report refusing to generate.
+    preloads = {p: load("preload", p, required=False) for p in PROFILES}
 
     o("# Results\n")
     o("Generated by `tools/report.py` from the CSVs in "
@@ -462,6 +550,7 @@ def build():
     latency(o, benches)
     space(o, benches)
     counters(o, benches, nostats)
+    preload(o, preloads)
     faults(o, matrices)
     scrub(o, sweeps)
 

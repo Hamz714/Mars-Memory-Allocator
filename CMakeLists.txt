@@ -280,6 +280,15 @@ if(MARS_BUILD_BENCH)
   set_target_properties(bench PROPERTIES
     C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 
+  # Prices the fresh-mapping shortcut in calloc. Deliberately linked against
+  # nothing of ours: it has to run under LD_PRELOAD against whichever allocator
+  # is being measured, glibc included, so it must not have this one linked in.
+  if(UNIX)
+    add_executable(calloc_probe bench/calloc_probe.c)
+    set_target_properties(calloc_probe PROPERTIES
+      C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+  endif()
+
   # The histogram decides every percentile that gets reported, so it is tested
   # on its own rather than trusted because the benchmark runs.
   if(BUILD_TESTING)
