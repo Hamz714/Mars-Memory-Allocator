@@ -225,12 +225,16 @@ static void reclaim(mm_block *b) {
     return;
   }
 
-  if (mm_block_size(b) >= MM_DONTNEED_MIN) {
+  // Large enough to be worth a syscall, and not more often than once per
+  // MM_TRIM_INTERVAL calls for this span. Both conditions are load-bearing and
+  // the second one was learnt from a measurement -- see mm_arena.h.
+  if (mm_block_size(b) >= MM_DONTNEED_MIN && g_arena.ops >= s->trim_after) {
     // Only the interior. The first two words of a free block's payload are its
     // free-list links and the last eight bytes are its boundary tag, and
     // handing either back would be handing back the block's own metadata.
     mm_arena_release_pages(mm_payload_of(b) + 2 * sizeof(uint64_t),
                            mm_block_end(b) - sizeof(uint64_t));
+    s->trim_after = g_arena.ops + MM_TRIM_INTERVAL;
   }
 }
 

@@ -137,17 +137,32 @@ size_t mm_span_take_fresh(const mm_block *b);
 // A no-op where the platform has nothing equivalent.
 void mm_arena_release_pages(uint8_t *from, uint8_t *to);
 
-// Smallest run of free space worth the syscall and the page faults that
-// touching it again will cost.
-//
-// Half a chunk, so that a chunk which has become entirely free hands its pages
-// back while an ordinary allocation never comes close. The trade is real and
-// worth naming: a program that repeatedly allocates and frees a buffer just
-// over this size pays a syscall and a re-fault of every page each time round,
-// which is why the threshold is not lower. glibc solves the same problem with
-// a threshold that adapts to what the program has been doing; this is the
-// fixed version of that, and it is fixed because an adaptive one is a
-// measurement exercise of its own.
+// Smallest run of free space worth handing back to the operating system. Half
+// a chunk, so that a chunk which has become entirely free returns its pages
+// while an ordinary allocation never comes close.
 #define MM_DONTNEED_MIN (MM_CHUNK_SIZE / 2)
+
+// And how often one span may do it: at most once per this many allocator
+// calls.
+//
+// The size threshold alone is not enough, and the measurement is what showed
+// it. A program that allocates and frees a small buffer in a loop leaves the
+// whole chunk free after every single free, so every single free met the size
+// test -- and each MADV_DONTNEED threw away page mappings that the very next
+// allocation faulted straight back in. `calloc_4kb_x200000` in
+// bench/results/preload-*.csv cost 4.2 us per call that way, against glibc's
+// 0.07 us, and none of it was allocation.
+//
+// A watermark fixes it because the two cases differ in *rate*, not in shape: a
+// program genuinely finished with a chunk frees it once, and one that is
+// churning frees it constantly. Rate-limiting cannot tell them apart, and does
+// not need to -- it makes the second case pay a bounded price. A program that
+// has finished still gives its pages back on the next call that qualifies;
+// one that is churning gives them back a thousand times less often.
+//
+// glibc solves the same problem with a threshold that adapts to what the
+// program has been doing. This is the fixed-cost version, and it is fixed
+// because an adaptive one is a measurement exercise of its own.
+#define MM_TRIM_INTERVAL ((uint64_t)1024)
 
 #endif  // MARS_MM_ARENA_H_

@@ -64,8 +64,11 @@ typedef struct mm_span {
 
   uint8_t kind;
   // Pages the kernel has supplied and nothing has written to since, so they
-  // are still zero. What calloc uses to skip its memset -- see mm_span_fresh.
+  // are still zero. What calloc uses to skip its memset.
   bool fresh;
+  // The operation count from which this span may hand its pages back to the
+  // operating system again. See mm_arena.h.
+  uint64_t trim_after;
 } mm_span;
 
 #define MM_SPAN_MAGIC 0x5350414E5F4D4152ULL  // "SPAN_MAR", big-endian
@@ -125,6 +128,11 @@ typedef struct mm_arena {
   // that the allocation path can skip the question entirely with one load,
   // which is what it does for every allocation after the first few.
   size_t fresh_spans;
+
+  // Monotonic count of public allocator calls, advanced by mm_scrub_tick at the
+  // end of each one. The patrol has its own counter because it resets; this one
+  // never does, and is what rate-limits per-span page trimming.
+  uint64_t ops;
 
   // Whether payload integrity can be maintained at all. See mm_set_mode.
   mm_mode_t mode;

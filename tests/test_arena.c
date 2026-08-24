@@ -513,3 +513,85 @@ MM_TEST(arena, the_unit_index_grows_and_still_answers) {
 }
 
 #endif  // !_WIN32
+
+#if !defined(_WIN32)
+
+// --- Handing pages back ----------------------------------------------------
+
+MM_TEST(arena, a_churning_span_does_not_hand_its_pages_back_every_time) {
+  REQUIRE_EQ(mm_arena_init_growable(), 0);
+
+  void *warm = mm_malloc(64);
+  REQUIRE_NOT_NULL(warm);
+  mm_span *s = mm_span_of(warm);
+  REQUIRE_TRUE(s != NULL);
+  mm_free(warm);
+
+  // The pathological shape, and it is not contrived -- it is what
+  // `calloc_4kb_x200000` in bench/results/preload-*.csv does. After every free
+  // the whole chunk is one free block, so the size test for handing pages back
+  // passes on every single iteration. Doing it every time throws away page
+  // mappings that the very next allocation faults straight back in, and the
+  // measurement put that at 4.2 us per call.
+  size_t trims = 0;
+  uint64_t last = s->trim_after;
+  for (int i = 0; i < 5000; i++) {
+    void *p = mm_malloc(4096);
+    REQUIRE_NOT_NULL(p);
+    REQUIRE_TRUE(mm_span_of(p) == s);
+    mm_free(p);
+    if (s->trim_after != last) {
+      trims++;
+      last = s->trim_after;
+    }
+  }
+
+  // Ten thousand allocator calls, so the watermark permits about ten. The
+  // bound is what matters rather than the exact figure: the failure this
+  // guards against is one trim per free, which is five thousand.
+  CHECK_LE(trims, (size_t)15);
+  // And it does still happen. A rate limit that turned into an off switch
+  // would pass the line above and give no memory back at all.
+  CHECK_GT(trims, (size_t)0);
+
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  mm_arena_reset();
+}
+
+MM_TEST(arena, pages_handed_back_still_read_as_zero) {
+  REQUIRE_EQ(mm_arena_init_growable(), 0);
+
+  // Fill a chunk, dirty every page of it, then free it all: the whole span
+  // becomes one free block over the size threshold and its interior goes back
+  // to the kernel. What comes back has to be the zeroes MADV_DONTNEED promises,
+  // because a later calloc out of a fresh mapping relies on exactly that -- and
+  // because the block's own metadata must have survived, which mm_check_heap
+  // is what checks.
+  enum { N = 200 };
+  static void *live[N];
+  size_t made = 0;
+  for (size_t i = 0; i < N; i++) {
+    live[i] = mm_malloc(8192);
+    if (live[i] == NULL) break;
+    memset(live[i], 0xdd, 8192);
+    made++;
+  }
+  REQUIRE_TRUE(made > 0);
+  for (size_t i = 0; i < made; i++) mm_free(live[i]);
+
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  // And the arena still works afterwards, which is the part a mistake in the
+  // page range would break: madvising over a boundary tag or a free-list link
+  // would zero the block's own metadata rather than its interior.
+  void *p = mm_malloc(65536);
+  REQUIRE_NOT_NULL(p);
+  memset(p, 1, 65536);
+  CHECK_EQ(mm_verify(p), MM_OK);
+  mm_free(p);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  mm_arena_reset();
+}
+
+#endif  // !_WIN32

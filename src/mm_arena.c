@@ -328,6 +328,7 @@ mm_span *mm_arena_install_user(void *heap, size_t heap_size) {
   // mm_init clears the buffer itself and then files a block into it, so
   // nothing here is untouched by the time anyone could ask.
   user.fresh = false;
+  user.trim_after = 0;
 
   if (!span_adopt(&user)) return NULL;
   return &user;
@@ -386,6 +387,7 @@ static mm_span *map_span(size_t block_size, mm_span_kind_t kind) {
   // page-fault storm.
   s->kind = (uint8_t)kind;
   s->fresh = true;
+  s->trim_after = 0;
 
   if (!span_adopt(s)) {
     sys_unmap(base, bytes);

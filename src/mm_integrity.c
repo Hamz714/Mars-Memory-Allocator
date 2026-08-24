@@ -93,14 +93,20 @@ size_t mm_metadata_overhead(void) { return MM_HDR_SIZE + MM_TRAIL; }
 
 // --- Bounds ----------------------------------------------------------------
 
-bool mm_is_block_start(const mm_block *b) {
-  if (b == NULL) return false;
-  // Which span, before anything else. An address in none of them was never
-  // ours, and the bounds every question below is asked against are that span's
-  // rather than the whole arena's. Blocks never straddle a span, so this is
-  // the entirety of what "inside the arena" means for a block.
-  const mm_span *s = mm_span_of(b);
-  if (s == NULL) return false;
+// The two structural questions, asked of a span that has already been found.
+//
+// Split out because `mm_header_ok` is the hottest thing in the allocator --
+// every validation, every walk and every coalesce goes through it -- and
+// written the obvious way it asked which span a block was in *three* times
+// over: once through mm_is_block_start, again through mm_is_block, and again
+// through mm_block_index for the checksum. One lookup answers all three.
+//
+// No throughput claim is attached to that, because none survived measurement.
+// An interleaved A/B against the previous layout on this machine moved between
+// -14% and +41% by workload while glibc's own figures moved by 2x in the same
+// run, which is the machine and not the code. It is here because doing the
+// same work three times is worse than doing it once, which needs no benchmark.
+static bool start_ok_in(const mm_span *s, const mm_block *b) {
   const uint8_t *p = (const uint8_t *)(const void *)b;
   // Every block starts a whole number of alignment units into the tiling, so
   // an address that does not cannot be one. Checked before the control word is
@@ -109,12 +115,27 @@ bool mm_is_block_start(const mm_block *b) {
   return (size_t)(s->hi - p) >= MM_MIN_BLOCK;
 }
 
-bool mm_is_block(const mm_block *b) {
-  if (!mm_is_block_start(b)) return false;
-  const mm_span *s = mm_span_of(b);
+static bool block_ok_in(const mm_span *s, const mm_block *b) {
+  if (!start_ok_in(s, b)) return false;
   size_t n = mm_block_size(b);
   if (n < MM_MIN_BLOCK) return false;
   return n <= (size_t)(s->hi - (const uint8_t *)(const void *)b);
+}
+
+bool mm_is_block_start(const mm_block *b) {
+  if (b == NULL) return false;
+  // Which span, before anything else. An address in none of them was never
+  // ours, and the bounds every question here is asked against are that span's
+  // rather than the whole arena's. Blocks never straddle a span, so this is
+  // the entirety of what "inside the arena" means for a block.
+  const mm_span *s = mm_span_of(b);
+  return s != NULL && start_ok_in(s, b);
+}
+
+bool mm_is_block(const mm_block *b) {
+  if (b == NULL) return false;
+  const mm_span *s = mm_span_of(b);
+  return s != NULL && block_ok_in(s, b);
 }
 
 size_t mm_span_max_blocks(const mm_span *s) {
@@ -128,9 +149,13 @@ size_t mm_max_blocks(void) {
 // --- Validation ------------------------------------------------------------
 
 bool mm_header_ok(const mm_block *b) {
-  if (!mm_is_block(b)) return false;
+  if (b == NULL) return false;
+  // One span lookup, and everything below is asked of it: the structure, the
+  // extent, and the index the checksum is bound to. See start_ok_in.
+  const mm_span *s = mm_span_of(b);
+  if (s == NULL || !block_ok_in(s, b)) return false;
 #if MM_HAS_CRC
-  return b->hdr_crc == mm_hdr_crc_of(b, mm_block_index(b), g_arena.secret);
+  return b->hdr_crc == mm_hdr_crc_of(b, mm_index_in(s, b), g_arena.secret);
 #else
   // The fast profile buys its eight-byte header by carrying no checksum at
   // all, so this is the structural check and nothing more. Claiming otherwise
@@ -716,6 +741,10 @@ static mm_status_t scrub_run(size_t budget_blocks) {
 }
 
 void mm_scrub_tick(void) {
+  // Advanced first and unconditionally, because it is not the patrol's: it is
+  // the arena's count of public calls, and page trimming is rate-limited
+  // against it whether or not the patrol is running at all.
+  g_arena.ops++;
   if (g_scrub_interval == 0 || !mm_arena_live()) return;
   if (++g_ops_since_scrub < g_scrub_interval) return;
   g_ops_since_scrub = 0;
