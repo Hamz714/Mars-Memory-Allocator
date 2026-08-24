@@ -4,8 +4,12 @@ A memory allocator in C that assumes its memory is being corrupted underneath
 it, and is built to notice. Every block carries integrity metadata — a
 checksummed header, a canary past the payload, boundary tags on free space — so
 that a bit flipped after the fact is detected rather than silently used. It
-manages a caller-supplied arena, allocates in O(1) from size-classed free lists
-over a bitmap, and patrols cold memory in the background.
+allocates in O(1) from size-classed free lists over a bitmap and patrols cold
+memory in the background.
+
+It takes either a caller-supplied arena or memory it maps itself, and there is
+an `LD_PRELOAD` shim, so the second question — does it work under software that
+knows nothing about it? — has an answer that is not a benchmark.
 
 The fault it models is the **single-event upset**: ionising radiation flips a
 bit in DRAM and a value changes with nothing having written it. That is a real
@@ -232,11 +236,19 @@ that only has a measurement.
   hardware and physical shielding. Nothing in software stops a bit flipping;
   this notices afterwards. It models single-event upsets — it does not survive
   them at the hardware level.
-- **Not thread-safe.** There is no lock and no per-thread cache, and none of
-  the numbers above say anything about behaviour under concurrency.
-- **Not a `malloc` replacement.** It manages a fixed caller-supplied arena and
-  does not grow it. There is no `LD_PRELOAD` shim, and no timings against a
-  real program — every workload here is a model of a program, not one.
+- **Not thread-safe, and this now bites harder.** There is no lock and no
+  per-thread cache, in the allocator or in the shim. Preloading the shim into a
+  threaded program will corrupt that program's heap; the shim interposes
+  `pthread_create` purely to say so on stderr the first time, because the
+  alternative is an unexplained crash inside the program under test. Per-thread
+  arenas are the next piece of work, and the 2 MB chunk alignment is the
+  groundwork for them. None of the numbers above say anything about behaviour
+  under concurrency.
+- **Not a complete `malloc` replacement.** The shim exports the whole family
+  and runs `git`, `grep`, a Python interpreter and a C compiler correctly, with
+  a consistent heap afterwards — but it is single-threaded, Unix-only, and has
+  no equivalent of glibc's per-size caching, which the small-`calloc` row above
+  shows costing an order of magnitude.
 - **Not able to repair a payload**, under any profile. If the flip landed in
   user data, the payload checksum reports it and the data is gone. Repair
   exists only for metadata, only under `paranoid`, and only while the mirror
