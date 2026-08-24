@@ -113,7 +113,7 @@ else()
   set(MARS_LIB_TYPE SHARED)
 endif()
 
-add_library(mars ${MARS_LIB_TYPE}
+set(MARS_SOURCES
   src/mm_core.c
   src/mm_arena.c
   src/mm_freelist.c
@@ -121,6 +121,8 @@ add_library(mars ${MARS_LIB_TYPE}
   src/mm_access.c
   src/mm_stats.c
   src/mm_crc32.c)
+
+add_library(mars ${MARS_LIB_TYPE} ${MARS_SOURCES})
 
 add_library(mars::mars ALIAS mars)
 
@@ -147,6 +149,52 @@ if(MARS_LIB_TYPE STREQUAL "SHARED")
   set_target_properties(mars PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR})
+endif()
+
+# ---------------------------------------------------------------------------
+# The LD_PRELOAD shim
+# ---------------------------------------------------------------------------
+
+# Unix only, and deliberately so: LD_PRELOAD is the mechanism, and a growable
+# arena -- which is what the shim needs and what mm_arena.c only provides over
+# mmap -- is the other half of it.
+#
+# Built from the allocator sources rather than linked against libmars.so. A
+# preload library has to be loadable by `LD_PRELOAD=./libmars_preload.so prog`
+# with nothing else set, and linking to a second shared object would make that
+# depend on LD_LIBRARY_PATH or on an RPATH baked in at build time. Compiling
+# the sources twice costs a second and removes the whole question.
+#
+# **Not built under a sanitizer, and not under coverage.** ASan replaces malloc
+# with its own, so a build in which both exist is a build where which one runs
+# is a link-order accident -- the two would fight, and whichever won, the result
+# would say nothing about either. TSan is the same. The core is still fully
+# sanitized: every other target here is built, and the shim is the one thing
+# left out. Coverage is excluded for a different reason: this target compiles
+# src/ a second time, and a second set of counters over the same source files
+# would be merged into the gate as though the shim's copy were the library's.
+#
+# The consequence is that the shim itself is not covered by the 90% line gate
+# in .github/workflows/ci.yml, which the workflow says in as many words.
+set(MARS_BUILD_SHIM OFF)
+if(UNIX AND MARS_SANITIZE STREQUAL "none" AND NOT MARS_COVERAGE)
+  set(MARS_BUILD_SHIM ON)
+endif()
+
+if(MARS_BUILD_SHIM)
+  add_library(mars_preload SHARED shim/mm_shim.c ${MARS_SOURCES})
+  target_include_directories(mars_preload
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(mars_preload
+    PRIVATE mars_flags mars_flags_strict ${CMAKE_DL_LIBS})
+  if(MARS_STATS)
+    target_compile_definitions(mars_preload PRIVATE MM_STATS=1)
+  endif()
+  set_target_properties(mars_preload PROPERTIES
+    OUTPUT_NAME mars_preload
+    C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
+    POSITION_INDEPENDENT_CODE ON)
 endif()
 
 include(CTest)
@@ -184,6 +232,23 @@ if(BUILD_TESTING)
   mars_add_test(test_realloc     tests/test_realloc.c)
   mars_add_test(test_integrity   tests/test_integrity.c)
   mars_add_test(test_regressions tests/test_regressions.c)
+
+  # Linked against the preload library rather than against libmars, so that
+  # every allocation it makes -- its own and the test framework's -- goes
+  # through the shim. Built only where the shim is; see MARS_BUILD_SHIM above
+  # for why a sanitized build is not one of those places.
+  if(MARS_BUILD_SHIM)
+    add_executable(test_shim tests/test_shim.c)
+    target_link_libraries(test_shim
+      PRIVATE mars_preload mars_test mars_flags mars_flags_strict)
+    target_include_directories(test_shim
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+              ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    set_target_properties(test_shim PROPERTIES
+      C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    add_test(NAME test_shim COMMAND test_shim)
+    set_tests_properties(test_shim PROPERTIES TIMEOUT 120)
+  endif()
 
   # The fuzzer brings its own main() and CLI, so it is registered directly
   # rather than through mars_add_test. CI runs a short bounded pass; longer
