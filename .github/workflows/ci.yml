@@ -68,10 +68,17 @@ jobs:
         run: cmake --preset ${{ matrix.preset }}
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }} -- -j$(nproc)
+      # test_shim is skipped, and it is not an oversight. Valgrind redirects
+      # malloc for *any* object that defines one, not only for libc, so under
+      # memcheck the preload shim is linked in and never called -- the test
+      # would be exercising valgrind's allocator and reporting on ours. It is
+      # the same interception that keeps the shim out of ASan builds. The
+      # allocator underneath is checked here through every other binary.
       - name: Memcheck the test binaries
         run: |
           set -e
           for t in build/${{ matrix.preset }}/bin/test_*; do
+            case "$t" in *test_shim) echo "== $t (skipped: valgrind replaces malloc)"; continue;; esac
             echo "== $t"
             valgrind -q --error-exitcode=1 --leak-check=full \
                      --errors-for-leak-kinds=all "$t"
@@ -222,6 +229,14 @@ jobs:
       - name: Test
         run: ctest --preset gcc-coverage
       # Gated, not merely reported: a number nobody enforces drifts downwards.
+      #
+      # The filter is `src/`, so **shim/mm_shim.c is not covered by this gate**.
+      # It is not built under coverage at all: the preload library compiles the
+      # `src/` sources a second time, and a second set of counters over the same
+      # files would be folded into this number as though the shim's copy were
+      # the library's. The shim is covered instead by tests/test_shim.c in the
+      # ordinary builds and by the preload job below, which runs real programs
+      # through it.
       - name: Report
         run: |
           mkdir -p coverage
@@ -236,6 +251,160 @@ jobs:
         with:
           name: coverage
           path: coverage/
+
+  # The claim this whole phase exists to support: the allocator runs software
+  # nobody wrote for it, produces the same answers, and leaves a consistent
+  # heap. A microbenchmark cannot say any of that -- the person who chose its
+  # allocation pattern also wrote the allocator.
+  #
+  # Correctness first and timings second. tools/preload_bench.py takes the
+  # committed timings deliberately, on a pinned core; a shared CI runner is not
+  # a machine anyone should quote a wall time from, so this job checks that the
+  # programs are *right* and leaves the numbers to bench/results/.
+  preload:
+    name: preload / ${{ matrix.preset }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [gcc-release, gcc-fast, gcc-paranoid]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} -- -j$(nproc)
+
+      # Bootstrap is the first thing that can go wrong and the loudest: dlsym
+      # allocates, so an allocator that has not solved that starts nothing at
+      # all. If this step passes, the bootstrap pool works.
+      - name: The shim loads at all
+        run: |
+          set -e
+          SO=$PWD/build/${{ matrix.preset }}/bin/libmars_preload.so
+          LD_PRELOAD=$SO /bin/true
+          LD_PRELOAD=$SO /bin/echo bootstrap ok
+
+      - name: Real programs produce identical output
+        run: |
+          set -e
+          SO=$PWD/build/${{ matrix.preset }}/bin/libmars_preload.so
+          LOG=$PWD/heapcheck.log
+          : > "$LOG"
+          fail=0
+          run_both() {
+            name="$1"; shift
+            "$@" > base.out 2> /dev/null; rc_base=$?
+            LD_PRELOAD=$SO MARS_SHIM_CHECK=$LOG "$@" > shim.out 2> /dev/null; rc_shim=$?
+            if [ "$rc_base" != "$rc_shim" ]; then
+              echo "FAIL $name: exit $rc_base vs $rc_shim"; fail=1; return
+            fi
+            if ! cmp -s base.out shim.out; then
+              echo "FAIL $name: output differs"; diff base.out shim.out | head -5; fail=1; return
+            fi
+            echo "ok   $name (exit $rc_base, $(wc -c < shim.out) bytes)"
+          }
+          run_both "ls -laR"        ls -laR /usr/include
+          run_both "git status"     git status --porcelain
+          run_both "git log --stat" git log --stat -n 100
+          run_both "grep -r"        grep -rc allocator src docs tests
+          run_both "python sum"     python3 -c "print(sum(range(10**6)))"
+          run_both "python dict"    python3 -c "d={str(i):i*i for i in range(200000)}; print(len(d), sum(d.values()))"
+          run_both "gcc compile"    gcc -O2 -std=c11 -c src/mm_core.c -Iinclude -Isrc -o /tmp/o.o
+          run_both "sort"           bash -c "seq 1 200000 | sort -n | md5sum"
+
+          echo "heap checks passed:      $(grep -c 'heap consistent at exit' "$LOG")"
+          echo "heap checks failed:      $(grep -c 'INCONSISTENT' "$LOG")"
+          [ "$(grep -c 'INCONSISTENT' "$LOG")" = "0" ] || fail=1
+          [ "$(grep -c 'heap consistent at exit' "$LOG")" != "0" ] || {
+            echo "FAIL: no run reported a heap check"; fail=1; }
+          exit $fail
+
+      # fork is the case a copy-on-write arena has to survive, and threads are
+      # the case it does not. The second is checked for the warning rather than
+      # for the outcome: there is no lock yet, and the shim's job is to say so.
+      - name: fork, and the thread warning
+        run: |
+          set -e
+          SO=$PWD/build/${{ matrix.preset }}/bin/libmars_preload.so
+          cat > forker.c <<'EOF'
+          #include <stdlib.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+          int main(void) {
+            void *pre[32];
+            for (int i = 0; i < 32; i++) { pre[i] = malloc(4096); memset(pre[i], i, 4096); }
+            pid_t pid = fork();
+            if (pid < 0) return 1;
+            for (int r = 0; r < 100; r++) {
+              void *p[16];
+              for (int i = 0; i < 16; i++) { p[i] = calloc(1, 8192); if (!p[i]) return 2; }
+              for (int i = 0; i < 16; i++) free(p[i]);
+            }
+            for (int i = 0; i < 32; i++) {
+              unsigned char *q = pre[i];
+              for (int j = 0; j < 4096; j++) if (q[j] != (unsigned char)i) return 3;
+              free(pre[i]);
+            }
+            if (pid == 0) _exit(0);
+            int st = 0; waitpid(pid, &st, 0);
+            if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return 4;
+            printf("fork ok\n");
+            return 0;
+          }
+          EOF
+          gcc -O1 -o forker forker.c
+          LD_PRELOAD=$SO MARS_SHIM_CHECK=1 ./forker
+
+          cat > threaded.c <<'EOF'
+          #include <pthread.h>
+          #include <stdlib.h>
+          #include <stdio.h>
+          static void *w(void *a) { (void)a; for (int i=0;i<64;i++){void*p=malloc(64);free(p);} return 0; }
+          int main(void) { pthread_t t; if (pthread_create(&t,0,w,0)) return 1; pthread_join(t,0); printf("ran\n"); return 0; }
+          EOF
+          gcc -O1 -pthread -o threaded threaded.c
+          LD_PRELOAD=$SO ./threaded 2> thread.err || true
+          grep -q 'no lock yet' thread.err || {
+            echo "FAIL: threaded program was not warned about"; cat thread.err; exit 1; }
+          echo "ok: the thread warning was emitted"
+
+      # A bit flipped in a real program's heap, and what each profile does
+      # about it. The profile decides the expectation, which is the point: the
+      # `fast` trade is priced rather than gated, and the other two are gated.
+      - name: A staged fault inside a real program
+        env:
+          PRESET: ${{ matrix.preset }}
+        run: |
+          set -e
+          SO=$PWD/build/${{ matrix.preset }}/bin/libmars_preload.so
+          PROG='d={str(i):i*i for i in range(50000)}; print(len(d))'
+
+          LD_PRELOAD=$SO MARS_SHIM_CHECK=1 python3 -c "$PROG" > /dev/null 2> clean.err
+          if [ -s clean.err ] && grep -qE 'corrupt|inconsistent|INCONSISTENT' clean.err; then
+            echo "FAIL: a clean run reported damage"; cat clean.err; exit 1
+          fi
+          echo "ok: a clean run reports nothing"
+
+          LD_PRELOAD=$SO MARS_SHIM_CHECK=1 MARS_SHIM_FLIP=120 \
+            python3 -c "$PROG" > /dev/null 2> flip.err || true
+          cat flip.err
+          grep -q 'flipped one bit' flip.err || { echo "FAIL: no flip staged"; exit 1; }
+          case "$PRESET" in
+            gcc-fast)
+              # No header checksum under this profile, so detection is not
+              # promised. Recorded, not gated -- exactly as the fault matrix
+              # treats it.
+              echo "note: reports from fast: $(grep -cE 'shim: (free|malloc|realloc|calloc): ' flip.err)"
+              ;;
+            *)
+              grep -qE 'shim: (free|malloc|realloc|calloc): |HEAP INCONSISTENT' flip.err || {
+                echo "FAIL: a profile with a checksum did not report the flip"; exit 1; }
+              echo "ok: the flip was reported"
+              ;;
+          esac
 
   # The core and its tests must stay portable. The preload shim, sanitizers,
   # valgrind and the fault injector are Linux-only by design and are not built
