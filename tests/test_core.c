@@ -356,5 +356,12 @@ MM_TEST(core, memalign_refuses_rather_than_returning_a_misaligned_block) {
   CHECK_EQ(mm_last_error(), MM_ERR_NOMEM);
   CHECK_EQ(mm_check_heap(), MM_OK);
 
+  // And a size whose over-allocation would wrap round rather than merely not
+  // fit. The arithmetic has to refuse before it is done, not after.
+  CHECK_NULL(mm_memalign(64, SIZE_MAX));
+  CHECK_EQ(mm_last_error(), MM_ERR_NOMEM);
+  CHECK_NULL(mm_memalign(64, SIZE_MAX - 63));
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
   free(heap);
 }

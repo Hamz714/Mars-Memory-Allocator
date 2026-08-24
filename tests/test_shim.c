@@ -9,6 +9,16 @@
 // arena is long since up. That is covered where it actually happens: the
 // preload job in .github/workflows/ci.yml runs real programs, and a bootstrap
 // failure is not subtle -- nothing starts at all.
+//
+// **This binary must not be run under Valgrind or under a sanitizer.** Both
+// replace malloc with one of their own, for any object that defines it, so
+// under either of them the shim is present, linked, and never called: the
+// tests below would be exercising the tool's allocator and reporting on this
+// one. Valgrind's redirection is global (`*  malloc  RG->`), not confined to
+// libc, which is why linking the shim first does not help. CMakeLists.txt
+// leaves this target out of sanitized and coverage builds, and the valgrind
+// job in ci.yml skips it by name. The allocator underneath is checked by both
+// through every other test binary here.
 
 #include "mars_test.h"
 

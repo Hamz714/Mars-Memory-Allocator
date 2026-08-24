@@ -452,3 +452,64 @@ MM_TEST(arena, freshness_is_spent_by_a_plain_malloc_too) {
 }
 
 #endif  // !_WIN32
+
+#if !defined(_WIN32)
+
+// --- The unit index under pressure -----------------------------------------
+
+MM_TEST(arena, the_unit_index_grows_and_still_answers) {
+  REQUIRE_EQ(mm_arena_init_growable(), 0);
+
+  // The index starts as a fixed table and doubles when it passes half full.
+  // Three hundred mappings of two units each is six hundred entries, which
+  // forces at least one rehash -- and a rehash that lost an entry would show
+  // up as a live pointer the allocator no longer recognises.
+  //
+  // This is address space rather than memory: nothing here touches more than
+  // the first page of each mapping, so the resident cost is a few megabytes.
+  enum { N = 300 };
+  static void *live[N];
+  size_t big = 3u * 1024u * 1024u;
+
+  for (size_t i = 0; i < N; i++) {
+    live[i] = mm_malloc(big);
+    REQUIRE_NOT_NULL(live[i]);
+    memset(live[i], (int)(i & 0xff), 64);
+  }
+  CHECK_GE(g_arena.span_count, (size_t)N);
+
+  for (size_t i = 0; i < N; i++) {
+    CHECK_TRUE(mm_owns(live[i]));
+    CHECK_EQ(mm_verify(live[i]), MM_OK);
+    CHECK_EQ(((const uint8_t *)live[i])[0], (uint8_t)(i & 0xff));
+  }
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  // Released in a scattered order, so that deletion has to shift entries back
+  // over occupied slots rather than always finding the hole at the end of a
+  // run. Tombstones would pass this and then degrade for the rest of the
+  // process; backward shifting is what keeps the table usable afterwards.
+  for (size_t step = 0; step < 7; step++) {
+    for (size_t i = step; i < N; i += 7) {
+      mm_free(live[i]);
+      live[i] = NULL;
+    }
+    // And the survivors are still findable after every round of deletions.
+    for (size_t i = 0; i < N; i++) {
+      if (live[i] != NULL) CHECK_TRUE(mm_owns(live[i]));
+    }
+  }
+
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  // Back to where it started, with the enlarged table still in service: a
+  // fresh allocation resolves through it.
+  void *p = mm_malloc(big);
+  REQUIRE_NOT_NULL(p);
+  CHECK_TRUE(mm_owns(p));
+  mm_free(p);
+
+  mm_arena_reset();
+}
+
+#endif  // !_WIN32
