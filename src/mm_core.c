@@ -290,19 +290,25 @@ static bool finish_allocation(mm_block *b, size_t size) {
 
 // --- Allocation ------------------------------------------------------------
 
-// Maps more memory when the bins have nothing that fits, and returns a free
-// block from it. NULL when the arena is fixed, or when the mapping failed.
+// Maps more memory and returns a free block from it, still in its bin. NULL
+// when the arena is fixed, or when the mapping failed.
 //
-// The new span arrives with its whole space filed as one free block, so the
-// answer comes back out of the bins rather than being handed over directly.
-// That is not a detour: it keeps every allocation, grown-into or not, on
-// exactly one path through mm_bin_remove and the re-validation after it.
+// The block is taken from the new span's start rather than by searching the
+// bins again. Searching would sometimes prefer free space elsewhere and leave
+// the mapping that was just made standing empty, with nothing in it whose
+// release could ever hand it back. There is nothing else in this span to
+// prefer, so its first block is the answer by construction.
 static mm_block *grow_for(size_t need) {
   if (!g_arena.growable) return NULL;
   mm_span *s = need > MM_LARGE_THRESHOLD ? mm_arena_map_large(need)
                                          : mm_arena_grow(need);
   if (s == NULL) return NULL;
-  return mm_bin_find(need);
+
+  mm_block *b = (mm_block *)(void *)s->lo;
+  if (!mm_header_ok(b) || mm_is_used(b) || mm_block_size(b) < need) {
+    return NULL;
+  }
+  return b;
 }
 
 void *mm_malloc(size_t size) {
@@ -322,8 +328,22 @@ void *mm_malloc(size_t size) {
     return NULL;
   }
 
-  mm_block *b = mm_bin_find(need);
+  // Above half a chunk an allocation is given a mapping of its own, and the
+  // bins are not consulted first. That is not a performance choice: it is what
+  // makes releasing it hand the memory back to the operating system rather
+  // than only to the free lists. A multi-megabyte buffer that happened to fit
+  // in an existing chunk would pin that chunk for the life of the process.
+  //
+  // A fixed arena is exempt, because it has nothing to map: there the bins are
+  // all there is, and refusing to look in them would fail an allocation the
+  // arena could serve.
+  bool dedicated = g_arena.growable && need > MM_LARGE_THRESHOLD;
+
+  mm_block *b = dedicated ? NULL : mm_bin_find(need);
   if (b == NULL) b = grow_for(need);
+  // The mapping was refused. Whatever the bins hold is better than failing, so
+  // the preference for a dedicated mapping gives way rather than the request.
+  if (b == NULL && dedicated) b = mm_bin_find(need);
   if (b == NULL) {
     MM_STAT_NOTE(MM_STAT_ALLOC_FAILED, 0);
     mm_fail(MM_ERR_NOMEM);

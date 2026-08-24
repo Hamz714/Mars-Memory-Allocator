@@ -354,7 +354,7 @@ static void *map_chunk_aligned(size_t bytes) {
 
 // Maps a region able to hold a block of `block_size` and adopts it. `bytes`
 // covers the descriptor, the block, and the rounding up to whole chunks.
-static mm_span *map_span(size_t block_size) {
+static mm_span *map_span(size_t block_size, mm_span_kind_t kind) {
   if (!mm_arena_can_grow() || !g_arena.growable) return NULL;
 
   size_t want = MM_SPAN_HDR + MM_BLOCK_OFFSET + block_size;
@@ -377,11 +377,14 @@ static mm_span *map_span(size_t block_size) {
   s->index_base = g_arena.next_index_base;
   s->map_base = base;
   s->map_size = bytes;
-  // A mapping bigger than one chunk was made for one oversized request, and is
-  // handed straight back when that request is released. A single chunk is kept
-  // and reused: churning mappings for ordinary allocations trades a cheap
-  // free-list operation for two syscalls and a page-fault storm.
-  s->kind = bytes > MM_CHUNK_SIZE ? MM_SPAN_LARGE : MM_SPAN_CHUNK;
+  // How the span was asked for, not how big it turned out. A request just over
+  // half a chunk still rounds to a single chunk's worth of mapping, and it is
+  // still a mapping made for one allocation and handed straight back when that
+  // allocation is released -- which is what MM_SPAN_LARGE means. An ordinary
+  // chunk is kept and reused instead, because churning mappings for ordinary
+  // allocations trades a cheap free-list operation for two syscalls and a
+  // page-fault storm.
+  s->kind = (uint8_t)kind;
   s->fresh = true;
 
   if (!span_adopt(s)) {
@@ -398,7 +401,7 @@ int mm_arena_init_growable(void) {
   g_arena.secret = mm_draw_secret();
   g_arena.mode = MM_MODE_MANAGED;
   g_arena.growable = true;
-  if (map_span(MM_MIN_BLOCK) == NULL) {
+  if (map_span(MM_MIN_BLOCK, MM_SPAN_CHUNK) == NULL) {
     g_arena.growable = false;
     return -1;
   }
@@ -407,11 +410,11 @@ int mm_arena_init_growable(void) {
 
 mm_span *mm_arena_grow(size_t block_size) {
   if (block_size > MM_LARGE_THRESHOLD) return NULL;
-  return map_span(block_size);
+  return map_span(block_size, MM_SPAN_CHUNK);
 }
 
 mm_span *mm_arena_map_large(size_t block_size) {
-  return map_span(block_size);
+  return map_span(block_size, MM_SPAN_LARGE);
 }
 
 // --- Release ---------------------------------------------------------------
