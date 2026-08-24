@@ -5,6 +5,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "mm_arena.h"
+
 size_t mm_alignment(void) { return MM_ALIGNMENT; }
 
 size_t mm_min_arena(void) { return MM_BLOCK_OFFSET + MM_MIN_BLOCK; }
@@ -22,7 +24,7 @@ static _Thread_local uint64_t g_pinned_secret;
 
 void mm_pin_secret(uint64_t secret) { g_pinned_secret = secret; }
 
-static uint64_t draw_secret(void) {
+uint64_t mm_draw_secret(void) {
   if (g_pinned_secret != 0) return g_pinned_secret;
 
   // Address of a stack object and the clock, run through splitmix64. Under
@@ -53,42 +55,33 @@ int mm_init(void *heap, size_t heap_size) {
     return -1;
   }
 
-  g_arena.base = (uint8_t *)heap;
-  g_arena.size = heap_size;
-  g_arena.lost_bytes = 0;
-  g_arena.secret = draw_secret();
-  mm_bins_reset();
+  // Whatever was installed before goes back to the operating system here, so
+  // that a program which starts with a growable arena and then hands over a
+  // buffer of its own -- which the tests do, repeatedly -- leaks nothing.
+  mm_arena_reset();
+  g_arena.secret = mm_draw_secret();
+  // A caller-supplied arena is reached through mm_read and mm_write, which is
+  // what the managed mode means. Restoring it here means a program that turned
+  // the shim's mode on and then installed its own arena gets the arena it
+  // asked for rather than the one the shim left behind.
+  g_arena.mode = MM_MODE_MANAGED;
 
   // Clear the arena once, up front. A payload checksum covers the whole
   // payload, including bytes the caller has not written yet, so those bytes
   // have to hold something defined -- otherwise the checksum is computed over
   // indeterminate memory. Paying for it here is O(arena) once rather than
   // O(size) on every allocation, and mmap-backed arenas arrive zeroed anyway.
-  memset(g_arena.base, 0, heap_size);
+  memset(heap, 0, heap_size);
 
   // The payload, not the block, is what must be 16-aligned, so a header whose
   // size is not a multiple of the alignment shifts the whole tiling forward by
   // the difference. Whatever does not divide into blocks at the tail is simply
-  // not part of the arena.
-  size_t usable = heap_size - MM_BLOCK_OFFSET;
-  usable -= usable % MM_ALIGNMENT;
-  g_arena.lo = g_arena.base + MM_BLOCK_OFFSET;
-  g_arena.hi = g_arena.lo + usable;
-  g_arena.scrub_at = g_arena.lo;
-
-  mm_block *first = (mm_block *)(void *)g_arena.lo;
-  first->word = 0;
-#if MM_HAS_CRC
-  first->payload_crc = 0;
-#endif
-  mm_set_word(first, usable, 0, false, false);
-  // Nothing precedes the first block, and reporting its predecessor as in use
-  // is what stops anything trying to step backwards off the front.
-  mm_set_prev_in_use(first, true);
-  // `usable` was measured off the arena itself, so this cannot be refused.
-  (void)mm_publish(first);
-  mm_bin_insert(first);
-
+  // not part of the arena. mm_arena_install_user does that arithmetic and
+  // files the space as one free block.
+  if (mm_arena_install_user(heap, heap_size) == NULL) {
+    mm_fail(MM_ERR_BAD_ARENA);
+    return -1;
+  }
   return 0;
 }
 
@@ -133,8 +126,13 @@ int mm_init(void *heap, size_t heap_size) {
 static mm_block *absorb_neighbours(mm_block *b) {
   size_t own = mm_block_size(b);
 
+  const mm_span *sp = mm_span_of(b);
+  if (sp == NULL) return NULL;
+
   uint8_t *end = mm_block_end(b);
-  if (end < g_arena.hi) {
+  // Bounded by the span and not the arena: the block after the last one in a
+  // chunk is not a block at all, it is whatever the next mapping holds.
+  if (end < sp->hi) {
     mm_block *n = (mm_block *)(void *)end;
     // A neighbour that fails validation is never merged and never written
     // through. Quarantined blocks report as in use, so they are excluded here
@@ -199,6 +197,43 @@ static mm_block *absorb_neighbours(mm_block *b) {
   return prev;
 }
 
+// Hands memory back to the operating system after a block has been freed.
+//
+// Two different things, because a chunk and a dedicated mapping are used
+// differently. A mapping made for one oversized request has nothing else in it
+// once that request is released, so it is unmapped outright -- address space
+// and all. An ordinary chunk is kept and reused, because churning mappings
+// would trade a free-list operation for two syscalls and a storm of page
+// faults; what it gives back instead is the resident pages of a large enough
+// free run, which is the memory that actually costs anything.
+static void reclaim(mm_block *b) {
+  mm_span *s = mm_span_of(b);
+  // A caller-supplied buffer is not ours to hand anywhere. It may be static
+  // storage or a file mapping, and MADV_DONTNEED means something quite
+  // different on one of those.
+  if (s == NULL || s->kind == MM_SPAN_USER) return;
+  // The release did not end with a free block -- it was quarantined part-way
+  // through -- so there is nothing here to give back.
+  if (mm_is_used(b)) return;
+
+  if (s->kind == MM_SPAN_LARGE && (uint8_t *)(void *)b == s->lo &&
+      mm_block_end(b) == s->hi) {
+    // Out of its bin first: the memory the links live in is about to stop
+    // existing.
+    mm_bin_remove(b);
+    mm_arena_release_span(s);
+    return;
+  }
+
+  if (mm_block_size(b) >= MM_DONTNEED_MIN) {
+    // Only the interior. The first two words of a free block's payload are its
+    // free-list links and the last eight bytes are its boundary tag, and
+    // handing either back would be handing back the block's own metadata.
+    mm_arena_release_pages(mm_payload_of(b) + 2 * sizeof(uint64_t),
+                           mm_block_end(b) - sizeof(uint64_t));
+  }
+}
+
 // Marks a block that absorb_neighbours produced as free, publishes it, and
 // files it. The insert is the last thing to happen, and by then the extent has
 // stopped moving.
@@ -255,9 +290,24 @@ static bool finish_allocation(mm_block *b, size_t size) {
 
 // --- Allocation ------------------------------------------------------------
 
+// Maps more memory when the bins have nothing that fits, and returns a free
+// block from it. NULL when the arena is fixed, or when the mapping failed.
+//
+// The new span arrives with its whole space filed as one free block, so the
+// answer comes back out of the bins rather than being handed over directly.
+// That is not a detour: it keeps every allocation, grown-into or not, on
+// exactly one path through mm_bin_remove and the re-validation after it.
+static mm_block *grow_for(size_t need) {
+  if (!g_arena.growable) return NULL;
+  mm_span *s = need > MM_LARGE_THRESHOLD ? mm_arena_map_large(need)
+                                         : mm_arena_grow(need);
+  if (s == NULL) return NULL;
+  return mm_bin_find(need);
+}
+
 void *mm_malloc(size_t size) {
   mm_clear_error();
-  if (g_arena.base == NULL) {
+  if (!mm_arena_live()) {
     mm_fail(MM_ERR_NOT_INITIALIZED);
     return NULL;
   }
@@ -273,6 +323,7 @@ void *mm_malloc(size_t size) {
   }
 
   mm_block *b = mm_bin_find(need);
+  if (b == NULL) b = grow_for(need);
   if (b == NULL) {
     MM_STAT_NOTE(MM_STAT_ALLOC_FAILED, 0);
     mm_fail(MM_ERR_NOMEM);
@@ -370,7 +421,10 @@ void mm_free(void *ptr) {
   // NULL means the block stopped standing up mid-coalesce and has been reported
   // and surrendered. There is nothing left to release, and the caller's pointer
   // is gone either way.
-  if (run != NULL) release_block(run);
+  if (run != NULL) {
+    release_block(run);
+    reclaim(run);
+  }
 
   mm_scrub_tick();
 }
@@ -384,7 +438,7 @@ void mm_free(void *ptr) {
 static void carry_payload_crc(mm_block *b, size_t old_size, uint32_t old_sum,
                               size_t new_size) {
 #if MM_HAS_CRC
-  if (old_sum != 0 && new_size <= old_size) {
+  if (mm_payload_crc_live() && old_sum != 0 && new_size <= old_size) {
     b->payload_crc = mm_payload_crc(mm_payload_of(b), new_size);
   } else {
     b->payload_crc = 0;
@@ -453,9 +507,12 @@ void *mm_realloc(void *ptr, size_t new_size) {
     return payload;
   }
 
-  // Try to absorb the following block rather than move.
+  // Try to absorb the following block rather than move. Bounded by this
+  // block's own span: what follows the last block of a chunk is another
+  // mapping, not a block.
+  const mm_span *sp = mm_span_of(b);
   uint8_t *end = mm_block_end(b);
-  if (end < g_arena.hi) {
+  if (sp != NULL && end < sp->hi) {
     mm_block *n = (mm_block *)(void *)end;
     size_t own = mm_block_size(b);
     bool mergeable = mm_header_ok(n) && !mm_is_used(n);

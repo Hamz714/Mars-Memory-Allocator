@@ -94,8 +94,14 @@ int64_t mm_write(void *ptr, size_t offset, const void *src, size_t len) {
   }
 
 #if MM_HAS_CRC
-  b->payload_crc = mm_payload_crc(payload, mm_requested_size(b));
-  mm_seal(b);
+  // Not established under MM_MODE_LIBC. The mode exists because raw pointers
+  // are being handed out, so a checksum this call left behind would be stale
+  // the moment anybody used one -- and mm_read would then report a correct
+  // program as corrupt.
+  if (mm_payload_crc_live()) {
+    b->payload_crc = mm_payload_crc(payload, mm_requested_size(b));
+    mm_seal(b);
+  }
 #endif
 
   return (int64_t)len;

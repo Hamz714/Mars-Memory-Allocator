@@ -9,6 +9,9 @@
 // Payload integrity is only meaningful when reads and writes go through
 // mm_read and mm_write: a raw pointer handed to the caller can be written
 // behind the allocator's back, at which point any payload checksum is stale.
+// That is a property of returning pointers at all rather than a gap in the
+// implementation, so it is named rather than hidden -- see mm_mode_t below and
+// the first section of docs/DESIGN.md.
 
 #ifndef MARS_ALLOCATOR_H_
 #define MARS_ALLOCATOR_H_
@@ -34,7 +37,8 @@ typedef enum mm_status {
   MM_ERR_CORRUPT_LINKS,    // block list topology is inconsistent
   MM_ERR_DOUBLE_FREE,      // block was already free
   MM_ERR_NOMEM,            // no block large enough
-  MM_ERR_QUARANTINED       // block was isolated after corruption was found
+  MM_ERR_QUARANTINED,      // block was isolated after corruption was found
+  MM_ERR_DEGRADED          // intact as far as this mode can check; see below
 } mm_status_t;
 
 // What the calling thread's most recent allocator call ran into. Reset at the
@@ -50,6 +54,48 @@ mm_status_t mm_last_error(void);
 
 // Human-readable name for a status code. Never returns NULL.
 const char *mm_strerror(mm_status_t status);
+
+// --- Modes -----------------------------------------------------------------
+//
+// Payload checksums and raw pointers are fundamentally incompatible. Once a
+// caller holds a `void *` it can store through it without telling the
+// allocator, and from that instant any checksum the allocator holds over those
+// bytes is stale. The managed API sidesteps this by requiring mm_read and
+// mm_write. A libc-compatible malloc cannot: handing back a raw pointer is the
+// entire contract.
+//
+// So the trade is made explicit rather than left to be discovered:
+//
+//   MM_MODE_MANAGED  access goes through mm_read/mm_write, and payload
+//                    integrity is maintained and checked like everything else.
+//
+//   MM_MODE_LIBC     raw pointers. The header checksum, the canary and the
+//                    free-list validation are unchanged and still cover every
+//                    byte of metadata; the payload is not covered at all, and
+//                    mm_verify says so by returning MM_ERR_DEGRADED rather
+//                    than MM_OK for a block it could only partly check.
+//
+// Nothing else changes between the two. The same blocks, the same layout, the
+// same detection of metadata damage -- what a mode selects is whether a
+// payload checksum is claimed, and MM_ERR_DEGRADED is how the allocator
+// declines to claim one.
+typedef enum mm_mode {
+  MM_MODE_MANAGED = 0,
+  MM_MODE_LIBC = 1
+} mm_mode_t;
+
+// Selects the mode. MM_MODE_MANAGED is the default, and mm_init restores it,
+// so a program that never calls this sees exactly the behaviour it always did.
+//
+// Switching to MM_MODE_LIBC drops the payload checksums already established,
+// because a checksum that is no longer maintained is worse than none: it
+// produces reports nobody can act on. Switching back does not invent them
+// again -- blocks written through a raw pointer in the meantime start
+// unestablished, which is what `payload_crc == 0` already means.
+void mm_set_mode(mm_mode_t mode);
+
+// The mode currently in force.
+mm_mode_t mm_get_mode(void);
 
 // --- Lifecycle -------------------------------------------------------------
 
@@ -149,6 +195,12 @@ void mm_stats_reset(void);
 
 // Verifies one block: header checksum, mirrored footer, canary, and payload
 // checksum. Returns MM_OK if intact.
+//
+// Under MM_MODE_LIBC the payload cannot be checked at all, so an otherwise
+// intact block returns MM_ERR_DEGRADED: everything this mode is able to verify
+// was verified and was sound, and the payload was not looked at. Damage that
+// *is* detectable still outranks it -- a broken canary reports
+// MM_ERR_CORRUPT_CANARY in either mode.
 mm_status_t mm_verify(const void *ptr);
 
 // Walks every block and checks each one's metadata and the list topology.

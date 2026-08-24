@@ -183,7 +183,7 @@ static int choose_region(mars_rng *rng, target_t target, uint8_t **out_base,
   mm_block *candidates[256];
   size_t n = 0;
   size_t budget = mm_max_blocks();
-  for (uint8_t *p = g_arena.lo; p < g_arena.hi && n < 256;) {
+  for (uint8_t *p = mm_sole_span()->lo; p < mm_sole_span()->hi && n < 256;) {
     if (budget-- == 0) break;
     mm_block *b = (mm_block *)(void *)p;
     if (!mm_header_ok(b)) break;

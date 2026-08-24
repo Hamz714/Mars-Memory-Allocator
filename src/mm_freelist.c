@@ -112,33 +112,39 @@ void mm_bins_reset(void) {
 void mm_bins_rebuild(void) {
   mm_bins_reset();
 
-  size_t budget = mm_max_blocks();
-  for (uint8_t *p = g_arena.lo; p < g_arena.hi;) {
-    if (budget-- == 0) break;
-    mm_block *b = (mm_block *)(void *)p;
-    // Without a legible header there is no way to step past this block, so the
-    // rebuild stops here rather than guessing. Free blocks beyond it drop out
-    // of the bins; they are still in the tiling, and mm_check_heap says so.
-    if (!mm_header_ok(b)) break;
+  // Every span, because the bins are shared by all of them: rebuilding from
+  // one span's tiling alone would drop every free block in the others.
+  for (const mm_span *s = g_arena.spans; s != NULL; s = s->next) {
+    size_t budget = mm_span_max_blocks(s);
+    for (uint8_t *p = s->lo; p < s->hi;) {
+      if (budget-- == 0) break;
+      mm_block *b = (mm_block *)(void *)p;
+      // Without a legible header there is no way to step past this block, so
+      // the rebuild stops here rather than guessing -- here, meaning in this
+      // span; the other spans are still walkable and are still walked. Free
+      // blocks beyond it drop out of the bins; they are still in the tiling,
+      // and mm_check_heap says so.
+      if (!mm_header_ok(b)) break;
 
-    // Filing a block writes two link words into it, so this walk cannot be
-    // allowed to file anything it has not corroborated. Under `fast` a header
-    // is only bounds-checked, so once anything upstream has lied about an
-    // extent this walk is out of step and reading payload bytes as control
-    // words -- and it was those writes, landing on a live block's header, that
-    // turned a two-bit flip into a footer written 115 MB past the arena.
-    //
-    // A free block's boundary tag is the redundancy that settles it. Where it
-    // does not agree, the walk stops for the same reason an illegible header
-    // stops it: there is nothing here it is entitled to write to.
-    if (!mm_is_used(b) && !mm_extent_corroborated(b)) {
-      mm_fail(MM_ERR_CORRUPT_LINKS);
-      break;
+      // Filing a block writes two link words into it, so this walk cannot be
+      // allowed to file anything it has not corroborated. Under `fast` a
+      // header is only bounds-checked, so once anything upstream has lied
+      // about an extent this walk is out of step and reading payload bytes as
+      // control words -- and it was those writes, landing on a live block's
+      // header, that turned a two-bit flip into a footer written 115 MB past
+      // the arena.
+      //
+      // A free block's boundary tag is the redundancy that settles it. Where
+      // it does not agree, the walk stops for the same reason an illegible
+      // header stops it: there is nothing here it is entitled to write to.
+      if (!mm_is_used(b) && !mm_extent_corroborated(b)) {
+        mm_fail(MM_ERR_CORRUPT_LINKS);
+        break;
+      }
+
+      if (!mm_is_used(b)) bin_push(b, mm_bin_of(mm_block_size(b)));
+      p += mm_block_size(b);
     }
-
-
-    if (!mm_is_used(b)) bin_push(b, mm_bin_of(mm_block_size(b)));
-    p += mm_block_size(b);
   }
 }
 

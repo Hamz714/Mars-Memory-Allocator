@@ -15,7 +15,6 @@ option(MARS_BUILD_BENCH "Build the benchmark harness"           ON)
 option(MARS_COVERAGE "Instrument for gcov/lcov coverage"        OFF)
 
 # Integrity profile. Selects the block layout and how much validation is done.
-# Not yet consumed by the sources; the layout work introduces it.
 set(MARS_PROFILE "hardened" CACHE STRING
     "Integrity profile: fast | hardened | paranoid")
 set_property(CACHE MARS_PROFILE PROPERTY STRINGS fast hardened paranoid)
@@ -116,6 +115,7 @@ endif()
 
 add_library(mars ${MARS_LIB_TYPE}
   src/mm_core.c
+  src/mm_arena.c
   src/mm_freelist.c
   src/mm_integrity.c
   src/mm_access.c

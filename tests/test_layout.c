@@ -75,7 +75,7 @@ MM_TEST(layout, payloads_are_aligned_whatever_the_header_size_is) {
 
   // An 8-byte header only works because the tiling is shifted 8 bytes into the
   // arena. Check that directly, not just its consequence.
-  CHECK_EQ((uintptr_t)(g_arena.lo + MM_HDR_SIZE) % MM_ALIGNMENT, 0);
+  CHECK_EQ((uintptr_t)(mm_sole_span()->lo + MM_HDR_SIZE) % MM_ALIGNMENT, 0);
 
   for (size_t n = 1; n <= 512; n++) {
     void *p = mm_malloc(n);
@@ -116,8 +116,8 @@ MM_TEST(layout, a_pointer_is_only_a_block_if_the_geometry_says_so) {
   CHECK_EQ(mm_verify((uint8_t *)p + 1), MM_ERR_INVALID_PTR);
   CHECK_EQ(mm_verify((uint8_t *)p + MM_ALIGNMENT / 2), MM_ERR_INVALID_PTR);
   // Below the first payload, and past the end of the tiling.
-  CHECK_EQ(mm_verify(g_arena.lo), MM_ERR_INVALID_PTR);
-  CHECK_EQ(mm_verify(g_arena.hi), MM_ERR_INVALID_PTR);
+  CHECK_EQ(mm_verify(mm_sole_span()->lo), MM_ERR_INVALID_PTR);
+  CHECK_EQ(mm_verify(mm_sole_span()->hi), MM_ERR_INVALID_PTR);
   // Correctly aligned and inside the arena, but landing mid-payload rather
   // than on a block: only the checksum can tell, and under `fast` there is
   // none, so this is asserted only where it is true.
@@ -336,13 +336,13 @@ MM_TEST(layout, prev_in_use_tracks_the_neighbour_on_the_left) {
 
   // The first block has nothing before it and must still report "in use", so
   // that nothing tries to step backwards off the front of the arena.
-  CHECK_TRUE(mm_prev_in_use((const mm_block *)(const void *)g_arena.lo));
+  CHECK_TRUE(mm_prev_in_use((const mm_block *)(const void *)mm_sole_span()->lo));
 
   mm_free(a);
   CHECK_FALSE(mm_prev_in_use(hb));
   // And b can now find a by its boundary tag alone.
   mm_block *back = mm_prev_free_block(hb);
-  CHECK_PTR_EQ(back, (const void *)g_arena.lo);
+  CHECK_PTR_EQ(back, (const void *)mm_sole_span()->lo);
 
   mm_free(b);
   // a and b merged, so c's predecessor is the merged free block.
