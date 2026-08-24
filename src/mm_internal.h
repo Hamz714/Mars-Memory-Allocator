@@ -67,9 +67,47 @@ static inline uint64_t mm_block_index(const mm_block *b) {
                     MM_ALIGNMENT);
 }
 
-// True if `b` could be a block header: aligned to the tiling, inside the
-// arena, carrying a sane extent that does not run past the end.
+// True if `b` could be the *start* of a block: inside the arena, on the
+// tiling's alignment, with room after it for the smallest block there is. Says
+// nothing about the extent the control word records.
+//
+// Separate from mm_is_block because the two halves fail for different reasons
+// and want different answers. An address that is not a block start was never
+// ours; a block start whose recorded extent is impossible is a block whose
+// beginning is known and whose length has been lost, which is precisely the
+// case recovery exists to handle.
+bool mm_is_block_start(const mm_block *b);
+
+// True if `b` could be a block header: a block start whose recorded extent is
+// at least MM_MIN_BLOCK and does not run past the end of the arena.
 bool mm_is_block(const mm_block *b);
+
+// Whether the tiling corroborates this block's extent, as opposed to merely
+// permitting it.
+//
+// A free block repeats its extent in its last eight bytes. Under `hardened` and
+// `paranoid` the header checksum has already vouched for the extent, so the tag
+// adds nothing to what mm_header_ok established. Under `fast` there is no
+// checksum: the tag is the only second copy of the extent that exists anywhere,
+// and a run of payload bytes that happens to read as a free block is otherwise
+// indistinguishable from a real one.
+//
+// Every walk that would *write into* a block on the strength of having found it
+// has to ask this rather than mm_header_ok. Filing a block into a bin writes
+// two link words into it; ending an abandoned span at an address writes a
+// header there. Getting either wrong scatters metadata across the arena.
+bool mm_extent_corroborated(const mm_block *b);
+
+// Whether `b` is still the block it was just validated as being: same extent,
+// same state.
+//
+// Called after every bin operation, because a bin operation writes into free
+// blocks -- and one that finds its bin damaged rebuilds from the tiling, which
+// writes into every free block the walk reaches. An extent read before such a
+// call and used after it is not a block size; it is whatever that write left
+// behind.
+bool mm_unchanged(const mm_block *b, size_t block_size, bool used);
+
 
 // --- Integrity (mm_integrity.c) -------------------------------------------
 
@@ -86,7 +124,14 @@ void mm_seal(mm_block *b);
 
 // Establishes PREV_IN_USE on the block after `b`, and, when `b` is free, its
 // boundary tag. Called after anything that changes `b`'s extent or state.
-void mm_publish(mm_block *b);
+//
+// Returns false when it refused, which happens when `b`'s recorded extent is
+// not inside the arena. Both writes it makes are positioned by that extent, so
+// this is the last place the promise never to write outside the arena can be
+// kept whatever a corrupted control word says. Refusing quietly would leave the
+// tiling broken, so a refusal reports and surrenders the span; a caller that
+// was about to file `b` or hand it out must not.
+bool mm_publish(mm_block *b);
 
 // Gives up on a block: it stays in the tiling so the arena still tiles, but
 // it is marked quarantined, never merged and never handed out again. A block
@@ -100,6 +145,14 @@ void mm_quarantine(mm_block *b);
 // profile carries a tail mirror. Otherwise the block's span is surrendered as
 // a quarantined block and false is returned. Either way the arena still tiles
 // when this returns.
+//
+// **The caller vouches that `b` is a block start.** The extent is the thing
+// being recovered, so it cannot be the evidence; what stands in for it is the
+// caller knowing where the block begins -- from a pointer it handed out, or
+// from the block it is itself in the middle of operating on. An address that
+// merely looks plausible is not enough: giving up a span writes a control word
+// at its start, and doing that at an address that is not a boundary destroys
+// eight bytes of somebody's payload to tidy up a block that was never there.
 bool mm_rescue(mm_block *b);
 
 // The block preceding `b`, reached through its boundary tag, or NULL when

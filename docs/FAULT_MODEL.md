@@ -62,7 +62,7 @@ impressive.
 | Payload | CRC32C over the whole payload | `mm_read`, `mm_verify` |
 | End of payload | 8-byte canary, bound to the block's index | every access, free, resize |
 | Free-list links | structural cross-checks in a fixed order, XOR-masked with the arena secret | every traversal, `mm_check_heap` |
-| Boundary tag | corroborated against the header it claims to describe | every backward step, `mm_check_heap`, the patrol |
+| Boundary tag | corroborated against the header it claims to describe; under `fast` it is also the only second copy of a free block's extent, and is required before any walk writes into the block | every backward step, `mm_check_heap`, the patrol, the bin rebuild, the resynchronisation scan |
 | Topology | `PREV_IN_USE` agreement, no adjacent free blocks, exact tiling, bin membership against the tiling | `mm_check_heap` |
 | Anything untouched | the bounded patrol, resuming where it stopped | every `N` allocator calls |
 
@@ -201,11 +201,14 @@ every profile is *supposed* to promise never to read or write outside the
 arena whatever a corrupted control word says — a promise that should not depend
 on being able to detect the corruption.
 
-## Where that promise currently does not hold
+## Where that promise once did not hold
 
-Under `fast`, it does not. The measured run in `bench/results/faults-fast.csv`
-records **2 crashes in 240,000 trials**, both from single cells of the
-`free_hdr` target, and both reproduce exactly:
+It held under `hardened` and `paranoid` and was **broken under `fast`**: an
+earlier run recorded 2 crashes in 240,000 trials, both from single cells of the
+`free_hdr` target, both writing a boundary tag about 115 MB past a 262 KB arena.
+That is fixed. The two trials are replayed by seed as ctest cases under every
+profile — `faultinject_arena_promise_free_hdr_2bit` and `_4bit`, which is what
+`--fail-on-crash` exists for. They reproduce standalone too:
 
 ```bash
 cmake --preset gcc-fast && cmake --build --preset gcc-fast -- -j$(nproc)
@@ -217,31 +220,124 @@ cmake --preset gcc-fast && cmake --build --preset gcc-fast -- -j$(nproc)
 per-trial seed is `base + trial*1000003 + target*97 + bits_index`, so the base
 is shifted by one to compensate for `--bits` having one entry instead of four.)
 
-Both die on a **write**, in `mm_write_free_footer`, reached from `mm_free` →
-`release_block` → `mm_publish`. At that point the block's control word carries
-a `block_size` of 115,020,256 bytes against a 262,128-byte arena, so the footer
-lands about 115 MB past the end of it. `mm_publish` validates the *neighbour*
-it links to and writes the block's own trailer without re-checking that the
-block's extent is still inside the arena — and under `fast` there is no
-checksum, so a control word that has been through a coalesce is only ever
-bounds-checked structurally.
+The mechanism is worth writing down in full, because the crash was four steps
+downstream of the mistake and a bounds check at the write would have hidden it
+rather than fixed it.
 
-The same two seeds under `hardened` are detected and quarantined, which is
-precisely what the checksum is buying:
+**1. The flip made a free block illegible, not merely wrong.** Two bits in a
+free block's control word gave it a recorded extent of 4 GB. `mm_header_ok`
+under `fast` is a bounds check and nothing more, and 4 GB fails it — so every
+walk stopped at that block. The bins were rebuilt and came out empty, and the
+allocator stopped serving requests. All of that is correct behaviour.
 
-```bash
-./build/gcc-release/bin/faultinject --trials 1 --bits 2 --target free_hdr --seed 7361282833
-./build/gcc-release/bin/faultinject --trials 1 --bits 4 --target free_hdr --seed 9169288258
-```
+**2. The resynchronisation scan accepted an address that was not a block
+boundary.** Freeing the block in front of the damage sent `mm_publish` →
+`mm_recover_next` → `scan_resync` looking for the next place the tiling could be
+picked up again. It accepted the first address whose header was bounds-plausible
+and whose extent tiled with another bounds-plausible header — which under `fast`
+is a very weak test, and it matched a run of payload bytes 16 bytes short of the
+real boundary. 80 bytes were surrendered where the damaged block was 96, and
+**the tiling was now permanently out of step.**
 
-This is recorded rather than quietly fixed because the fix is not a one-liner:
-refusing the write leaves the arena inconsistent instead of wildly written, so
-the right behaviour is to report and quarantine, and that is a change to
-failure semantics on the free path with its own tests to write. It is a defect
-in `fast`, it has reproducers, and until it is fixed **the arena promise holds
-as measured under `hardened` and `paranoid` and does not hold under `fast`.**
-CI's 200-trial smoke sweep is far too small to hit a 1-in-120,000 event, so the
-gate there is correct but is not what found this; the 10,000-trial run was.
+**3. The bin rebuild wrote into blocks that were not there.** Two frees later a
+bin operation found its list inconsistent and called `mm_bins_rebuild`, which
+walks the tiling from `lo` filing every free block it meets. Out of step, that
+walk was reading payload bytes as control words, and two of them read as free
+blocks. Filing a block into a bin *writes two link words into it*: one of those
+writes, the `NULL` predecessor of a phantom, landed exactly on a live free
+block's control word and replaced it with `NULL ^ secret` — the arena secret,
+whose top 54 bits read as an extent of 115,020,032 bytes.
+
+**4. A coalesce added an extent it had validated before the write.**
+`absorb_neighbours` checked that neighbour, then called `mm_bin_remove`, then
+added its size. The size it added was the one the rebuild had just left behind.
+
+**5. The footer went where the sum said.** `release_block` → `mm_publish` →
+`mm_write_free_footer` wrote eight bytes at `block + 115,020,256 - 8`.
+`SIGSEGV`.
+
+In one sentence: **a free block carries a second copy of its extent in its
+boundary tag, and neither of the two walks that write into blocks was consulting
+it.** That is also exactly why `hardened` and `paranoid` never crashed — their
+header checksum makes the tag redundant, and `mm_header_ok` is genuine
+verification there rather than a bounds check. Under `fast` the tag is the only
+redundancy that exists, and both walks were treating a bounds-plausible header
+as a block.
+
+### What changed
+
+- **`mm_extent_corroborated`** replaces `mm_header_ok` wherever a walk would
+  *write into* a block on the strength of having found it: `scan_resync`,
+  `tiling_agrees`, and `mm_bins_rebuild`. For a free block under `fast` it
+  requires the boundary tag to repeat the extent; under a profile with a
+  checksum the extent has already been vouched for and it adds nothing. Both
+  seeds now surrender exactly the damaged block — 96 and 112 bytes, against the
+  80 and 96 the scan used to settle for — and the tiling stays in step.
+- **`mm_unchanged`** re-establishes every extent that was read before a bin
+  operation and is used after it, in `absorb_neighbours`, `mm_malloc`,
+  `mm_realloc` and `mm_quarantine`. A bin operation writes into free blocks, so
+  a size that crossed one is not a block size until it has been asked again. A
+  block that no longer agrees with itself is quarantined rather than merged.
+- **`mm_publish` refuses** to write when the block's recorded extent is not
+  inside the arena. Both of its writes are positioned by that extent, so this is
+  where the promise can be kept whatever a corrupted control word says — and
+  keeping it there rather than only on the paths that reach it is the difference
+  between a guarantee and a coincidence. A refusal reports and surrenders the
+  span through `mm_rescue`; callers that were about to file the block into a bin
+  or hand it to a caller do neither.
+- **The patrol no longer rewrites a disagreeing boundary tag under `fast`.**
+  With no checksum, the header is not vouched for either: the two copies of the
+  extent disagree and nothing can say which is wrong, so rewriting the tag from
+  the header would *manufacture* the corroboration the checks above rely on.
+  It is reported and left alone instead. The block stays in its bin and stays
+  allocatable; what it loses is being steppable backwards over, which
+  `mm_prev_free_block` already refuses on exactly this evidence. Under
+  `hardened` and `paranoid` the repair is unchanged.
+
+### What the tests pin, and what they do not
+
+Worth being exact about, because the obvious reading is wrong. **The two seeded
+cases pin the outcome, not the mechanism.** Reduce `mm_extent_corroborated` back
+to `mm_header_ok` and both still pass, as do 20,000 further `fast` trials —
+because `mm_publish` refuses the out-of-arena write on its own, and a refused
+write is not a crash. That is defence in depth working as intended, and it is
+the right thing for the fault injector to gate: the arena promise is a statement
+about outcomes.
+
+The mechanism is pinned by two unit tests, and only those two.
+`rebuild_does_not_write_into_a_phantom_free_block` and
+`recovery_surrenders_exactly_the_damaged_block` both fail under `fast` against a
+neutered `mm_extent_corroborated`, and neither is affected under `hardened`,
+where the checksum already establishes the extent.
+
+`mm_unchanged` guards eight extents in all. The four in `absorb_neighbours` and
+the one in `mm_malloc` have a test each, and every one of those tests fails if
+its branch is deleted -- checked by deleting each in turn, which is the only way
+to tell a test that pins a branch from a test that merely executes it. The two
+in `mm_realloc` and the one in `mm_quarantine` do not yet.
+
+Three of the five are reachable under every profile, one under `fast` and
+`paranoid`, and one under `fast` alone. Where a branch is unreachable the test
+is not compiled at all rather than left to pass for some other reason, and the
+reason is worth recording, because in both cases it is a consequence of the
+layout rather than a gap in the test. A bin operation only ever writes at `block
++ MM_HDR_SIZE` or eight bytes past it, so reaching a given control word needs a
+block header sixteen bytes in front of it -- and where the header is sixteen
+bytes wide, that header covers the eight bytes immediately before the target:
+
+| refusal point | `fast` | `hardened` | `paranoid` | what closes it |
+|---|:-:|:-:|:-:|---|
+| forward, the block being freed | yes | yes | yes | — |
+| forward, the neighbour | yes | no | yes | the phantom's header lands on the freed block's canary, and `hardened` always has one in an allocated block's last sixteen bytes; `paranoid` fills them with the tail mirror instead |
+| backward, the block being freed | yes | no | no | the phantom's checksum field lands on the predecessor's boundary tag, which `mm_prev_free_block` must read to reach the backward merge at all |
+| backward, the predecessor | yes | yes | yes | — |
+| the block `mm_malloc` chose | yes | yes | yes | — |
+
+CI's 200-trial smoke sweep could never have hit a 1-in-120,000 event; the
+10,000-trial run is what found it. The sweep is now 2,000 trials per cell —
+56,000 per profile per push, at a cost of well under a minute. But the sweep is
+not what stops this returning: the seeds pin the outcome and the unit tests pin
+the mechanism, and only the second kind fails when the fix is removed.
 
 Cells where theory and measurement can be compared are worth more than cells
 where only measurement exists, and disagreement between them should always be

@@ -71,9 +71,10 @@ would misstate the allocator in opposite directions.
 never to read or write outside the arena whatever a corrupted control word
 says, so a `crash` is that promise broken; a `timeout` is a traversal that was
 still running when the five-second alarm fired, which is a different defect.
-`faults-fast.csv` carries two crashes, which is a defect and not a cost of the
-`fast` trade — the reproducers are in
-[FAULT_MODEL.md](../../docs/FAULT_MODEL.md#where-that-promise-currently-does-not-hold).
+Both columns are zero in all three files. An earlier `faults-fast.csv` carried
+two crashes; that was a defect rather than a cost of the `fast` trade, and
+[FAULT_MODEL.md](../../docs/FAULT_MODEL.md#where-that-promise-once-did-not-hold)
+records the mechanism, the fix and the two seeds that now replay it as tests.
 
 `latency_mean_ops` is the mean number of allocator calls between a bit flip and
 the allocator first reporting it, over ordinary traffic that never touches the
@@ -93,7 +94,17 @@ traffic alone — `latency_n` of 0. That is the cost of O(1) allocation, priced.
 `fast` carries no header checksum and no canary, so it detects less, and the
 files record how much less rather than omitting it. Its `payload` cells are
 essentially all silent — there is no payload checksum under that profile — and
-single-bit `free_hdr` damage produces silent corruption at a rate the other two
-profiles hold at zero. Leaving those cells out would hide the cost of the trade
-instead of pricing it, which is why CI gates `fast` on the arena promise and
-records its detection numbers rather than gating them.
+its `alloc_hdr` cells carry silent corruption the other two profiles hold at
+zero, because an allocated block under this profile has no second copy of
+anything. (`any` flips anywhere in the arena, so most of its silent count is
+payload hits reached by another route.) Leaving those cells out would hide the
+cost of the trade instead of pricing it, which is why
+CI gates `fast` on the arena promise and records its detection numbers rather
+than gating them.
+
+The `free_hdr` cells are worth a second look: they are at zero silent under all
+three profiles, which was not true of `fast` before the arena-promise fix. A
+free block's boundary tag repeats its extent, so `fast` has a second copy of
+that one number even without a checksum — and once the walks that write into
+blocks started requiring the two to agree, the 245 silent `free_hdr` trials went
+with the crashes.

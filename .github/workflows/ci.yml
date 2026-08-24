@@ -101,8 +101,23 @@ jobs:
       - name: Explore a new seed
         run: ./build/gcc-release/bin/fuzz_shadow --seconds 90
 
-  # A small sweep, enough to catch the classifier or the injector breaking.
-  # Statistically meaningful runs are launched deliberately, not per push.
+  # A sweep large enough to have a chance of catching a rare arena-promise
+  # failure, not merely the classifier or the injector breaking.
+  #
+  # It used to be 200 trials per cell. That was too small on its own terms: the
+  # defect this gate exists to catch turned out to occur twice in 240,000 trials
+  # under `fast`, and a 200-trial sweep could not have seen it in the lifetime of
+  # the project. 2,000 per cell is 56,000 trials per profile and costs well under
+  # a minute, since a trial is a fork and a few thousand allocator calls.
+  #
+  # Enlarging it is still not the main defence. A sweep only ever catches a
+  # 1-in-100,000 event with some probability; replaying the exact trials that
+  # found one catches it every time, which is why the two seeds are ctest cases
+  # in the build matrix rather than a bigger number here.
+  #
+  # Statistically meaningful *measurements* are still taken deliberately: the
+  # committed CSVs are a 10,000-trial matrix, and that is what a reported
+  # detection rate comes from.
   fault-injection:
     name: fault injection / ${{ matrix.preset }}
     runs-on: ubuntu-22.04
@@ -125,8 +140,12 @@ jobs:
       - name: Inject
         run: |
           ./build/${{ matrix.preset }}/bin/faultinject \
-            --trials 200 --bits 1,2 --git-sha "$(git rev-parse --short HEAD)" \
+            --trials 2000 --bits 1,2,4,8 \
+            --git-sha "$(git rev-parse --short HEAD)" \
             --csv faults.csv
+        # Deliberately without --fail-on-crash: the check below gates the same
+        # thing and prints the offending row, which an exit code cannot. The flag
+        # is for the seeded replays in ctest, where there is no CSV to read.
       - name: Check the results against what the profile promises
         env:
           HAS_CHECKSUM: ${{ matrix.checksum }}

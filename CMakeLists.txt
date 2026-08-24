@@ -256,6 +256,28 @@ if(UNIX)
     add_test(NAME faultinject_smoke
              COMMAND faultinject --trials 25 --bits 1 --target alloc_hdr)
     set_tests_properties(faultinject_smoke PROPERTIES TIMEOUT 300)
+
+    # The two trials that caught the arena promise being broken under `fast`,
+    # replayed by seed. A sweep large enough to hit a 1-in-120,000 event again
+    # by chance does not belong in the test suite; replaying the exact trials
+    # that found it costs milliseconds and is what actually stops it coming
+    # back. --fail-on-crash is what turns the outcome into an exit code.
+    #
+    # Registered for every profile, not only for `fast`. The promise is
+    # unconditional, so a cell that only holds under the profiles carrying a
+    # checksum is a cell that was never evidence for the promise at all.
+    #
+    # See docs/FAULT_MODEL.md for how a per-trial seed maps back to a cell of
+    # the full run: these are trials 7341 and 9149.
+    foreach(_case "2;7361282833" "4;9169288258")
+      list(GET _case 0 _bits)
+      list(GET _case 1 _seed)
+      add_test(NAME faultinject_arena_promise_free_hdr_${_bits}bit
+               COMMAND faultinject --trials 1 --bits ${_bits}
+                       --target free_hdr --seed ${_seed} --fail-on-crash)
+      set_tests_properties(faultinject_arena_promise_free_hdr_${_bits}bit
+                           PROPERTIES TIMEOUT 60)
+    endforeach()
   endif()
 endif()
 

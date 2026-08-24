@@ -285,9 +285,19 @@ detects less. Stating that plainly is worth more than a table of ticks.
 | Payload bit flip | no | detected | detected |
 | Overrun past the payload | no | detected | detected |
 | Damaged free-list link | detected | detected | detected |
-| Damaged boundary tag | detected | detected | detected |
+| Damaged boundary tag | detected | detected **and repaired** | detected **and repaired** |
 | Block confusion | no | detected | detected |
 | Never leaves the arena | yes | yes | yes |
+
+The boundary tag is the one row where `fast` detects but cannot repair, and the
+reason is the same asymmetry as everywhere else. The other two profiles have a
+vouched-for header to put the tag back *from*; `fast` does not, so a header and
+a tag that disagree are two unvouched copies of one number with nothing to say
+which is wrong. The patrol reports it and leaves both alone. The block stays in
+its bin and stays allocatable; what it loses is being steppable backwards over,
+which `mm_prev_free_block` already refuses on exactly this evidence. Rewriting
+the tag from the header there would not be a repair — it would manufacture the
+corroboration the rest of the allocator now depends on.
 
 `fast` has no checksum and no canary; there is nothing for it to detect a
 flipped header bit *with*, and `tests/test_integrity.c` says so explicitly
@@ -297,12 +307,27 @@ traversals, clamped extents, and no access outside the arena whatever the
 control word says. That promise is gated in CI for all three profiles — a crash
 in any fault-injection cell fails the build.
 
-**Under `fast` that promise does not currently hold.** Two trials in 240,000
-write about 115 MB past a 262 KB arena, both reproducible from a seed; the
-mechanism and the reproducers are in
-[FAULT_MODEL.md](FAULT_MODEL.md#where-that-promise-currently-does-not-hold).
-Losing detection is the trade `fast` is supposed to be making. Losing the
-bound is not, and the two should not be confused.
+It did not hold under `fast` until recently: two trials in 240,000 wrote about
+115 MB past a 262 KB arena. Losing detection is the trade `fast` is supposed to
+be making; losing the bound is not, and the two should not be confused. The
+mechanism, the fix and the reproducers — now replayed by seed as tests under
+every profile — are in
+[FAULT_MODEL.md](FAULT_MODEL.md#where-that-promise-once-did-not-hold).
+
+The interesting part for this document is *why* the defect was specific to
+`fast`. A free block spends eight of its unused payload bytes on a boundary tag
+that repeats its extent. Under `hardened` and `paranoid` that tag is a
+convenience — the header checksum has already established the extent, so
+`mm_header_ok` is real verification. Under `fast` `mm_header_ok` is a bounds
+check, and **the tag is the only second copy of the extent that exists
+anywhere.** Two walks that write into blocks they find — the bin rebuild and the
+resynchronisation scan — were not consulting it, so a run of payload bytes that
+happened to read as a free block was indistinguishable from one. `mm_publish`
+positions its writes from the extent, and that is where the 115 MB came out.
+
+So the tag is not only what makes backward coalescing O(1). Under a profile with
+no checksum it is the whole of what makes a free block's extent verifiable, and
+`mm_extent_corroborated` is where the allocator now says so.
 
 The single-bit header cell is decidable from theory for the two profiles with a
 checksum, so CI gates it at 100% detection and zero silent corruption. `fast`

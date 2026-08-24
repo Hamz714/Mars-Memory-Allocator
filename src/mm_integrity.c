@@ -41,7 +41,7 @@ size_t mm_metadata_overhead(void) { return MM_HDR_SIZE + MM_TRAIL; }
 
 // --- Bounds ----------------------------------------------------------------
 
-bool mm_is_block(const mm_block *b) {
+bool mm_is_block_start(const mm_block *b) {
   if (g_arena.lo == NULL || b == NULL) return false;
   const uint8_t *p = (const uint8_t *)(const void *)b;
   if (p < g_arena.lo || p >= g_arena.hi) return false;
@@ -49,11 +49,14 @@ bool mm_is_block(const mm_block *b) {
   // an address that does not cannot be one. Checked before the control word is
   // read, because a header that is not there must not be dereferenced.
   if ((size_t)(p - g_arena.lo) % MM_ALIGNMENT != 0) return false;
-  if ((size_t)(g_arena.hi - p) < MM_MIN_BLOCK) return false;
+  return (size_t)(g_arena.hi - p) >= MM_MIN_BLOCK;
+}
 
+bool mm_is_block(const mm_block *b) {
+  if (!mm_is_block_start(b)) return false;
   size_t n = mm_block_size(b);
   if (n < MM_MIN_BLOCK) return false;
-  return n <= (size_t)(g_arena.hi - p);
+  return n <= (size_t)(g_arena.hi - (const uint8_t *)(const void *)b);
 }
 
 size_t mm_max_blocks(void) {
@@ -73,6 +76,36 @@ bool mm_header_ok(const mm_block *b) {
   // here would be the one dishonest line in the allocator.
   return true;
 #endif
+}
+
+bool mm_extent_corroborated(const mm_block *b) {
+  if (!mm_header_ok(b)) return false;
+#if MM_HAS_CRC
+  // The checksum covers the control word, so it has already established the
+  // extent. A free block's boundary tag is then a derivative of a number that
+  // has been vouched for: where the two disagree the tag is the damaged copy,
+  // and the patrol puts it back rather than giving up on the block.
+  return true;
+#else
+  // No checksum, so nothing has vouched for the control word and mm_header_ok
+  // above was a bounds check. An allocated block carries no second copy of its
+  // extent under this profile, so there is nothing further to ask of it -- that
+  // is the priced cost of an eight-byte header, and saying so is the honest
+  // answer rather than refusing every allocated block a walk meets.
+  //
+  // A free block is different: its last eight bytes repeat the extent, and
+  // requiring the two to agree is what separates a block from a run of payload
+  // bytes that happens to read like one.
+  if (mm_is_used(b)) return true;
+  uint64_t tag;
+  memcpy(&tag, mm_block_end(b) - sizeof(tag), sizeof(tag));
+  return tag == (uint64_t)mm_block_size(b);
+#endif
+}
+
+bool mm_unchanged(const mm_block *b, size_t block_size, bool used) {
+  return mm_header_ok(b) && mm_block_size(b) == block_size &&
+         mm_is_used(b) == used;
 }
 
 // --- Canary ----------------------------------------------------------------
@@ -150,16 +183,35 @@ static void seal_and_link(mm_block *b) {
   }
 }
 
-void mm_publish(mm_block *b) {
+bool mm_publish(mm_block *b) {
+  // Everything below is positioned by this block's own control word: the
+  // boundary tag lands at its end, and the step to its successor is its whole
+  // extent. So an extent that is not inside the arena must never be written
+  // through, whatever put it there. This is deliberately a check at the write
+  // rather than only on the paths that reach it -- the promise never to read or
+  // write outside the arena is the one thing every profile guarantees
+  // unconditionally, and a guarantee that holds only because every caller is
+  // currently correct is not unconditional.
+  //
+  // Refusing on its own would leave the tiling broken rather than wildly
+  // written, which is not an improvement, so the span goes the way every lost
+  // extent goes: reported, and surrendered as a quarantined block.
+  if (!mm_is_block(b)) {
+    mm_fail(MM_ERR_CORRUPT_HEADER);
+    (void)mm_rescue(b);
+    return false;
+  }
+
   if (!mm_is_used(b)) mm_write_free_footer(b);
   mm_seal(b);
 
   mm_block *n = mm_recover_next(b);
-  if (n == NULL) return;
+  if (n == NULL) return true;
   if (mm_prev_in_use(n) != mm_is_used(b)) {
     mm_set_prev_in_use(n, mm_is_used(b));
     mm_seal(n);
   }
+  return true;
 }
 
 // --- Stepping backwards ----------------------------------------------------
@@ -201,12 +253,20 @@ static bool tiling_agrees(const mm_block *b) {
   uint8_t *end = mm_block_end(b);
   if (end == g_arena.hi) return true;
   if ((size_t)(g_arena.hi - end) < MM_MIN_BLOCK) return false;
-  return mm_header_ok((const mm_block *)(const void *)end);
+  return mm_extent_corroborated((const mm_block *)(const void *)end);
 }
 
 // The next address at or after `start + MM_MIN_BLOCK` carrying a header that
 // stands up on its own and tiles with what follows it. NULL if there is none:
 // a real block is at least MM_MIN_BLOCK long, so nothing nearer can be one.
+//
+// Both halves ask mm_extent_corroborated rather than mm_header_ok, because this
+// is a *search*: the answer is not reached by stepping over a block already
+// trusted, so the only thing standing between it and a run of payload bytes is
+// how much the candidate can be made to corroborate itself. Accepting a
+// candidate that is not a block boundary does not merely surrender the wrong
+// span -- it leaves the tiling permanently out of step, and every later walk
+// then steps through blocks that are not there.
 static uint8_t *scan_resync(uint8_t *start) {
   size_t steps = 0;
   for (uint8_t *p = start + MM_MIN_BLOCK;
@@ -214,7 +274,7 @@ static uint8_t *scan_resync(uint8_t *start) {
        steps < MM_RECOVERY_STEPS;
        p += MM_ALIGNMENT, steps++) {
     const mm_block *c = (const mm_block *)(const void *)p;
-    if (mm_header_ok(c) && tiling_agrees(c)) return p;
+    if (mm_extent_corroborated(c) && tiling_agrees(c)) return p;
   }
   return NULL;
 }
@@ -280,28 +340,41 @@ static bool mirror_says(const uint8_t *lo_bound, const uint8_t *resync,
 // --- Quarantine and rescue -------------------------------------------------
 
 void mm_quarantine(mm_block *b) {
-  if (!mm_is_block(b)) return;
-  if (mm_is_quarantined(b)) {
-    mm_fail(MM_ERR_QUARANTINED);
-    return;
-  }
+  // Only the address is required here. A block whose start is known and whose
+  // recorded extent is impossible is exactly what recovery below is for, and
+  // turning it away would leave the damage in place unreported.
+  if (!mm_is_block_start(b)) return;
   if (!mm_header_ok(b)) {
     // The extent cannot be trusted, so neither can the address of anything
     // this block owns. Surrender the span instead of writing through it.
     (void)mm_rescue(b);
     return;
   }
+  if (mm_is_quarantined(b)) {
+    mm_fail(MM_ERR_QUARANTINED);
+    return;
+  }
 
   size_t n = mm_block_size(b);
+  bool was_free = !mm_is_used(b);
   // A free block is in a bin, and has to come out of it before its interior
   // stops meaning what that bin thinks it means.
-  if (!mm_is_used(b)) mm_bin_remove(b);
+  if (was_free) {
+    mm_bin_remove(b);
+    // Taking a block out of a bin writes memory, so the extent read above is
+    // no longer known to be this block's. See mm_unchanged.
+    if (!mm_unchanged(b, n, false)) {
+      mm_fail(MM_ERR_CORRUPT_LINKS);
+      (void)mm_rescue(b);
+      return;
+    }
+  }
 
   mm_set_word(b, n, 0, true, true);
 #if MM_HAS_CRC
   b->payload_crc = 0;
 #endif
-  mm_publish(b);
+  if (!mm_publish(b)) return;  // reported, and the span already surrendered
 
   g_arena.lost_bytes += n;
   MM_STAT_NOTE(MM_STAT_QUARANTINE, n);
@@ -310,7 +383,12 @@ void mm_quarantine(mm_block *b) {
 
 bool mm_rescue(mm_block *b) {
   if (mm_header_ok(b)) return true;
-  if (!mm_is_block(b)) return false;
+  // The start is all that is needed *of the block*: the extent is the thing
+  // being recovered, so requiring it to be legible first would refuse every
+  // block this exists to deal with. That the start is a real one is the
+  // caller's to vouch for -- see the declaration, and scrub_run for the one
+  // caller that cannot always do so.
+  if (!mm_is_block_start(b)) return false;
 
   uint8_t *start = (uint8_t *)(void *)b;
   uint8_t *resync = scan_resync(start);
@@ -433,18 +511,28 @@ static mm_status_t scrub_block(mm_block *b) {
   }
 
   if (!mm_is_used(b)) {
-    // The boundary tag is a pure derivative of an extent the checksum has
-    // already vouched for, so putting it back is a repair rather than a guess
-    // -- and it is the one thing here that can be repaired under every
-    // profile. Left alone it would break the next backward coalesce.
     uint64_t tag;
     memcpy(&tag, mm_block_end(b) - sizeof(tag), sizeof(tag));
-    if (tag != (uint64_t)mm_block_size(b)) {
-      mm_write_free_footer(b);
-      MM_STAT_NOTE(MM_STAT_REPAIR, mm_block_size(b));
-      return MM_ERR_CORRUPT_LINKS;
-    }
-    return MM_OK;
+    if (tag == (uint64_t)mm_block_size(b)) return MM_OK;
+#if MM_HAS_CRC
+    // The boundary tag is a pure derivative of an extent the checksum has
+    // already vouched for, so putting it back is a repair rather than a guess.
+    // Left alone it would break the next backward coalesce.
+    mm_write_free_footer(b);
+    MM_STAT_NOTE(MM_STAT_REPAIR, mm_block_size(b));
+#else
+    // Under `fast` there is no checksum, so the header has not been vouched for
+    // either: the two copies of the extent disagree and nothing can say which
+    // one is wrong. Rewriting the tag from the header would not be a repair, it
+    // would be *manufacturing* the corroboration that mm_extent_corroborated
+    // relies on -- and a walk that later writes into this block on the strength
+    // of it is the wild write this whole check exists to prevent.
+    //
+    // So it is reported and left as it is. The block stays in its bin and stays
+    // allocatable; what it loses is being steppable backwards over, which
+    // mm_prev_free_block already refuses on exactly this evidence.
+#endif
+    return MM_ERR_CORRUPT_LINKS;
   }
 
 #if MM_HAS_CRC
@@ -484,13 +572,27 @@ static mm_status_t scrub_run(size_t budget_blocks) {
     mm_block *b = (mm_block *)(void *)p;
 
     if (!mm_header_ok(b)) {
-      // The extent this block recorded is exactly what the damage destroyed,
-      // so there is no stepping past it. Recovery puts it back where the
-      // profile carries a mirror and surrenders its span where it does not;
-      // either way the arena still tiles afterwards.
       if (found == MM_OK) found = MM_ERR_CORRUPT_HEADER;
       hits++;
-      (void)mm_rescue(b);
+      // Recovery needs a block start the caller vouches for, and the patrol's
+      // cursor is not one. It is wherever the last extent said, so an extent
+      // that is *illegible* means the walk may already be out of step and this
+      // address may be somebody's payload -- and rebuilding from it writes a
+      // control word into that payload. Measured, letting the patrol do it cost
+      // 565 trials of silent corruption in the `fast` alloc_hdr cells, against
+      // 3 when it declines.
+      //
+      // A legible extent with a failed checksum is the opposite case: the walk
+      // is in step and only this block's contents are in doubt, which is
+      // precisely what recovery is for. That is the line mm_is_block draws, and
+      // under `fast` -- where mm_header_ok is that same bounds check -- means
+      // the patrol never rebuilds, which is the honest answer for a profile
+      // with nothing to tell a damaged block from a run of payload bytes.
+      //
+      // Nothing is lost by declining. The first free of a neighbour reaches the
+      // same damage through mm_publish, from an owner the allocator does vouch
+      // for.
+      if (mm_is_block(b)) (void)mm_rescue(b);
       if (!mm_header_ok(b)) {
         p = g_arena.lo;  // nothing legible here; start the lap again
         continue;

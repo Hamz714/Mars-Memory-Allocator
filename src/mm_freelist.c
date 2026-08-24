@@ -2,6 +2,7 @@
 
 #include "mm_internal.h"
 
+
 // --- The bitmap ------------------------------------------------------------
 
 static void bitmap_set(size_t bin) {
@@ -96,7 +97,9 @@ static void bin_push(mm_block *b, size_t bin) {
 
   mm_free_link_set(b, MM_LINK_NEXT, head, s);
   mm_free_link_set(b, MM_LINK_PREV, NULL, s);
-  if (head != NULL) mm_free_link_set(head, MM_LINK_PREV, b, s);
+  if (head != NULL) {
+    mm_free_link_set(head, MM_LINK_PREV, b, s);
+  }
   g_arena.bins[bin] = b;
   bitmap_set(bin);
 }
@@ -117,6 +120,22 @@ void mm_bins_rebuild(void) {
     // rebuild stops here rather than guessing. Free blocks beyond it drop out
     // of the bins; they are still in the tiling, and mm_check_heap says so.
     if (!mm_header_ok(b)) break;
+
+    // Filing a block writes two link words into it, so this walk cannot be
+    // allowed to file anything it has not corroborated. Under `fast` a header
+    // is only bounds-checked, so once anything upstream has lied about an
+    // extent this walk is out of step and reading payload bytes as control
+    // words -- and it was those writes, landing on a live block's header, that
+    // turned a two-bit flip into a footer written 115 MB past the arena.
+    //
+    // A free block's boundary tag is the redundancy that settles it. Where it
+    // does not agree, the walk stops for the same reason an illegible header
+    // stops it: there is nothing here it is entitled to write to.
+    if (!mm_is_used(b) && !mm_extent_corroborated(b)) {
+      mm_fail(MM_ERR_CORRUPT_LINKS);
+      break;
+    }
+
 
     if (!mm_is_used(b)) bin_push(b, mm_bin_of(mm_block_size(b)));
     p += mm_block_size(b);
@@ -169,7 +188,9 @@ void mm_bin_remove(mm_block *b) {
     g_arena.bins[bin] = next;
     if (next == NULL) bitmap_clear(bin);
   }
-  if (next != NULL) mm_free_link_set(next, MM_LINK_PREV, prev, s);
+  if (next != NULL) {
+    mm_free_link_set(next, MM_LINK_PREV, prev, s);
+  }
 }
 
 // --- Search ----------------------------------------------------------------

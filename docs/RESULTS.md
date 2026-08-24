@@ -103,7 +103,7 @@ So the counters are not free: on the allocation-heavy workloads they cost someth
 
 ## Fault injection
 
-10,000 trials per cell, 7 targets × {1, 2, 4, 8} bits × 3 profiles. Each trial forks a child under an alarm, flips *k* bits in the chosen structure, and classifies what the allocator then does against a shadow model of what every live payload is supposed to contain. Base seed `20260809`, arena 262,144 bytes, patrol at its 1024-call default, at commit `f182d28`.
+10,000 trials per cell, 7 targets × {1, 2, 4, 8} bits × 3 profiles. Each trial forks a child under an alarm, flips *k* bits in the chosen structure, and classifies what the allocator then does against a shadow model of what every live payload is supposed to contain. Base seed `20260809`, arena 262,144 bytes, patrol at its 1024-call default, at commit `415e85c`.
 
 **Detection coverage is `detected / (detected + silent)`** — of the flips that actually mattered, how many were caught. Benign flips landed in slack, padding or free space and are excluded, because there was nothing there to catch. Intervals are 95% Wilson score.
 
@@ -112,15 +112,15 @@ So the counters are not free: on the allocation-heavy workloads they cost someth
 
 | Target | Trials | Benign | Detected | Silent | Crash | Timeout | Coverage (95% CI) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `alloc_hdr` | 40,000 | 568 | 39,409 | **23** | 0 | 0 | 99.94% [99.91, 99.96] |
-| `free_hdr` | 40,000 | 1,605 | 38,148 | **245** | 2 | 0 | 99.36% [99.28, 99.44] |
+| `alloc_hdr` | 40,000 | 568 | 39,420 | **12** | 0 | 0 | 99.97% [99.95, 99.98] |
+| `free_hdr` | 40,000 | 1,605 | 38,395 | **0** | 0 | 0 | 100.00% [99.99, 100.00] |
 | `links` | 40,000 | 573 | 39,427 | **0** | 0 | 0 | 100.00% [99.99, 100.00] |
 | `free_footer` | 40,000 | 39,899 | 101 | **0** | 0 | 0 | 100.00% [96.34, 100.00] |
 | `payload` | 40,000 | 21 | 0 | **39,979** | 0 | 0 | 0.00% [0.00, 0.01] |
 | `canary` | – | – | – | – | – | – | no such structure under this profile |
-| `any` | 40,000 | 38,794 | 174 | **1,032** | 0 | 0 | 14.43% [12.56, 16.52] |
+| `any` | 40,000 | 38,794 | 175 | **1,031** | 0 | 0 | 14.51% [12.64, 16.61] |
 
-Across all targets and bit counts: **240,000 trials**, coverage 73.96% [73.7461, 74.1781], 41,279 silent (17.200%, 95% CI [17.049, 17.351]), 2 crashes, 0 timeouts.
+Across all targets and bit counts: **240,000 trials**, coverage 74.13% [73.9090, 74.3401], 41,022 silent (17.093%, 95% CI [16.942, 17.244]), 0 crashes, 0 timeouts.
 
 
 ### `hardened` — 24 B of metadata per allocation
@@ -170,13 +170,13 @@ Three columns, because the measurement says there are three populations and not 
 
 | Scrub interval | Free structures | Allocated header | Payload and canary | In window |
 |---|---:|---:|---:|---:|
-| 1 | 5.9 | ≥0.3 | never found | 14,518 / 14,654 |
-| 256 | 15.4 | ≥231.1 | never found | 11,242 / 11,471 |
-| 1,024 | 15.8 | ≥897.9 | never found | 11,204 / 11,434 |
-| 4,096 | 13.6 | ≥2,159.7 | never found | 10,348 / 11,426 |
-| off | 13.1 | ≥24.7 | never found | 8,872 / 11,426 |
+| 1 | ≥5.9 | ≥0.3 | never found | 14,518 / 14,794 |
+| 256 | ≥15.4 | ≥231.1 | never found | 11,242 / 11,516 |
+| 1,024 | ≥15.8 | ≥897.9 | never found | 11,204 / 11,479 |
+| 4,096 | ≥13.6 | ≥2,159.7 | never found | 10,348 / 11,471 |
+| off | ≥13.1 | ≥24.7 | never found | 8,872 / 11,471 |
 
-Silent corruption across the whole sweep: **20,578** — this profile carries no checksum and no canary, so it detects correspondingly less. Per interval it is between 4,097 and 4,190 depending on the setting, which is the same claim the other two make with a zero: the patrol moves *when* damage is found and not *whether* corruption gets through. CI gates `fast` on the arena promise and records these numbers rather than gating them.
+Silent corruption across the whole sweep: **20,258** — this profile carries no checksum and no canary, so it detects correspondingly less. Per interval it is between 4,050 and 4,052 depending on the setting, which is the same claim the other two make with a zero: the patrol moves *when* damage is found and not *whether* corruption gets through. CI gates `fast` on the arena promise and records these numbers rather than gating them.
 
 
 ### `hardened`
