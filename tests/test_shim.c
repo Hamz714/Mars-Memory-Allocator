@@ -135,13 +135,25 @@ MM_TEST(shim, calloc_zeroes_memory_that_has_been_used_before) {
   free(p);
 }
 
-// Through volatiles, so that the arguments reach calloc at run time. Written
-// as constants, the compiler folds the product itself, reports it as a
-// diagnostic, and the call that was supposed to be tested never happens.
+// Through volatiles, so that the arguments reach the allocator at run time.
+//
+// Written as constants they never get there. gcc folds the product and reports
+// it as a diagnostic instead of calling anything, so the call that was supposed
+// to be tested never happens; and clang 14 does something worse with a
+// constant alignment of zero, which is that its frontend segfaults --
+// reproducible with nothing but `aligned_alloc(0, 64)` at -O1 and above. Both
+// are the compiler reasoning about arguments this file exists to pass at run
+// time, and a volatile is how it is told not to.
 static void *calloc_v(size_t n, size_t size) {
   volatile size_t vn = n;
   volatile size_t vs = size;
   return calloc(vn, vs);
+}
+
+static void *aligned_alloc_v(size_t alignment, size_t size) {
+  volatile size_t va = alignment;
+  volatile size_t vs = size;
+  return aligned_alloc(va, vs);
 }
 
 MM_TEST(shim, calloc_refuses_a_product_that_overflows) {
@@ -201,9 +213,11 @@ MM_TEST(shim, aligned_alloc_meets_the_alignment_it_was_given) {
 }
 
 MM_TEST(shim, aligned_alloc_rejects_an_alignment_that_is_not_a_power_of_two) {
-  CHECK_NULL(aligned_alloc(0, 64));
-  CHECK_NULL(aligned_alloc(24, 64));
-  CHECK_NULL(aligned_alloc(100, 64));
+  CHECK_NULL(aligned_alloc_v(0, 64));
+  CHECK_NULL(aligned_alloc_v(24, 64));
+  CHECK_NULL(aligned_alloc_v(100, 64));
+  CHECK_NULL(aligned_alloc_v(3, 64));
+  CHECK_EQ(mm_check_heap(), MM_OK);
 }
 
 MM_TEST(shim, posix_memalign_and_its_relatives) {
