@@ -7,6 +7,9 @@
 #include <string.h>
 
 #include "mars/allocator.h"
+// For MM_HAS_CRC and MM_HAS_CANARY: which of the mode's claims are even
+// available to be dropped depends on what the profile carries.
+#include "mm_layout.h"
 
 #define ARENA_SIZE (64u * 1024u)
 
@@ -174,3 +177,152 @@ MM_TEST(access, every_byte_of_a_block_is_addressable) {
   CHECK_EQ(mm_check_heap(), MM_OK);
   free(heap);
 }
+
+// --- Modes -----------------------------------------------------------------
+//
+// A mode does not change what a block looks like or what the allocator does
+// with one. It changes exactly one thing: whether a payload checksum is being
+// maintained, and therefore whether mm_verify is entitled to claim it checked
+// the payload. Everything below is about that claim.
+
+MM_TEST(access, the_default_mode_is_managed) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  CHECK_EQ(mm_get_mode(), MM_MODE_MANAGED);
+
+  void *p = mm_malloc(64);
+  REQUIRE_NOT_NULL(p);
+  CHECK_EQ(mm_verify(p), MM_OK);
+
+  free(heap);
+}
+
+MM_TEST(access, libc_mode_verifies_what_it_can_and_says_so) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  void *p = mm_malloc(64);
+  REQUIRE_NOT_NULL(p);
+
+  mm_set_mode(MM_MODE_LIBC);
+  CHECK_EQ(mm_get_mode(), MM_MODE_LIBC);
+
+  // The block is intact. What has changed is that the payload was not looked
+  // at, and MM_OK would have claimed otherwise.
+  CHECK_EQ(mm_verify(p), MM_ERR_DEGRADED);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  mm_set_mode(MM_MODE_MANAGED);
+  CHECK_EQ(mm_verify(p), MM_OK);
+
+  free(heap);
+}
+
+MM_TEST(access, libc_mode_does_not_soften_damage_it_can_still_see) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  mm_set_mode(MM_MODE_LIBC);
+
+  uint8_t *p = (uint8_t *)mm_malloc(64);
+  REQUIRE_NOT_NULL(p);
+
+  // Metadata is covered in both modes -- that is the point of having two of
+  // them rather than one weak one. "I could not look at the payload" must
+  // never outrank "I looked at the canary and it was broken".
+  p[64] ^= 0xffu;
+#if MM_HAS_CANARY
+  CHECK_EQ(mm_verify(p), MM_ERR_CORRUPT_CANARY);
+#else
+  // No canary under this profile, so an overrun of one byte is invisible here
+  // in either mode -- and the mode is still what mm_verify reports.
+  CHECK_EQ(mm_verify(p), MM_ERR_DEGRADED);
+#endif
+
+  mm_set_mode(MM_MODE_MANAGED);
+  free(heap);
+}
+
+MM_TEST(access, mm_init_restores_the_managed_mode) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  mm_set_mode(MM_MODE_LIBC);
+  CHECK_EQ(mm_get_mode(), MM_MODE_LIBC);
+
+  // A program that installs an arena of its own is asking for the managed API,
+  // whatever a shim loaded underneath it had set.
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  CHECK_EQ(mm_get_mode(), MM_MODE_MANAGED);
+
+  free(heap);
+}
+
+#if MM_HAS_CRC
+
+MM_TEST(access, switching_to_libc_mode_drops_the_checksums_it_stops_keeping) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+
+  uint8_t *p = (uint8_t *)mm_malloc(64);
+  REQUIRE_NOT_NULL(p);
+  const char msg[] = "established through mm_write";
+  REQUIRE_EQ(mm_write(p, 0, msg, sizeof(msg)), (int64_t)sizeof(msg));
+  CHECK_EQ(mm_verify(p), MM_OK);
+
+  mm_set_mode(MM_MODE_LIBC);
+
+  // The store below is exactly what the mode exists to permit. A checksum left
+  // behind from before the switch would report this correct program as
+  // corrupt, which is why the switch clears them rather than leaving them to
+  // go stale.
+  p[0] = 'X';
+  CHECK_EQ(mm_verify(p), MM_ERR_DEGRADED);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  CHECK_EQ(mm_scrub(64), MM_OK);
+
+  // And going back does not invent one: the bytes were written behind the
+  // allocator's back, so there is nothing it can honestly vouch for until the
+  // next mm_write.
+  mm_set_mode(MM_MODE_MANAGED);
+  CHECK_EQ(mm_verify(p), MM_OK);
+  p[1] = 'Y';
+  CHECK_EQ(mm_verify(p), MM_OK);
+
+  REQUIRE_EQ(mm_write(p, 0, msg, sizeof(msg)), (int64_t)sizeof(msg));
+  p[2] = 'Z';
+  CHECK_EQ(mm_verify(p), MM_ERR_CORRUPT_PAYLOAD);
+
+  free(heap);
+}
+
+MM_TEST(access, libc_mode_establishes_no_checksum_even_through_mm_write) {
+  uint8_t *heap = arena_new(ARENA_SIZE);
+  REQUIRE_NOT_NULL(heap);
+  REQUIRE_EQ(mm_init(heap, ARENA_SIZE), 0);
+  mm_set_mode(MM_MODE_LIBC);
+
+  uint8_t *p = (uint8_t *)mm_malloc(64);
+  REQUIRE_NOT_NULL(p);
+  const char msg[] = "written through the managed call";
+  CHECK_EQ(mm_write(p, 0, msg, sizeof(msg)), (int64_t)sizeof(msg));
+
+  // mm_write still copies, and mm_read still reads it back. What it does not
+  // do is leave a checksum that the very next raw store would falsify.
+  char back[64] = {0};
+  CHECK_EQ(mm_read(p, 0, back, sizeof(msg)), (int64_t)sizeof(msg));
+  CHECK_STR_EQ(back, msg);
+
+  p[0] = '!';
+  CHECK_EQ(mm_read(p, 0, back, sizeof(msg)), (int64_t)sizeof(msg));
+  CHECK_EQ(mm_verify(p), MM_ERR_DEGRADED);
+
+  mm_set_mode(MM_MODE_MANAGED);
+  free(heap);
+}
+
+#endif  // MM_HAS_CRC
