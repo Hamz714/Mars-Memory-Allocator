@@ -4,8 +4,12 @@ A memory allocator in C that assumes its memory is being corrupted underneath
 it, and is built to notice. Every block carries integrity metadata — a
 checksummed header, a canary past the payload, boundary tags on free space — so
 that a bit flipped after the fact is detected rather than silently used. It
-manages a caller-supplied arena, allocates in O(1) from size-classed free lists
-over a bitmap, and patrols cold memory in the background.
+allocates in O(1) from size-classed free lists over a bitmap and patrols cold
+memory in the background.
+
+It takes either a caller-supplied arena or memory it maps itself, and there is
+an `LD_PRELOAD` shim, so the second question — does it work under software that
+knows nothing about it? — has an answer that is not a benchmark.
 
 The fault it models is the **single-event upset**: ionising radiation flips a
 bit in DRAM and a value changes with nothing having written it. That is a real
@@ -50,22 +54,68 @@ pinned repetitions, 400,000 operations each, 64 MB arena:
 
 | Workload | `hardened` ops/s | glibc ops/s | ratio | p50 | util% |
 |---|---:|---:|---:|---:|---:|
-| `seq_lifo` | 5,566,274 | 20,441,785 | 0.27× | 108 ns | 66.7 |
-| `seq_fifo` | 4,386,148 | 20,299,790 | 0.22× | 113 ns | 66.7 |
-| `random_size` | 3,648,712 | 10,626,431 | 0.34× | 157 ns | 97.4 |
-| `churn` | 5,273,182 | 16,989,710 | 0.31× | 101 ns | 99.4 |
-| `realloc_grow` | 4,663,288 | 2,757,089 | 1.69× | 128 ns | 100.0 |
-| `fragmentation` | 3,700,471 | 13,695,435 | 0.27× | 117 ns | 94.3 |
-| `validated_access` | 301,044 | 2,032,129 | 0.15× | 180 ns | 100.0 |
+| `seq_lifo` | 6,291,090 | 34,437,061 | 0.18× | 110 ns | 66.7 |
+| `seq_fifo` | 4,826,375 | 35,280,979 | 0.14× | 124 ns | 66.7 |
+| `random_size` | 5,001,456 | 19,081,193 | 0.26× | 124 ns | 97.4 |
+| `churn` | 6,027,158 | 22,474,001 | 0.27× | 101 ns | 99.4 |
+| `realloc_grow` | 4,767,230 | 3,808,097 | 1.25× | 146 ns | 100.0 |
+| `fragmentation` | 3,807,486 | 17,555,016 | 0.22× | 116 ns | 94.3 |
+| `validated_access` | 392,233 | 2,934,219 | 0.13× | 130 ns | 100.0 |
 
-**This is three to five times slower than glibc on most workloads, and that is
+**This is four to seven times slower than glibc on most workloads, and that is
 the honest headline.** glibc has a per-thread cache in front of its free lists
 and does no integrity checking at all; some of the difference is buying
 something it does not provide, and some of it is simply glibc being very good.
-`realloc_grow` is the one workload where the fixed arena and in-place growth
-win outright. `validated_access` is the far outlier and is dominated by CRC32C
-over the whole payload on every read — the cost of the feature, not of the
-allocator.
+`realloc_grow` is the one workload where in-place growth wins outright.
+`validated_access` is the far outlier and is dominated by CRC32C over the whole
+payload on every read — the cost of the feature, not of the allocator.
+
+Read that range as an order of magnitude and no finer. The same table at the
+end of the previous phase said three to five, and most of the movement is
+glibc's rather than this allocator's: its own figures came out substantially
+higher in this run than in that one, on the same machine, against code that
+did not change. That is what [bench/results/README.md](bench/results/README.md)
+means by one significant figure, and it is why ratios are quoted at all.
+
+### And on programs that never heard of it
+
+The table above measures a workload written to be measured, which is the
+weakest thing about it: the allocation pattern was chosen by the person who
+wrote the allocator. So there is now an `LD_PRELOAD` shim, and it is put under
+software that was not. Wall time of the whole process, median of eleven
+repetitions, allocators alternating repetition by repetition:
+
+| Program | glibc | `hardened` | ratio | peak RSS |
+|---|---:|---:|---:|---:|
+| `ls_recursive` | 24 ms | 33 ms | 1.33× | 12 MB |
+| `git_status` | 170 ms | 175 ms | 1.03× | 12 MB |
+| `git_log_stat` | 3104 ms | 3087 ms | 0.99× | 12 MB |
+| `grep_recursive` | 42 ms | 46 ms | 1.09× | 12 MB |
+| `python_sum` | 24 ms | 30 ms | 1.23× | 12 MB |
+| `python_dict` | 103 ms | 111 ms | 1.07× | 47 MB |
+| `gcc_compile` | 160 ms | 186 ms | 1.16× | 25 MB |
+
+**A ratio near 1.0 here means the allocator disappeared into everything else
+the process was doing, not that it matched glibc.** Most of what `git` or a
+Python interpreter does is not allocation; the per-operation cost is in the
+table above and it is unchanged by any of this. What these runs do establish is
+that the programs produce byte-identical output, and that `mm_check_heap()`
+walked the whole arena after each of them and found it consistent — 11 times,
+zero failures.
+
+`calloc` is where the shape of the allocator shows through in both directions
+at once:
+
+| `calloc` shape | glibc | `hardened` | shortcut off |
+|---|---:|---:|---:|
+| `calloc_4mb_x200` | 36 ms | 10 ms | 286 ms |
+| `calloc_4kb_x200000` | 13 ms | 65 ms | 66 ms |
+
+A large `calloc` is served by a mapping the kernel has just supplied, so its
+pages are already zero and the `memset` is skipped entirely; the last column is
+the same build made to do it anyway. A small one is served out of recycled
+arena memory, where the `memset` has to happen, glibc has a per-size cache in
+front of its free lists, and this allocator has nothing equivalent.
 
 Every number here is generated from a committed CSV in
 [bench/results/](bench/results/), and `tools/check_readme_numbers.py` fails CI
@@ -232,11 +282,19 @@ that only has a measurement.
   hardware and physical shielding. Nothing in software stops a bit flipping;
   this notices afterwards. It models single-event upsets — it does not survive
   them at the hardware level.
-- **Not thread-safe.** There is no lock and no per-thread cache, and none of
-  the numbers above say anything about behaviour under concurrency.
-- **Not a `malloc` replacement.** It manages a fixed caller-supplied arena and
-  does not grow it. There is no `LD_PRELOAD` shim, and no timings against a
-  real program — every workload here is a model of a program, not one.
+- **Not thread-safe, and this now bites harder.** There is no lock and no
+  per-thread cache, in the allocator or in the shim. Preloading the shim into a
+  threaded program will corrupt that program's heap; the shim interposes
+  `pthread_create` purely to say so on stderr the first time, because the
+  alternative is an unexplained crash inside the program under test. Per-thread
+  arenas are the next piece of work, and the 2 MB chunk alignment is the
+  groundwork for them. None of the numbers above say anything about behaviour
+  under concurrency.
+- **Not a complete `malloc` replacement.** The shim exports the whole family
+  and runs `git`, `grep`, a Python interpreter and a C compiler correctly, with
+  a consistent heap afterwards — but it is single-threaded, Unix-only, and has
+  no equivalent of glibc's per-size caching, which the small-`calloc` row above
+  shows costing an order of magnitude.
 - **Not able to repair a payload**, under any profile. If the flip landed in
   user data, the payload checksum reports it and the data is gone. Repair
   exists only for metadata, only under `paranoid`, and only while the mirror

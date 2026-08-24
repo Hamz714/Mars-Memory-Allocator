@@ -7,9 +7,9 @@ The method behind each figure is in [BENCHMARK_METHOD.md](BENCHMARK_METHOD.md) a
 
 ## Provenance
 
-Taken on `11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz`, Linux 6.6.87.2-microsoft-standard-WSL2, gcc 11.4.0, at commit `cb6d6ad` on 2026-08-17T19:19:38Z.
+Taken on `11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz`, Linux 6.6.87.2-microsoft-standard-WSL2, gcc 11.4.0, at commit `971fd2e` on 2026-08-24T19:37:48Z.
 
-The timestamp counter is constant and non-stop here (`tsc_usable=1`) in every run, so the latency figures below are quotable. A back-to-back pair of counter reads costs **9.91–10.37 ns** depending on the run, measured each time as the minimum of 20,000 attempts and subtracted from that run's own samples. Percentiles of the same order as that number should be read with it in mind.
+The timestamp counter is constant and non-stop here (`tsc_usable=1`) in every run, so the latency figures below are quotable. A back-to-back pair of counter reads costs **6.48–7.59 ns** depending on the run, measured each time as the minimum of 20,000 attempts and subtracted from that run's own samples. Percentiles of the same order as that number should be read with it in mind.
 
 Measured under WSL2 on a laptop, which is not a quiet benchmarking environment. Repeated runs move the *system* allocator's own throughput by as much as 1.5×, so **one significant figure is what these throughput numbers support**: ratios that hold across runs and differences of an order of magnitude are what they are good for. The fault-injection counts below do not have this problem — they come from seeded, deterministic trials and reproduce exactly.
 
@@ -22,37 +22,37 @@ Median of the repetitions, with the inter-quartile range beside it. Wall-clock o
 
 | Workload | mars ops/s | IQR | glibc ops/s | mars / glibc |
 |---|---:|---:|---:|---:|
-| `seq_lifo` | 6,983,788 | ±1,330,517 | 22,781,014 | 0.31× |
-| `seq_fifo` | 9,977,644 | ±950,948 | 24,971,246 | 0.40× |
-| `random_size` | 6,393,282 | ±400,230 | 14,711,051 | 0.43× |
-| `churn` | 6,595,241 | ±510,965 | 14,551,134 | 0.45× |
-| `realloc_grow` | 8,112,355 | ±832,049 | 2,587,968 | 3.13× |
-| `fragmentation` | 4,184,264 | ±1,096,948 | 13,264,190 | 0.32× |
-| `validated_access` | 1,769,891 | ±58,275 | 1,962,492 | 0.90× |
+| `seq_lifo` | 11,652,180 | ±671,081 | 33,460,710 | 0.35× |
+| `seq_fifo` | 11,189,549 | ±235,780 | 34,924,926 | 0.32× |
+| `random_size` | 8,350,461 | ±500,463 | 18,806,468 | 0.44× |
+| `churn` | 11,049,803 | ±322,919 | 26,311,100 | 0.42× |
+| `realloc_grow` | 10,660,816 | ±264,745 | 4,169,253 | 2.56× |
+| `fragmentation` | 7,222,098 | ±444,489 | 19,877,898 | 0.36× |
+| `validated_access` | 2,410,217 | ±33,984 | 2,954,115 | 0.82× |
 
 ### `hardened`
 
 | Workload | mars ops/s | IQR | glibc ops/s | mars / glibc |
 |---|---:|---:|---:|---:|
-| `seq_lifo` | 5,566,274 | ±415,518 | 20,441,785 | 0.27× |
-| `seq_fifo` | 4,386,148 | ±483,395 | 20,299,790 | 0.22× |
-| `random_size` | 3,648,712 | ±227,997 | 10,626,431 | 0.34× |
-| `churn` | 5,273,182 | ±213,581 | 16,989,710 | 0.31× |
-| `realloc_grow` | 4,663,288 | ±297,899 | 2,757,089 | 1.69× |
-| `fragmentation` | 3,700,471 | ±445,808 | 13,695,435 | 0.27× |
-| `validated_access` | 301,044 | ±6,196 | 2,032,129 | 0.15× |
+| `seq_lifo` | 6,291,090 | ±275,104 | 34,437,061 | 0.18× |
+| `seq_fifo` | 4,826,375 | ±215,655 | 35,280,979 | 0.14× |
+| `random_size` | 5,001,456 | ±158,400 | 19,081,193 | 0.26× |
+| `churn` | 6,027,158 | ±171,529 | 22,474,001 | 0.27× |
+| `realloc_grow` | 4,767,230 | ±277,409 | 3,808,097 | 1.25× |
+| `fragmentation` | 3,807,486 | ±238,126 | 17,555,016 | 0.22× |
+| `validated_access` | 392,233 | ±12,547 | 2,934,219 | 0.13× |
 
 ### `paranoid`
 
 | Workload | mars ops/s | IQR | glibc ops/s | mars / glibc |
 |---|---:|---:|---:|---:|
-| `seq_lifo` | 5,557,780 | ±308,837 | 24,419,069 | 0.23× |
-| `seq_fifo` | 4,923,035 | ±342,042 | 24,126,781 | 0.20× |
-| `random_size` | 4,268,117 | ±167,437 | 14,121,741 | 0.30× |
-| `churn` | 5,146,025 | ±164,511 | 18,700,692 | 0.28× |
-| `realloc_grow` | 4,899,629 | ±195,791 | 2,886,466 | 1.70× |
-| `fragmentation` | 3,416,654 | ±325,365 | 14,126,397 | 0.24× |
-| `validated_access` | 297,153 | ±6,137 | 2,005,722 | 0.15× |
+| `seq_lifo` | 6,447,072 | ±477,553 | 30,860,247 | 0.21× |
+| `seq_fifo` | 6,104,155 | ±69,669 | 34,860,812 | 0.18× |
+| `random_size` | 5,064,707 | ±343,520 | 22,323,103 | 0.23× |
+| `churn` | 6,759,254 | ±227,814 | 29,042,287 | 0.23× |
+| `realloc_grow` | 5,386,966 | ±217,660 | 4,145,573 | 1.30× |
+| `fragmentation` | 3,529,786 | ±151,307 | 20,360,345 | 0.17× |
+| `validated_access` | 407,724 | ±6,892 | 2,940,953 | 0.14× |
 
 ## Per-operation latency
 
@@ -60,13 +60,13 @@ Timestamp-counter samples into a log-linear histogram, timer overhead already su
 
 | Workload | fast p50 | fast p99 | hardened p50 | hardened p99 | paranoid p50 | paranoid p99 |
 |---|---:|---:|---:|---:|---:|---:|
-| `seq_lifo` | 70 ns | 168 ns | 108 ns | 273 ns | 118 ns | 279 ns |
-| `seq_fifo` | 62 ns | 156 ns | 113 ns | 337 ns | 118 ns | 286 ns |
-| `random_size` | 78 ns | 310 ns | 157 ns | 567 ns | 132 ns | 487 ns |
-| `churn` | 63 ns | 232 ns | 101 ns | 311 ns | 107 ns | 319 ns |
-| `realloc_grow` | 73 ns | 183 ns | 128 ns | 333 ns | 137 ns | 288 ns |
-| `fragmentation` | 80 ns | 440 ns | 117 ns | 347 ns | 136 ns | 393 ns |
-| `validated_access` | 29 ns | 1938 ns | 180 ns | 15640 ns | 178 ns | 18434 ns |
+| `seq_lifo` | 58 ns | 116 ns | 110 ns | 208 ns | 109 ns | 229 ns |
+| `seq_fifo` | 60 ns | 118 ns | 124 ns | 284 ns | 115 ns | 211 ns |
+| `random_size` | 65 ns | 248 ns | 124 ns | 390 ns | 123 ns | 411 ns |
+| `churn` | 50 ns | 125 ns | 101 ns | 273 ns | 95 ns | 218 ns |
+| `realloc_grow` | 67 ns | 113 ns | 146 ns | 295 ns | 137 ns | 276 ns |
+| `fragmentation` | 60 ns | 324 ns | 116 ns | 412 ns | 130 ns | 431 ns |
+| `validated_access` | 20 ns | 1288 ns | 130 ns | 9801 ns | 122 ns | 9155 ns |
 
 ## Space
 
@@ -88,22 +88,103 @@ Utilisation is payload over what those blocks actually occupied, sampled at peak
 
 | Workload | counters on | counters off | throughput given up | IQR of the `on` runs | bigger than the spread? |
 |---|---:|---:|---:|---:|:-:|
-| `seq_lifo` | 5,566,274 | 6,051,970 | +8.7% | ±7.5% | yes |
-| `seq_fifo` | 4,386,148 | 5,328,428 | +21.5% | ±11.0% | yes |
-| `random_size` | 3,648,712 | 4,339,191 | +18.9% | ±6.2% | yes |
-| `churn` | 5,273,182 | 5,661,258 | +7.4% | ±4.1% | yes |
-| `realloc_grow` | 4,663,288 | 4,424,220 | -5.1% | ±6.4% | no |
-| `fragmentation` | 3,700,471 | 4,055,079 | +9.6% | ±12.0% | no |
-| `validated_access` | 301,044 | 295,897 | -1.7% | ±2.1% | no |
+| `seq_lifo` | 6,291,090 | 6,352,173 | +1.0% | ±4.4% | no |
+| `seq_fifo` | 4,826,375 | 5,860,163 | +21.4% | ±4.5% | yes |
+| `random_size` | 5,001,456 | 5,307,009 | +6.1% | ±3.2% | yes |
+| `churn` | 6,027,158 | 7,099,686 | +17.8% | ±2.8% | yes |
+| `realloc_grow` | 4,767,230 | 5,492,530 | +15.2% | ±5.8% | yes |
+| `fragmentation` | 3,807,486 | 4,382,585 | +15.1% | ±6.3% | yes |
+| `validated_access` | 392,233 | 401,112 | +2.3% | ±3.2% | no |
 
-A positive figure is throughput the counters cost; a negative one is the build with them compiled in coming out *faster*, which is not a result — it is the noise floor showing through. The last two columns are how to tell those apart: the difference is larger than half the inter-quartile range of its own runs on **4 of 7** workloads (`seq_lifo`, `seq_fifo`, `random_size`, `churn`) and smaller than it on the rest (`realloc_grow`, `fragmentation`, `validated_access`).
+A positive figure is throughput the counters cost; a negative one is the build with them compiled in coming out *faster*, which is not a result — it is the noise floor showing through. The last two columns are how to tell those apart: the difference is larger than half the inter-quartile range of its own runs on **5 of 7** workloads (`seq_fifo`, `random_size`, `churn`, `realloc_grow`, `fragmentation`) and smaller than it on the rest (`seq_lifo`, `validated_access`).
 
 So the counters are not free: on the allocation-heavy workloads they cost something this machine can actually resolve. On the rest, the honest statement is that the cost is below what it can measure — not that there is none.
 
 
+## Real programs under LD_PRELOAD
+
+Wall time of a whole process, median of the repetitions, with the inter-quartile range beside it. `LD_PRELOAD=libmars_preload.so` against the same program with the system allocator, alternating repetition by repetition so that a machine drifting during the run does not land on one of them.
+
+This is the measurement this allocator is least able to flatter. Nothing here was written to be allocated for: the programs, their allocation patterns and their sizes were all decided by somebody else for other reasons. It is also the measurement where the allocator matters least — most of what these processes do is not allocation — so **a ratio near 1.0 means the allocator disappeared into the noise, not that it is as fast as glibc.** The microbenchmarks above are where the per-operation cost is visible.
+
+Every program was also run once more with `MARS_SHIM_CHECK` set, and `mm_check_heap()` walked the whole arena afterwards. The count is in each file's `#` block.
+
+
+### `fast`
+
+| Program | glibc | mars | IQR (mars) | mars / glibc | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| `ls_recursive` | 24 ms | 32 ms | ±5 ms | 1.34× | 12 MB |
+| `git_status` | 170 ms | 183 ms | ±21 ms | 1.07× | 12 MB |
+| `git_log_stat` | 3,155 ms | 3,020 ms | ±87 ms | 0.96× | 12 MB |
+| `grep_recursive` | 42 ms | 43 ms | ±2 ms | 1.03× | 12 MB |
+| `python_sum` | 22 ms | 26 ms | ±4 ms | 1.22× | 12 MB |
+| `python_dict` | 103 ms | 105 ms | ±10 ms | 1.02× | 47 MB |
+| `gcc_compile` | 144 ms | 174 ms | ±13 ms | 1.21× | 24 MB |
+| `calloc_4mb_x200` | 37 ms | 10 ms | ±1 ms | 0.26× | 12 MB |
+| `calloc_4kb_x200000` | 13 ms | 42 ms | ±2 ms | 3.19× | 12 MB |
+
+Heap checks after these runs: **11 consistent, 0 inconsistent**.
+
+
+What knowing a mapping is fresh saves `calloc`. `mars_nofresh` is the same build with `MARS_SHIM_NOFRESH=1`, which makes it memset every byte it hands back rather than trusting pages the kernel has just supplied.
+
+| Program | glibc | mars | mars, memset always | saved |
+|---|---:|---:|---:|---:|
+| `calloc_4mb_x200` | 36.6 ms | 9.6 ms | 277.5 ms | 29.0× |
+| `calloc_4kb_x200000` | 13.1 ms | 41.9 ms | 42.5 ms | 1.0× |
+
+### `hardened`
+
+| Program | glibc | mars | IQR (mars) | mars / glibc | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| `ls_recursive` | 24 ms | 33 ms | ±2 ms | 1.33× | 12 MB |
+| `git_status` | 170 ms | 175 ms | ±20 ms | 1.03× | 12 MB |
+| `git_log_stat` | 3,104 ms | 3,087 ms | ±111 ms | 0.99× | 12 MB |
+| `grep_recursive` | 42 ms | 46 ms | ±4 ms | 1.09× | 12 MB |
+| `python_sum` | 24 ms | 30 ms | ±4 ms | 1.23× | 12 MB |
+| `python_dict` | 103 ms | 111 ms | ±16 ms | 1.07× | 47 MB |
+| `gcc_compile` | 160 ms | 186 ms | ±25 ms | 1.16× | 25 MB |
+| `calloc_4mb_x200` | 36 ms | 10 ms | ±1 ms | 0.28× | 12 MB |
+| `calloc_4kb_x200000` | 13 ms | 65 ms | ±6 ms | 5.01× | 12 MB |
+
+Heap checks after these runs: **11 consistent, 0 inconsistent**.
+
+
+What knowing a mapping is fresh saves `calloc`. `mars_nofresh` is the same build with `MARS_SHIM_NOFRESH=1`, which makes it memset every byte it hands back rather than trusting pages the kernel has just supplied.
+
+| Program | glibc | mars | mars, memset always | saved |
+|---|---:|---:|---:|---:|
+| `calloc_4mb_x200` | 36.1 ms | 10.1 ms | 285.6 ms | 28.2× |
+| `calloc_4kb_x200000` | 12.9 ms | 64.7 ms | 66.2 ms | 1.0× |
+
+### `paranoid`
+
+| Program | glibc | mars | IQR (mars) | mars / glibc | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| `ls_recursive` | 27 ms | 38 ms | ±17 ms | 1.40× | 12 MB |
+| `git_status` | 236 ms | 217 ms | ±124 ms | 0.92× | 12 MB |
+| `git_log_stat` | 3,727 ms | 3,599 ms | ±1,015 ms | 0.97× | 12 MB |
+| `grep_recursive` | 56 ms | 62 ms | ±24 ms | 1.10× | 12 MB |
+| `python_sum` | 27 ms | 35 ms | ±10 ms | 1.27× | 12 MB |
+| `python_dict` | 136 ms | 132 ms | ±51 ms | 0.97× | 47 MB |
+| `gcc_compile` | 169 ms | 212 ms | ±78 ms | 1.26× | 25 MB |
+| `calloc_4mb_x200` | 39 ms | 12 ms | ±3 ms | 0.30× | 12 MB |
+| `calloc_4kb_x200000` | 15 ms | 81 ms | ±23 ms | 5.57× | 12 MB |
+
+Heap checks after these runs: **11 consistent, 0 inconsistent**.
+
+
+What knowing a mapping is fresh saves `calloc`. `mars_nofresh` is the same build with `MARS_SHIM_NOFRESH=1`, which makes it memset every byte it hands back rather than trusting pages the kernel has just supplied.
+
+| Program | glibc | mars | mars, memset always | saved |
+|---|---:|---:|---:|---:|
+| `calloc_4mb_x200` | 39.1 ms | 11.7 ms | 306.4 ms | 26.3× |
+| `calloc_4kb_x200000` | 14.5 ms | 80.9 ms | 77.9 ms | 1.0× |
+
 ## Fault injection
 
-10,000 trials per cell, 7 targets × {1, 2, 4, 8} bits × 3 profiles. Each trial forks a child under an alarm, flips *k* bits in the chosen structure, and classifies what the allocator then does against a shadow model of what every live payload is supposed to contain. Base seed `20260809`, arena 262,144 bytes, patrol at its 1024-call default, at commit `415e85c`.
+10,000 trials per cell, 7 targets × {1, 2, 4, 8} bits × 3 profiles. Each trial forks a child under an alarm, flips *k* bits in the chosen structure, and classifies what the allocator then does against a shadow model of what every live payload is supposed to contain. Base seed `20260809`, arena 262,144 bytes, patrol at its 1024-call default, at commit `971fd2e`.
 
 **Detection coverage is `detected / (detected + silent)`** — of the flips that actually mattered, how many were caught. Benign flips landed in slack, padding or free space and are excluded, because there was nothing there to catch. Intervals are 95% Wilson score.
 

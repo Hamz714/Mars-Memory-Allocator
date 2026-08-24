@@ -84,8 +84,11 @@ workload code, so no difference can come from the driver.
 
 The comparison is still not like-for-like, and the difference matters:
 
-- This allocator manages a fixed caller-supplied arena. glibc's `malloc`
-  requests memory from the kernel and grows.
+- The benchmark drives this allocator over a fixed caller-supplied arena.
+  glibc's `malloc` requests memory from the kernel and grows. (The allocator
+  can now grow too, and does under the shim — but the benchmark deliberately
+  does not use that, so the arena parameter stays a parameter and the numbers
+  stay comparable with every earlier run.)
 - glibc has a per-thread cache in front of its free lists.
 - This allocator validates integrity metadata on operations where glibc does no
   checking at all. Some of the cost being measured buys something glibc does
@@ -93,6 +96,41 @@ The comparison is still not like-for-like, and the difference matters:
 
 None of that makes glibc a bad reference point — it makes it the *only* honest
 one, provided the caveats travel with the number.
+
+## The second measurement: real programs under LD_PRELOAD
+
+Everything above measures a workload written to be measured. That is a real
+weakness and no amount of care inside the harness fixes it, because the person
+who chose the allocation pattern is the person who wrote the allocator.
+
+`tools/preload_bench.py` is the answer to it. It `LD_PRELOAD`s the shim into
+programs that know nothing about any of this — `ls`, `git`, `grep`, a Python
+interpreter, a C compiler — and times the whole process against the same
+program on glibc. Nobody chose those allocation patterns to suit anything here.
+
+The method differs from the one above in ways that follow from the instrument:
+
+- **Wall time of a whole process**, not per-operation timings. Fork, exec,
+  dynamic linking and the program's own work are all inside the number.
+  Allocation is a minority of it for every program in the set.
+- **Allocators alternate repetition by repetition**, not one after the other,
+  so that a machine drifting during the run does not land entirely on whichever
+  went second. The page cache is warmed before the first timed repetition.
+- **The heap check is run separately, afterwards.** `mm_check_heap` walks every
+  block in the arena, and doing that inside a timed run would charge the
+  allocator for a diagnostic the program never asked for. Each program is run
+  once more with `MARS_SHIM_CHECK` set, and the pass and fail counts go into
+  the CSV's `#` block.
+- **Output is discarded and the exit code is recorded**, because a program that
+  failed early would otherwise look like a fast one.
+
+What this measurement can and cannot say is the important part. It can say the
+allocator runs real software correctly, that the software produces identical
+output, and that the heap it leaves behind is consistent. On cost it says much
+less than it appears to: **a ratio near 1.0 means the allocator disappeared
+into the noise of everything else the process did, not that it is as fast as
+glibc.** For per-operation cost, read the microbenchmarks, where it is visible
+and where it is three to five times glibc's.
 
 ## Environment
 
@@ -105,7 +143,12 @@ repetitions is reported, and why the spread is published rather than hidden.
 ## What these numbers are not
 
 They are not a claim about behaviour under concurrency: the allocator is
-currently single-threaded. They are not a claim about real programs; a workload
-is a model of a program, not one. And a throughput figure says nothing about
+single-threaded, and so is the shim. And a throughput figure says nothing about
 whether the memory handed back was correct — that is what the test suite, the
 fuzzer, and the fault injector are for.
+
+The microbenchmarks are also not a claim about real programs; a workload is a
+model of a program, not one. That gap is what the preload runs above exist to
+close, and they close it only partly: they establish that real programs run
+correctly and leave a consistent heap, and they are too noisy an instrument to
+say much about cost.

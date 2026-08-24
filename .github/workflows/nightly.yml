@@ -142,6 +142,47 @@ jobs:
           name: scrub-sweep-${{ matrix.preset }}
           path: scrub-sweep.csv
 
+  # The shim, under load, for long enough that a slow leak or a rare
+  # mis-classification would show. ci.yml runs each program once; this runs
+  # them over and over and checks the heap after every single one, which is the
+  # only way a fault that needs a particular arena shape to appear ever will.
+  preload-soak:
+    name: preload soak / ${{ matrix.preset }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [gcc-release, gcc-fast, gcc-paranoid]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} -- -j$(nproc)
+      - name: Soak
+        run: |
+          set -e
+          SO=$PWD/build/${{ matrix.preset }}/bin/libmars_preload.so
+          LOG=$PWD/soak.log
+          : > "$LOG"
+          for i in $(seq 1 40); do
+            export LD_PRELOAD=$SO MARS_SHIM_CHECK=$LOG
+            git log --stat -n 60 > /dev/null
+            python3 -c "d={str(j):j*j for j in range(150000)}; print(len(d))" > /dev/null
+            gcc -O2 -std=c11 -c src/mm_core.c -Iinclude -Isrc -o /tmp/o.o
+            ls -laR /usr/include > /dev/null
+            unset LD_PRELOAD MARS_SHIM_CHECK
+          done
+          echo "consistent: $(grep -c 'heap consistent at exit' "$LOG")"
+          echo "failed:     $(grep -c 'INCONSISTENT' "$LOG")"
+          [ "$(grep -c 'INCONSISTENT' "$LOG")" = "0" ]
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: preload-soak-${{ matrix.preset }}
+          path: soak.log
+
   valgrind-soak:
     name: soak / valgrind
     runs-on: ubuntu-22.04

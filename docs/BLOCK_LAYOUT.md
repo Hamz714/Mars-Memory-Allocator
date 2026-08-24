@@ -147,6 +147,14 @@ was checksummed for a different position. `tests/test_layout.c` copies one
 block's header over another of identical size and requires it to be rejected,
 and does the same with the canary.
 
+An index is a block's offset from the start of its *span*, in alignment units,
+plus a base the span was handed when it was installed. The base is what keeps
+indices unique once an arena can be more than one region: every span gets a
+disjoint range, so two blocks at the same offset in two different chunks do not
+share a checksum, and copying a header between them still fails. A
+caller-supplied arena is one span with a base of zero, so its indices are
+exactly what they always were.
+
 The secret is drawn once per arena in `mm_init` from a stack address and the
 clock. It is a corruption detector, not a security boundary, and is not claimed
 to be one: it makes accidental confusion detectable, not deliberate forgery
@@ -208,7 +216,8 @@ two sets of pointers can. It checks that
 - `PREV_IN_USE` agrees with what actually precedes each block,
 - every free block's boundary tag repeats its extent,
 - no two free blocks are adjacent (a missed coalesce),
-- the blocks tile `[lo, hi)` **exactly**,
+- the blocks tile every span's `[lo, hi)` **exactly**, and no block straddles
+  two spans,
 - the quarantined blocks account for exactly `lost_bytes`, and
 - the bins contain precisely the free blocks the walk found — every one in
   exactly one bin, in the bin its size asks for, no allocated block in any of

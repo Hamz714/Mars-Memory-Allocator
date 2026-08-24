@@ -47,6 +47,67 @@ implementation, and no amount of extra metadata removes it. Naming it is the
 first thing this document does because every other decision below sits inside
 it.
 
+### Two modes, because a `malloc` cannot have the first one
+
+The paragraphs above were written when the managed API was the only way in. A
+`malloc` replacement cannot use it: handing back a raw pointer *is* the
+contract, and there is no version of `malloc` that asks the caller to route
+their stores through the allocator. So the trade is now named rather than
+implied, and it is a value the caller sets:
+
+| | `MM_MODE_MANAGED` (default) | `MM_MODE_LIBC` |
+|---|---|---|
+| Access | `mm_read` / `mm_write` | raw pointers |
+| Header checksum | yes | yes |
+| Canary | yes | yes |
+| Boundary tags, free-list validation | yes | yes |
+| Payload checksum | maintained and checked | **not maintained at all** |
+| `mm_verify` on an intact block | `MM_OK` | `MM_ERR_DEGRADED` |
+
+`MM_ERR_DEGRADED` is the whole point of the distinction. It does not mean
+"probably fine"; it means **everything this mode is able to check was checked
+and was sound, and the payload was not looked at**. An allocator that returned
+`MM_OK` there would be claiming a guarantee it had stopped providing, and a
+guarantee nobody can rely on is worse than an absence — it is the same failure
+as a checksum that is sometimes stale, one level up. Damage that *is* still
+detectable outranks it: a broken canary reports `MM_ERR_CORRUPT_CANARY` in
+either mode, because "I could not look" must never displace "I looked and it
+was broken".
+
+Two consequences follow, and both are in the code rather than in this
+paragraph:
+
+- **Switching into `MM_MODE_LIBC` clears every payload checksum already
+  established.** Leaving them would not be a weaker detector, it would be a
+  false one: the first legitimate store through a raw pointer would be reported
+  as corruption. Switching back does not invent them again — a block written
+  behind the allocator's back is `payload_crc == 0`, "not established", until
+  the next `mm_write`.
+- **A libc-mode block records the whole of itself, less its trailer, as
+  payload.** `malloc_usable_size` has to return something the program may write
+  every byte of, and programs do. If the payload ended at the requested size,
+  the canary would sit inside that entitlement and a correct program writing
+  into its own slack would be reported as overrunning. Ending the payload where
+  the trailer begins puts the canary back out of reach, where only a real
+  overrun reaches it.
+
+What the mode does **not** change is worth stating too, because it is the part
+that makes the shim worth having: the block layout, the profile, the header
+checksum, the canary, the boundary tags, the free-list validation, quarantine,
+recovery and the patrol are all identical. `MM_MODE_LIBC` gives up one of the
+four kinds of integrity checking and keeps the other three. Under `hardened`
+that is 24 bytes per allocation still covering every byte of metadata a bit
+flip could land in — which the fault injection in
+[FAULT_MODEL.md](FAULT_MODEL.md) measures, and which `MARS_SHIM_FLIP` stages
+inside real programs rather than inside a workload written to be measured.
+
+Under `fast` there is no payload checksum in either mode, because that profile
+carries none at all. `MM_ERR_DEGRADED` is deliberately not returned there:
+`mm_verify` reports it when the *mode* prevented a check, and conflating a
+compile-time absence with a run-time mode would make one status mean two
+things. What a profile carries is answered by `mm_profile()` and
+`mm_metadata_overhead()`, and by [BLOCK_LAYOUT.md](BLOCK_LAYOUT.md).
+
 ## Architecture
 
 ```
@@ -54,13 +115,18 @@ include/mars/allocator.h   the public surface: 18 functions, mm_status_t, mm_sta
         |
 src/mm_layout.h            block shape, control word, accessors -- per profile
 src/mm_freelist.{h,c}      bin indexing, the 128-bit bitmap, hardened unlink
-src/mm_internal.h          arena state, constants, internal declarations
-src/mm_core.c              init, malloc, free, realloc, split, coalesce
+src/mm_internal.h          arena state, spans, constants, internal declarations
+src/mm_arena.{h,c}         where memory comes from: providers, chunk growth,
+                           the span registry, MADV_DONTNEED
+src/mm_core.c              init, malloc, free, realloc, memalign, split,
+                           coalesce
 src/mm_integrity.c         checksums, canary, validation, recovery, quarantine,
-                           mm_check_heap, mm_scrub
+                           modes, mm_check_heap, mm_scrub
 src/mm_access.c            mm_read / mm_write
 src/mm_crc32.{h,c}         CRC32C: runtime SSE4.2 dispatch, table fallback
 src/mm_stats.c             counters, compiled out unless MM_STATS
+
+shim/mm_shim.c             the LD_PRELOAD malloc family -- Unix only
 ```
 
 Everything that knows how a block is shaped lives in `mm_layout.h`, and the
@@ -68,9 +134,58 @@ rest of the allocator is written against its accessors. That is what makes the
 integrity profile a compile-time choice rather than a fork of the allocator:
 `-DMARS_PROFILE=fast|hardened|paranoid` changes one header and nothing else.
 
-The arena is caller-supplied and fixed. `mm_init` zeroes it once, so a payload
-checksum never covers indeterminate memory, and draws a per-arena secret that
-binds every checksum and canary to the arena it was computed in.
+There are two ways to install an arena, and they are alternatives rather than
+layers. `mm_init` takes a caller-supplied buffer, zeroes it once so that a
+payload checksum never covers indeterminate memory, and cannot grow it -- that
+is the managed API, and it is unchanged. `mm_arena_init_growable` maps memory
+itself and maps more when it runs out; that is what the shim uses, because a
+program under `LD_PRELOAD` cannot be asked how much heap it will need. Either
+way a per-arena secret is drawn, binding every checksum and canary to the arena
+it was computed in.
+
+## Growth, and why a block now belongs to a span
+
+A fixed buffer is one contiguous tiling. Growth cannot be: a caller's buffer
+cannot be extended, and neither can a mapping with something already mapped
+after it, so more memory means another region -- and two regions are not one
+tiling. Everything that reasons about a block's geometry therefore asks which
+**span** the block is in first, and answers the question against that span's
+bounds rather than against a single global pair.
+
+Blocks never straddle a span, which is what keeps the rest untouched: inside a
+span, coalescing, the boundary tags, the backward walk and the consistency
+check are exactly what they were. The first block of every span reports its
+predecessor as in use, which is what stops a backward walk stepping out of the
+mapping. The bins are shared across spans, because a free block is filed by its
+size and nothing else, and that is what keeps allocation O(1) however many
+chunks there are.
+
+**Chunks are 2 MB and 2 MB-aligned**, obtained by over-mapping one extra chunk
+and trimming both ends. The alignment is the whole design, and it buys one
+thing: the span a pointer belongs to is identified by
+`(uintptr_t)p >> 21`, spending **zero header bits**. There are none to spend —
+every field in the control word is load-bearing and the whole word is
+checksummed — and a per-thread arena, which is what the next phase needs, has
+exactly the same question to answer.
+
+The shift produces the key; a small open-addressed table maps it to a span.
+Dereferencing `p & ~(CHUNK-1)` directly would be a byte cheaper and unsafe: the
+shim is handed pointers this allocator never produced, including memory a
+program obtained before the shim was loaded, and the 2 MB-aligned address below
+such a pointer need not be mapped at all. A miss in the table is a foreign
+pointer and costs one probe; a hit yields a descriptor we mapped ourselves, and
+only then is anything dereferenced. `mm_owns` is that question, and the shim
+asks it on every `free`.
+
+An allocation larger than half a chunk gets a mapping of its own, before the
+bins are consulted at all. That is not a performance choice: it is what makes
+releasing it hand the memory back to the operating system rather than only to
+the free lists, because a multi-megabyte buffer that happened to fit inside an
+existing chunk would pin that chunk for the life of the process. Ordinary
+chunks are kept and reused -- churning mappings for ordinary allocations would
+trade a free-list operation for two syscalls and a storm of page faults -- and
+what they hand back instead is the resident pages of a large enough free run,
+through `MADV_DONTNEED`.
 
 ## The block, per profile
 
@@ -152,10 +267,14 @@ one most likely to still be in cache.
 These are the properties everything else is written against. `mm_check_heap`
 checks all of them, and the differential fuzzer runs it continuously.
 
-- **The tiling is the list.** Blocks tile `[lo, hi)` exactly, always. Stepping
-  forward is `b + block_size`; stepping back over a free neighbour is its
-  boundary tag. There is no adjacency list that can fall out of step with the
-  memory it describes.
+- **The tiling is the list.** Blocks tile each span's `[lo, hi)` exactly,
+  always. Stepping forward is `b + block_size`; stepping back over a free
+  neighbour is its boundary tag. There is no adjacency list that can fall out
+  of step with the memory it describes.
+- **A block belongs to exactly one span, and never straddles two.** Every
+  bound, every walk and every recovery scan stops at its span's edge, because
+  what lies past that edge is a different mapping and not the allocator's to
+  read or write.
 - **The bins are a cache over the tiling and never the authority.** Anything
   that finds them inconsistent rebuilds from the tiling and reports
   `MM_ERR_CORRUPT_LINKS`.
@@ -288,11 +407,19 @@ offer it is with the price on the label.
 
 ## What this is not
 
-- Not thread-safe. There is no lock and no per-thread cache; the arena is
-  single-threaded, and none of the published numbers say anything about
-  behaviour under concurrency.
-- Not a `malloc` replacement. It manages a fixed caller-supplied arena and does
-  not grow it; there is no `LD_PRELOAD` shim.
+- **Not thread-safe, and that now matters more than it did.** There is no lock
+  and no per-thread cache, and the `LD_PRELOAD` shim has neither. Preloading it
+  into a threaded program will corrupt that program's heap; the shim interposes
+  `pthread_create` solely to say so on stderr the first time, because the
+  alternative is a mysterious crash inside the program under test with nothing
+  pointing at the allocator. Per-thread arenas are the next phase, and the
+  chunk alignment described above is the groundwork for them. None of the
+  published numbers say anything about behaviour under concurrency.
+- Not a *complete* `malloc` replacement. The shim exports the whole family and
+  runs `git`, a Python interpreter and a compiler correctly, but it is
+  single-threaded, Unix-only, and has no equivalent of glibc's per-size caching
+  — which is visible in the numbers: see the small-`calloc` row in
+  [RESULTS.md](RESULTS.md).
 - Not radiation hardening. Real hardening is ECC memory, redundant hardware and
   physical shielding. Nothing in software stops a bit flipping — this can only
   notice afterwards.

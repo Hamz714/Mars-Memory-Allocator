@@ -259,7 +259,7 @@ MM_TEST(regression, free_does_not_merge_through_a_broken_backward_step) {
 
   mm_free(a);  // a is now free, and sits immediately before b
 
-  mm_block *ha = (mm_block *)(void *)g_arena.lo;
+  mm_block *ha = (mm_block *)(void *)mm_sole_span()->lo;
   mm_block *hb = mm_block_of(b);
   REQUIRE_NOT_NULL(hb);
   CHECK_PTR_EQ(mm_prev_free_block(hb), ha);
@@ -543,7 +543,7 @@ MM_TEST(regression, publish_refuses_an_extent_outside_the_arena) {
 
   // An extent four times the arena, which is the shape the measured failure
   // arrived in: a control word overwritten by something that was never a size.
-  mm_set_block_size(b, (size_t)(g_arena.hi - g_arena.lo) * 4);
+  mm_set_block_size(b, (size_t)(mm_sole_span()->hi - mm_sole_span()->lo) * 4);
 
   CHECK_FALSE(mm_publish(b));
   CHECK_TRUE(guards_intact(raw, ARENA_SIZE));
@@ -688,7 +688,7 @@ MM_TEST(regression, recovery_surrenders_exactly_the_damaged_block) {
 
   // An extent no bounds check can accept, which is what a control word looks
   // like once something that was never a size has been written over it.
-  mm_set_block_size(damaged, (size_t)(g_arena.hi - g_arena.lo) * 4);
+  mm_set_block_size(damaged, (size_t)(mm_sole_span()->hi - mm_sole_span()->lo) * 4);
 
   // Freeing the block in front of it makes the walk in mm_publish meet the
   // damage, which is the path the measured failure took.

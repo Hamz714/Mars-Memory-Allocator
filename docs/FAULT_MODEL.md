@@ -26,6 +26,39 @@ repair what the others surrender. The profile is printed at the top of every
 run and recorded in the first column of the CSV, because a detection rate
 without it is not comparable with anything.
 
+## Staging the same fault inside a real program
+
+The injector above drives a workload written to be injected into. That is
+enough to measure a detection rate and nothing like enough to claim the
+detection works, because both sides of the experiment were written here.
+
+So the same event is staged under `LD_PRELOAD`. `MARS_SHIM_FLIP=<n>` flips one
+bit in the header of the n-th allocation a program makes — the second byte of
+the control word, which carries the low bits of the block extent, because an
+extent is what every later walk is positioned by and getting it wrong is how a
+corrupted header becomes a wild write. Then the program runs, and the allocator
+either reports it or it does not:
+
+```bash
+LD_PRELOAD=./build/gcc-release/bin/libmars_preload.so \
+  MARS_SHIM_CHECK=1 MARS_SHIM_FLIP=120 \
+  python3 -c "d={str(i):i*i for i in range(50000)}; print(len(d))"
+```
+
+Under `hardened` and `paranoid` this reports `block header corrupted` from
+inside `free`, the block is surrendered, and the program finishes with the
+right answer. Under `fast` the header carries no checksum, so what catches it
+instead is the free block's boundary tag failing to corroborate the extent —
+reported as `block list inconsistent` — and where the damaged block is never
+touched again, `fast` does not catch it at all. That is the same trade the
+matrix above prices, observed in software that has never heard of it.
+
+Two things about this are worth stating plainly. It is a **demonstration**, not
+a measurement: one flip, one program, no repetition, no interval. And a clean
+run is part of it — the same programs under the same shim with no flip injected
+report nothing at all, which is what makes a report mean something when one
+appears.
+
 ## What this is not
 
 Being precise about the limits matters more than the defence sounding

@@ -339,7 +339,7 @@ MM_TEST(freelist, a_damaged_link_is_rejected_rather_than_spliced_through) {
     void *bogus = NULL;
     switch (variant) {
       case 0: bogus = foreign; break;                   // not in the arena
-      case 1: bogus = (void *)(g_arena.lo + 8); break;   // misaligned
+      case 1: bogus = (void *)(mm_sole_span()->lo + 8); break;   // misaligned
       case 2: bogus = mm_block_of(keep[0]); break;       // an allocated block
       default: {
         // A block that is genuinely free and passes every structural check --
@@ -589,7 +589,7 @@ MM_TEST(freelist, the_patrol_reaches_every_block_over_enough_calls) {
   // How many blocks the tiling actually holds, counted the same way the patrol
   // walks it.
   size_t blocks = 0;
-  for (uint8_t *q = g_arena.lo; q < g_arena.hi;) {
+  for (uint8_t *q = mm_sole_span()->lo; q < mm_sole_span()->hi;) {
     mm_block *b = (mm_block *)(void *)q;
     REQUIRE_TRUE(mm_header_ok(b));
     blocks++;
@@ -605,19 +605,19 @@ MM_TEST(freelist, the_patrol_reaches_every_block_over_enough_calls) {
   // exactly that block's extent. Landing back on hi after `blocks` calls means
   // every block was visited and none was visited twice.
   uint8_t *at = g_arena.scrub_at;
-  CHECK_PTR_EQ(at, g_arena.lo);
+  CHECK_PTR_EQ(at, mm_sole_span()->lo);
   for (size_t i = 0; i < blocks; i++) {
     size_t n = mm_block_size((mm_block *)(void *)at);
     CHECK_EQ(mm_scrub(1), MM_OK);
     at += n;
     CHECK_PTR_EQ(g_arena.scrub_at, at);
   }
-  CHECK_PTR_EQ(g_arena.scrub_at, g_arena.hi);
+  CHECK_PTR_EQ(g_arena.scrub_at, mm_sole_span()->hi);
 
   // And the lap starts again rather than the patrol stopping at the end.
-  size_t first = mm_block_size((mm_block *)(void *)g_arena.lo);
+  size_t first = mm_block_size((mm_block *)(void *)mm_sole_span()->lo);
   CHECK_EQ(mm_scrub(1), MM_OK);
-  CHECK_PTR_EQ(g_arena.scrub_at, g_arena.lo + first);
+  CHECK_PTR_EQ(g_arena.scrub_at, mm_sole_span()->lo + first);
 
 #ifdef MM_STATS
   mm_stats_t st;

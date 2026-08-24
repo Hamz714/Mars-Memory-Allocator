@@ -99,6 +99,31 @@ def csv_candidates():
             for v in row.values():
                 add(v)
 
+    # Real-program wall times, aggregated as RESULTS.md aggregates them, and
+    # in the units it prints them in: milliseconds and megabytes, not the
+    # nanoseconds and kilobytes the file records.
+    for path in sorted(report.RESULTS.glob("preload-*.csv")):
+        _, rows = report.read(path)
+        for name in report.program_names(rows):
+            per = {}
+            for al in ("glibc", "mars", "mars_nofresh"):
+                vals = [float(r["wall_ns"]) for r in rows
+                        if r["program"] == name and r["allocator"] == al]
+                if not vals:
+                    continue
+                per[al] = report.median(vals)
+                add(report.median(vals) / 1e6)
+                add(report.iqr(vals) / 1e6)
+                rss = [float(r["max_rss_kb"]) for r in rows
+                       if r["program"] == name and r["allocator"] == al]
+                add(report.median(rss) / 1024.0)
+            if per.get("glibc") and per.get("mars"):
+                add(per["mars"] / per["glibc"])
+                add(per["glibc"] / per["mars"])
+            if per.get("mars") and per.get("mars_nofresh"):
+                add(per["mars_nofresh"] / per["mars"])
+                add(per["mars"] / per["mars_nofresh"])
+
     # Throughput, latency and space, aggregated as RESULTS.md aggregates them.
     for _, rows in benches.values():
         for wl in report.workloads(rows):
