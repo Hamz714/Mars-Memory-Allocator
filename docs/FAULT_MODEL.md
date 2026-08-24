@@ -206,7 +206,7 @@ on being able to detect the corruption.
 It held under `hardened` and `paranoid` and was **broken under `fast`**: an
 earlier run recorded 2 crashes in 240,000 trials, both from single cells of the
 `free_hdr` target, both writing a boundary tag about 115 MB past a 262 KB arena.
-That is fixed, and the two trials are replayed by seed as ctest cases under every
+That is fixed. The two trials are replayed by seed as ctest cases under every
 profile — `faultinject_arena_promise_free_hdr_2bit` and `_4bit`, which is what
 `--fail-on-crash` exists for. They reproduce standalone too:
 
@@ -253,7 +253,8 @@ whose top 54 bits read as an extent of 115,020,032 bytes.
 added its size. The size it added was the one the rebuild had just left behind.
 
 **5. The footer went where the sum said.** `release_block` → `mm_publish` →
-`mm_write_free_footer` wrote eight bytes at `block + 115,020,256 - 8`. `SIGSEGV`.
+`mm_write_free_footer` wrote eight bytes at `block + 115,020,256 - 8`.
+`SIGSEGV`.
 
 In one sentence: **a free block carries a second copy of its extent in its
 boundary tag, and neither of the two walks that write into blocks was consulting
@@ -293,10 +294,50 @@ as a block.
   `mm_prev_free_block` already refuses on exactly this evidence. Under
   `hardened` and `paranoid` the repair is unchanged.
 
+### What the tests pin, and what they do not
+
+Worth being exact about, because the obvious reading is wrong. **The two seeded
+cases pin the outcome, not the mechanism.** Reduce `mm_extent_corroborated` back
+to `mm_header_ok` and both still pass, as do 20,000 further `fast` trials —
+because `mm_publish` refuses the out-of-arena write on its own, and a refused
+write is not a crash. That is defence in depth working as intended, and it is
+the right thing for the fault injector to gate: the arena promise is a statement
+about outcomes.
+
+The mechanism is pinned by two unit tests, and only those two.
+`rebuild_does_not_write_into_a_phantom_free_block` and
+`recovery_surrenders_exactly_the_damaged_block` both fail under `fast` against a
+neutered `mm_extent_corroborated`, and neither is affected under `hardened`,
+where the checksum already establishes the extent.
+
+`mm_unchanged` guards eight extents in all. The four in `absorb_neighbours` and
+the one in `mm_malloc` have a test each, and every one of those tests fails if
+its branch is deleted -- checked by deleting each in turn, which is the only way
+to tell a test that pins a branch from a test that merely executes it. The two
+in `mm_realloc` and the one in `mm_quarantine` do not yet.
+
+Three of the five are reachable under every profile, one under `fast` and
+`paranoid`, and one under `fast` alone. Where a branch is unreachable the test
+is not compiled at all rather than left to pass for some other reason, and the
+reason is worth recording, because in both cases it is a consequence of the
+layout rather than a gap in the test. A bin operation only ever writes at `block
++ MM_HDR_SIZE` or eight bytes past it, so reaching a given control word needs a
+block header sixteen bytes in front of it -- and where the header is sixteen
+bytes wide, that header covers the eight bytes immediately before the target:
+
+| refusal point | `fast` | `hardened` | `paranoid` | what closes it |
+|---|:-:|:-:|:-:|---|
+| forward, the block being freed | yes | yes | yes | — |
+| forward, the neighbour | yes | no | yes | the phantom's header lands on the freed block's canary, and `hardened` always has one in an allocated block's last sixteen bytes; `paranoid` fills them with the tail mirror instead |
+| backward, the block being freed | yes | no | no | the phantom's checksum field lands on the predecessor's boundary tag, which `mm_prev_free_block` must read to reach the backward merge at all |
+| backward, the predecessor | yes | yes | yes | — |
+| the block `mm_malloc` chose | yes | yes | yes | — |
+
 CI's 200-trial smoke sweep could never have hit a 1-in-120,000 event; the
 10,000-trial run is what found it. The sweep is now 2,000 trials per cell —
-56,000 per profile per push, at a cost of well under a minute — and the two
-seeds are pinned as tests, which is the part that actually stops this returning.
+56,000 per profile per push, at a cost of well under a minute. But the sweep is
+not what stops this returning: the seeds pin the outcome and the unit tests pin
+the mechanism, and only the second kind fails when the fix is removed.
 
 Cells where theory and measurement can be compared are worth more than cells
 where only measurement exists, and disagreement between them should always be
