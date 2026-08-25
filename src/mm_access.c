@@ -48,7 +48,8 @@ static mm_block *checked_block(const void *ptr, size_t offset, size_t len) {
   return b;
 }
 
-// Both of these are inside the lock for the whole of their work, the memcpy
+// Both of these are inside the lock of whichever arena owns the block -- not
+// necessarily this thread's -- for the whole of their work, the memcpy
 // included. Not because the caller's bytes need protecting -- they are the
 // caller's, and two threads writing the same payload is their business -- but
 // because the checks either side of the copy read the block's header, its
@@ -63,9 +64,9 @@ int64_t mm_read(const void *ptr, size_t offset, void *buf, size_t len) {
     return -1;
   }
 
-  mm_arena *a = mm_enter();
+  mm_guard g = mm_enter_for(ptr);
   int64_t n = read_unlocked(ptr, offset, buf, len);
-  mm_leave(a);
+  mm_leave_for(g);
   return n;
 }
 
@@ -101,9 +102,9 @@ int64_t mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     return -1;
   }
 
-  mm_arena *a = mm_enter();
+  mm_guard g = mm_enter_for(ptr);
   int64_t n = write_unlocked(ptr, offset, src, len);
-  mm_leave(a);
+  mm_leave_for(g);
   return n;
 }
 

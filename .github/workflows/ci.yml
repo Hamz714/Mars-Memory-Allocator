@@ -136,6 +136,43 @@ jobs:
             echo "FAIL: the unlocked allocator was not reported as racy, so the"
             echo "green run above is not evidence of anything"; exit 1; }
 
+      # And the shim built that way has to say so. The warning is not decoration
+      # -- it is the only thing standing between somebody who built with
+      # MARS_LOCK=none and a corrupted heap in a program that has nothing to do
+      # with this project.
+      - name: The shim built without locking warns about threads
+        run: |
+          set -e
+          cmake -S . -B build/nolock-shim -G "Unix Makefiles" \
+            -DCMAKE_C_COMPILER=gcc -DCMAKE_BUILD_TYPE=Release \
+            -DMARS_LOCK=none
+          cmake --build build/nolock-shim -j$(nproc) --target mars_preload
+          cat > tiny.c <<'EOF'
+          #include <pthread.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          static void *w(void *a) {
+            (void)a;
+            for (int i = 0; i < 64; i++) free(malloc(64));
+            return NULL;
+          }
+          int main(void) {
+            pthread_t t;
+            if (pthread_create(&t, 0, w, 0)) return 1;
+            pthread_join(t, 0);
+            printf("ran\n");
+            return 0;
+          }
+          EOF
+          gcc -O1 -pthread -o tiny tiny.c
+          LD_PRELOAD=$PWD/build/nolock-shim/bin/libmars_preload.so ./tiny \
+            2> tiny.err || true
+          cat tiny.err
+          grep -q 'MARS_LOCK=none' tiny.err || {
+            echo "FAIL: a build with no locking did not warn about threads"
+            exit 1; }
+          echo "ok: the build that is unsafe under threads says so"
+
   valgrind:
     name: valgrind / ${{ matrix.preset }}
     runs-on: ubuntu-22.04
@@ -404,9 +441,12 @@ jobs:
           exit $fail
 
       # fork is the case a copy-on-write arena has to survive, and threads are
-      # the case it does not. The second is checked for the warning rather than
-      # for the outcome: there is no lock yet, and the shim's job is to say so.
-      - name: fork, and the thread warning
+      # the case that used to be checked for a warning rather than an outcome.
+      # It is checked for the outcome now: the allocator gives each thread its
+      # own arena, so a threaded program under the shim has to *work* and has to
+      # leave a consistent heap, and the shim has to have stopped warning about
+      # something that is no longer true.
+      - name: fork, and threads
         run: |
           set -e
           SO=$PWD/build/${{ matrix.preset }}/bin/libmars_preload.so
@@ -441,18 +481,74 @@ jobs:
           gcc -O1 -o forker forker.c
           LD_PRELOAD=$SO MARS_SHIM_CHECK=1 ./forker
 
+          # Eight threads each minding their own blocks, then a pair that hands
+          # every block from one thread to another -- the case that needs the
+          # remote-free queue, and the case a naive per-thread arena gets wrong.
           cat > threaded.c <<'EOF'
           #include <pthread.h>
           #include <stdlib.h>
           #include <stdio.h>
-          static void *w(void *a) { (void)a; for (int i=0;i<64;i++){void*p=malloc(64);free(p);} return 0; }
-          int main(void) { pthread_t t; if (pthread_create(&t,0,w,0)) return 1; pthread_join(t,0); printf("ran\n"); return 0; }
+          #include <string.h>
+          #define T 8
+          static void *own(void *a) {
+            (void)a;
+            void *held[64];
+            memset(held, 0, sizeof(held));
+            for (int i = 0; i < 20000; i++) {
+              int s = i % 64;
+              free(held[s]);
+              held[s] = malloc(1 + (unsigned)(i * 37) % 900);
+              if (held[s] == NULL) return (void *)1;
+              memset(held[s], i & 0xFF, 1);
+            }
+            for (int i = 0; i < 64; i++) free(held[i]);
+            return NULL;
+          }
+          static void *handoff[4096];
+          static void *maker(void *a) {
+            (void)a;
+            for (int i = 0; i < 4096; i++)
+              if ((handoff[i] = calloc(1, 128)) == NULL) return (void *)1;
+            return NULL;
+          }
+          static void *taker(void *a) {
+            (void)a;
+            for (int i = 0; i < 4096; i++) {
+              char *p = realloc(handoff[i], 256);
+              if (p == NULL) return (void *)1;
+              free(p);
+            }
+            return NULL;
+          }
+          int main(void) {
+            pthread_t t[T]; void *r;
+            for (int i = 0; i < T; i++)
+              if (pthread_create(&t[i], 0, own, 0)) return 1;
+            for (int i = 0; i < T; i++) { pthread_join(t[i], &r); if (r) return 2; }
+            pthread_t m, k;
+            if (pthread_create(&m, 0, maker, 0)) return 1;
+            pthread_join(m, &r); if (r) return 3;
+            if (pthread_create(&k, 0, taker, 0)) return 1;
+            pthread_join(k, &r); if (r) return 4;
+            printf("threads ok\n");
+            return 0;
+          }
           EOF
           gcc -O1 -pthread -o threaded threaded.c
-          LD_PRELOAD=$SO ./threaded 2> thread.err || true
-          grep -q 'no lock yet' thread.err || {
-            echo "FAIL: threaded program was not warned about"; cat thread.err; exit 1; }
-          echo "ok: the thread warning was emitted"
+          : > thread.log
+          LD_PRELOAD=$SO MARS_SHIM_CHECK=$PWD/thread.log ./threaded > thread.out 2> thread.err
+          cat thread.err
+          grep -q 'threads ok' thread.out || {
+            echo "FAIL: the threaded program did not finish"; exit 1; }
+          grep -q 'heap consistent at exit' thread.log || {
+            echo "FAIL: no consistent heap after a threaded run"; cat thread.log; exit 1; }
+          # The warning belongs to MARS_LOCK=none and nowhere else. A shim that
+          # still says its heap is unsafe under threads would be lying, and a
+          # stale warning is worse than none: it teaches people to ignore them.
+          grep -q 'not safe under' thread.err && {
+            echo "FAIL: the shim still warns about threads it now supports"
+            exit 1; }
+          echo "ok: a threaded program ran, left a consistent heap, and was not warned at"
 
       # A bit flipped in a real program's heap, and what each profile does
       # about it. The profile decides the expectation, which is the point: the

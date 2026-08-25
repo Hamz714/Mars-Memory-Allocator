@@ -17,11 +17,6 @@
 #  include <unistd.h>
 #endif
 
-// Bytes reserved at the front of a mapping for the span descriptor itself.
-// Rounded to the alignment so that the tiling behind it starts where the
-// geometry expects.
-#define MM_SPAN_HDR (mm_round_up(sizeof(mm_span), MM_ALIGNMENT))
-
 // --- The platform provider -------------------------------------------------
 //
 // Three of them were planned: a caller-supplied buffer, mmap, and VirtualAlloc.
@@ -85,28 +80,89 @@ void mm_arena_release_pages(uint8_t *from, uint8_t *to) {
 
 #endif  // _WIN32
 
+// --- Memory for the allocator's own structures ------------------------------
+//
+// Mapped once and never handed back. Everything drawn from here -- span
+// descriptors, index tables, arenas -- is something a lookup running on another
+// thread may still be holding a pointer to, and there is no moment at which
+// that can be known to be over. Address space is not the scarce resource here;
+// a use-after-free inside free() is.
+
+void *mm_sys_alloc(size_t bytes) {
+  size_t page = sys_page_size();
+  return sys_map(mm_round_up(bytes, page));
+}
+
 // --- The unit index --------------------------------------------------------
 //
 // Open-addressed, linear-probed, keyed on the 2 MB unit a pointer falls in.
 // Every unit a mapping covers gets an entry, so a pointer anywhere inside a
 // span -- not only at a block start -- resolves in one probe. A miss is a
 // foreign pointer, and costs the probe and nothing else.
+//
+// --- Why readers take no lock ----------------------------------------------
+//
+// Every free asks this table which span, and therefore which arena, a pointer
+// belongs to. A reader-writer lock here would put an atomic read-modify-write
+// on one shared cache line into every free in the program, which is exactly the
+// serialisation per-thread arenas exist to remove -- the table would become the
+// global lock under a different name.
+//
+// So readers are lock-free and writers serialise on a mutex of their own.
+// Three things make that safe:
+//
+//   * **A table is never freed.** Growing publishes a new one and leaves the
+//     old mapped, so a reader that loaded the old pointer is reading memory
+//     that is still there. What it can miss is a span registered after it
+//     started, which is why a miss re-reads the table pointer and tries again.
+//
+//   * **Deletion leaves a tombstone** rather than shifting entries back.
+//     Backward-shift deletion moves entries a concurrent probe may already have
+//     walked past, and there is no ordering that makes that safe. Tombstones do
+//     not accumulate, because the load factor counts them and a rehash drops
+//     them -- a table full of them is rebuilt at the same size rather than
+//     doubled.
+//
+//   * **A descriptor outlives its mapping.** Descriptors come from a pool that
+//     is never given back, so a reader that arrives a moment after a span was
+//     released reads a descriptor that is still there and finds it disowned:
+//     mm_arena_release_span clears the magic and the bounds before it unmaps
+//     anything.
+//
+// What is left is a genuine window, and it is worth naming rather than
+// implying: a lookup for an address *inside a mapping this allocator has just
+// released* can still be holding that span when the memory goes. Reaching it
+// requires a pointer into memory that has already been freed, which is a
+// use-after-free in the caller -- the same program error that makes glibc abort
+// -- and closing it would mean deferring every unmap until every thread had
+// been observed to leave the allocator.
 
 typedef struct mm_unit_slot {
-  uint64_t unit;
-  mm_span *span;  // NULL marks the slot empty
+  _Atomic uint64_t unit;
+  // NULL is an empty slot; MM_UNIT_TOMB is one a probe walks over.
+  _Atomic(mm_span *) span;
 } mm_unit_slot;
 
+#define MM_UNIT_TOMB ((mm_span *)(uintptr_t)1)
+
+typedef struct mm_index {
+  mm_unit_slot *slot;
+  size_t cap;  // a power of two
+} mm_index;
+
 // Sized so that an arena of 512 chunks -- a gigabyte -- never has to grow the
-// table at all. Static, because the table has to exist before the allocator
-// can allocate anything.
+// table at all. Static, because the table has to exist before the allocator can
+// allocate anything.
 #define MM_INDEX_STATIC 1024
 
-static mm_unit_slot g_index_static[MM_INDEX_STATIC];
-static mm_unit_slot *g_index = g_index_static;
-static size_t g_index_cap = MM_INDEX_STATIC;
-static size_t g_index_len;
-static size_t g_index_map_bytes;  // non-zero when the table itself is mapped
+static mm_unit_slot g_slots0[MM_INDEX_STATIC];
+static mm_index g_index0 = {g_slots0, MM_INDEX_STATIC};
+static _Atomic(mm_index *) g_index = &g_index0;
+
+// Writers only. Readers never take it.
+static mm_mutex g_index_lock = MM_MUTEX_INITIALIZER;
+static size_t g_index_used;  // live entries plus tombstones
+static size_t g_index_live;
 
 static uint64_t unit_of(const void *p) {
   return (uint64_t)(uintptr_t)p >> MM_CHUNK_SHIFT;
@@ -123,88 +179,166 @@ static size_t slot_for(uint64_t unit, size_t cap) {
   return (size_t)z & (cap - 1);
 }
 
-static void index_put(mm_unit_slot *tab, size_t cap, uint64_t unit,
-                      mm_span *s) {
-  size_t i = slot_for(unit, cap);
-  while (tab[i].span != NULL) {
-    if (tab[i].unit == unit) {  // re-registering the same unit
-      tab[i].span = s;
+// Writers hold g_index_lock, so the stores here need no compare-exchange --
+// only the release ordering that makes a reader which sees the span also see
+// the unit it was filed under.
+// A tombstone is walked over and never reused, even though reusing one is free
+// and obvious. A reader probing concurrently may already have passed that slot,
+// and filling it behind them would hide an entry they are still looking for.
+// Appending at the end of the chain cannot: whatever a reader has passed, it
+// has not passed the end. Tombstones are paid for by the rehash instead, which
+// is where the load factor already counts them.
+static void index_put(mm_index *ix, uint64_t unit, mm_span *s) {
+  size_t i = slot_for(unit, ix->cap);
+  for (;;) {
+    mm_span *have = atomic_load_explicit(&ix->slot[i].span,
+                                         memory_order_relaxed);
+    if (have == NULL) break;
+    if (have != MM_UNIT_TOMB &&
+        atomic_load_explicit(&ix->slot[i].unit,
+                             memory_order_relaxed) == unit) {
+      atomic_store_explicit(&ix->slot[i].span, s, memory_order_release);
       return;
     }
-    i = (i + 1) & (cap - 1);
+    i = (i + 1) & (ix->cap - 1);
   }
-  tab[i].unit = unit;
-  tab[i].span = s;
+  atomic_store_explicit(&ix->slot[i].unit, unit, memory_order_relaxed);
+  atomic_store_explicit(&ix->slot[i].span, s, memory_order_release);
 }
 
-// Doubles the table. Returns false when the platform cannot supply the memory,
+// Rebuilds the table, dropping tombstones. `cap` is chosen from the live count
+// rather than doubled unconditionally, so a program that maps and releases
+// large blocks in a loop rehashes at the same size for ever instead of growing
+// without bound. Returns false when the platform will not supply the memory,
 // which is the one way registration fails.
-static bool index_grow(void) {
-  size_t cap = g_index_cap * 2;
-  size_t bytes = mm_round_up(cap * sizeof(mm_unit_slot), sys_page_size());
-  mm_unit_slot *tab = (mm_unit_slot *)sys_map(bytes);
-  if (tab == NULL) return false;
-  memset(tab, 0, bytes);
+static bool index_rehash(void) {
+  size_t cap = MM_INDEX_STATIC;
+  while (cap < (g_index_live + 1) * 4) cap *= 2;
 
-  for (size_t i = 0; i < g_index_cap; i++) {
-    if (g_index[i].span != NULL) {
-      index_put(tab, cap, g_index[i].unit, g_index[i].span);
+  mm_index *ix = (mm_index *)mm_sys_alloc(sizeof(mm_index) +
+                                          cap * sizeof(mm_unit_slot));
+  if (ix == NULL) return false;
+  ix->slot = (mm_unit_slot *)(void *)(ix + 1);
+  ix->cap = cap;
+  memset(ix->slot, 0, cap * sizeof(mm_unit_slot));
+
+  mm_index *old = atomic_load_explicit(&g_index, memory_order_relaxed);
+  for (size_t i = 0; i < old->cap; i++) {
+    mm_span *s = atomic_load_explicit(&old->slot[i].span,
+                                      memory_order_relaxed);
+    if (s != NULL && s != MM_UNIT_TOMB) {
+      index_put(ix, atomic_load_explicit(&old->slot[i].unit,
+                                         memory_order_relaxed), s);
     }
   }
 
-  mm_unit_slot *old = g_index;
-  size_t old_bytes = g_index_map_bytes;
-  g_index = tab;
-  g_index_cap = cap;
-  g_index_map_bytes = bytes;
-  if (old_bytes != 0) sys_unmap(old, old_bytes);
+  // The old table stays mapped. A reader holding it sees every span registered
+  // before this moment, and re-reads this pointer when it does not find what it
+  // was looking for.
+  atomic_store_explicit(&g_index, ix, memory_order_release);
+  g_index_used = g_index_live;
   return true;
 }
 
 static bool index_add(uint64_t unit, mm_span *s) {
-  // Kept below half full. Linear probing degrades sharply past that, and a
-  // probe that has degraded is a free() that has got slower.
-  if ((g_index_len + 1) * 2 >= g_index_cap && !index_grow()) return false;
-  index_put(g_index, g_index_cap, unit, s);
-  g_index_len++;
+  // Kept below half full, tombstones included. Linear probing degrades sharply
+  // past that, and a probe that has degraded is a free() that has got slower.
+  if ((g_index_used + 1) * 2 >= atomic_load_explicit(
+          &g_index, memory_order_relaxed)->cap && !index_rehash()) {
+    return false;
+  }
+  index_put(atomic_load_explicit(&g_index, memory_order_relaxed), unit, s);
+  g_index_used++;
+  g_index_live++;
   return true;
 }
 
-static size_t index_find(uint64_t unit) {
-  size_t i = slot_for(unit, g_index_cap);
-  for (size_t probes = 0; probes < g_index_cap; probes++) {
-    if (g_index[i].span == NULL) return g_index_cap;  // a miss
-    if (g_index[i].unit == unit) return i;
-    i = (i + 1) & (g_index_cap - 1);
+static void index_del(uint64_t unit) {
+  mm_index *ix = atomic_load_explicit(&g_index, memory_order_relaxed);
+  size_t i = slot_for(unit, ix->cap);
+  for (size_t probes = 0; probes < ix->cap; probes++) {
+    mm_span *s = atomic_load_explicit(&ix->slot[i].span, memory_order_relaxed);
+    if (s == NULL) return;
+    if (s != MM_UNIT_TOMB &&
+        atomic_load_explicit(&ix->slot[i].unit, memory_order_relaxed) == unit) {
+      atomic_store_explicit(&ix->slot[i].span, MM_UNIT_TOMB,
+                            memory_order_release);
+      g_index_live--;
+      return;
+    }
+    i = (i + 1) & (ix->cap - 1);
   }
-  return g_index_cap;
 }
 
-// Backward-shift deletion. Tombstones would be simpler and would make every
-// later probe pay for every span ever released, which under a program that
-// allocates and frees large buffers in a loop is unbounded.
-static void index_del(uint64_t unit) {
-  size_t i = index_find(unit);
-  if (i == g_index_cap) return;
-
-  g_index[i].span = NULL;
-  g_index_len--;
-
-  size_t j = i;
+// The lock-free half. Returns the span filed under `unit`, or NULL.
+static mm_span *index_find(uint64_t unit) {
   for (;;) {
-    j = (j + 1) & (g_index_cap - 1);
-    if (g_index[j].span == NULL) return;
-    size_t home = slot_for(g_index[j].unit, g_index_cap);
-    // Move j down to i when its home is not cyclically inside (i, j] -- that
-    // is, when the hole at i does not separate j from where it wants to be.
-    bool between = (i < j) ? (home > i && home <= j)
-                           : (home > i || home <= j);
-    if (!between) {
-      g_index[i] = g_index[j];
-      g_index[j].span = NULL;
-      i = j;
+    mm_index *ix = atomic_load_explicit(&g_index, memory_order_acquire);
+    size_t i = slot_for(unit, ix->cap);
+    mm_span *found = NULL;
+    for (size_t probes = 0; probes < ix->cap; probes++) {
+      mm_span *s = atomic_load_explicit(&ix->slot[i].span,
+                                        memory_order_acquire);
+      if (s == NULL) break;  // a miss: nothing was ever filed past here
+      if (s != MM_UNIT_TOMB &&
+          atomic_load_explicit(&ix->slot[i].unit,
+                               memory_order_relaxed) == unit) {
+        found = s;
+        break;
+      }
+      i = (i + 1) & (ix->cap - 1);
     }
+    if (found != NULL) return found;
+    // A miss on a table that has since been replaced is not an answer: the
+    // entry may only ever have been written to the new one.
+    if (atomic_load_explicit(&g_index, memory_order_acquire) == ix) return NULL;
   }
+}
+
+// --- Span descriptors -------------------------------------------------------
+//
+// Out of the mapping they describe, which is a change threads forced and an
+// improvement anyway. A descriptor inside the arena is memory an overrun can
+// reach; a descriptor outside it is not. What threads need is the other half:
+// the descriptor has to stay readable after its mapping has gone, so that a
+// lookup which arrives a moment too late reads a disowned descriptor rather
+// than an unmapped page.
+//
+// Recycled, so the pool is bounded by the number of spans in existence at once
+// rather than by the number ever created. A recycled descriptor answers
+// correctly for whatever it describes now, and a stale reader's bounds check
+// fails against it -- which is the answer it should have got.
+
+static mm_span *g_span_pool;   // descriptors nobody is using
+static uint8_t *g_span_slab;   // what is left of the current page
+static size_t g_span_slab_left;
+
+// The caller holds g_index_lock.
+static mm_span *span_desc_alloc(void) {
+  if (g_span_pool != NULL) {
+    mm_span *s = g_span_pool;
+    g_span_pool = s->next;
+    memset(s, 0, sizeof(*s));
+    return s;
+  }
+  if (g_span_slab_left < sizeof(mm_span)) {
+    size_t page = sys_page_size();
+    g_span_slab = (uint8_t *)mm_sys_alloc(page);
+    if (g_span_slab == NULL) return NULL;
+    g_span_slab_left = page;
+  }
+  mm_span *s = (mm_span *)(void *)g_span_slab;
+  g_span_slab += sizeof(mm_span);
+  g_span_slab_left -= sizeof(mm_span);
+  memset(s, 0, sizeof(*s));
+  return s;
+}
+
+static void span_desc_free(mm_span *s) {
+  mm_mutex_lock(&g_index_lock);
+  s->next = g_span_pool;
+  g_span_pool = s;
+  mm_mutex_unlock(&g_index_lock);
 }
 
 // --- The registry ----------------------------------------------------------
@@ -213,58 +347,67 @@ static void index_del(uint64_t unit) {
 // deliberately: it is not chunk-aligned, there is at most one of it, and a
 // 4 GB buffer would otherwise cost two thousand table entries to describe
 // something a single range check answers.
-static mm_span *g_user;
+static _Atomic(mm_span *) g_user;
 
 bool mm_span_register(mm_span *s) {
   if (s->kind == MM_SPAN_USER) {
-    g_user = s;
+    atomic_store_explicit(&g_user, s, memory_order_release);
     return true;
   }
   uint64_t first = unit_of(s->map_base);
   uint64_t last = unit_of((const uint8_t *)s->map_base + s->map_size - 1);
-  for (uint64_t u = first; u <= last; u++) {
+  mm_mutex_lock(&g_index_lock);
+  bool ok = true;
+  for (uint64_t u = first; u <= last && ok; u++) {
     if (!index_add(u, s)) {
       for (uint64_t v = first; v < u; v++) index_del(v);
-      return false;
+      ok = false;
     }
   }
-  return true;
+  mm_mutex_unlock(&g_index_lock);
+  return ok;
 }
 
 void mm_span_unregister(mm_span *s) {
   if (g_arena.span_cache == s) g_arena.span_cache = NULL;
   if (s->kind == MM_SPAN_USER) {
-    if (g_user == s) g_user = NULL;
+    mm_span *want = s;
+    (void)atomic_compare_exchange_strong_explicit(
+        &g_user, &want, NULL, memory_order_release, memory_order_relaxed);
     return;
   }
   uint64_t first = unit_of(s->map_base);
   uint64_t last = unit_of((const uint8_t *)s->map_base + s->map_size - 1);
+  mm_mutex_lock(&g_index_lock);
   for (uint64_t u = first; u <= last; u++) index_del(u);
+  mm_mutex_unlock(&g_index_lock);
+}
+
+mm_span *mm_span_lookup_uncached(const void *p) {
+  const uint8_t *q = (const uint8_t *)p;
+
+  mm_span *u = atomic_load_explicit(&g_user, memory_order_acquire);
+  if (u != NULL && q >= u->lo && q < u->hi) return u;
+
+  mm_span *s = index_find(unit_of(p));
+  if (s == NULL) return NULL;
+  // A descriptor is drawn from a pool that is never given back, so this read is
+  // always of memory that exists -- and the magic is what makes it mean
+  // something. It is cleared before a span's mapping is released and it carries
+  // the descriptor's own address, so a descriptor that has been disowned,
+  // recycled or copied does not answer for anything.
+  if (s->magic != mm_span_magic_for(s)) return NULL;
+  // In the mapping, outside the tiling. Also what a recycled descriptor fails.
+  if (q < s->lo || q >= s->hi) return NULL;
+  return s;
 }
 
 mm_span *mm_span_lookup(const void *p) {
-  const uint8_t *q = (const uint8_t *)p;
-
-  mm_span *u = g_user;
-  if (u != NULL && q >= u->lo && q < u->hi) {
-    g_arena.span_cache = u;
-    return u;
-  }
-
-  if (g_index_len == 0) return NULL;
-  size_t i = index_find(unit_of(p));
-  if (i == g_index_cap) return NULL;
-
-  mm_span *s = g_index[i].span;
-  // The descriptor lives at the front of the mapping it describes, so an
-  // overrun elsewhere in the arena could in principle have reached it. It
-  // carries its own address XOR-ed into a magic number for that reason: a
-  // descriptor that has been overwritten, or copied from another chunk, does
-  // not answer for anything.
-  if (s->magic != mm_span_magic_for(s)) return NULL;
-  if (q < s->lo || q >= s->hi) return NULL;  // in the mapping, outside the tiling
-
-  g_arena.span_cache = s;
+  mm_span *s = mm_span_lookup_uncached(p);
+  // Only ever this arena's own spans. The cache is read and written under this
+  // arena's lock and no other, so holding another arena's descriptor in it
+  // would be holding a pointer that arena is entitled to recycle.
+  if (s != NULL && s->owner == &g_arena) g_arena.span_cache = s;
   return s;
 }
 
@@ -275,6 +418,9 @@ mm_span *mm_span_lookup(const void *p) {
 // secret; nothing here may run before that, since filing a block seals it.
 // Returns false, having unmapped nothing, if the registry would not take it.
 static bool span_adopt(mm_span *s) {
+  // Set before the span is published, because the moment it is registered
+  // another thread freeing a pointer into it will ask whose it is.
+  s->owner = &g_arena;
   if (!mm_span_register(s)) return false;
 
   s->next = g_arena.spans;
@@ -317,6 +463,7 @@ mm_span *mm_arena_install_user(void *heap, size_t heap_size) {
   size_t usable = heap_size - MM_BLOCK_OFFSET;
   usable -= usable % MM_ALIGNMENT;
 
+  user.owner = &g_arena;
   user.magic = mm_span_magic_for(&user);
   user.lo = base + MM_BLOCK_OFFSET;
   user.hi = user.lo + usable;
@@ -354,20 +501,28 @@ static void *map_chunk_aligned(size_t bytes) {
 }
 
 // Maps a region able to hold a block of `block_size` and adopts it. `bytes`
-// covers the descriptor, the block, and the rounding up to whole chunks.
+// covers the block and the rounding up to whole chunks; the descriptor is not
+// in there.
 static mm_span *map_span(size_t block_size, mm_span_kind_t kind) {
   if (!mm_arena_can_grow() || !g_arena.growable) return NULL;
 
-  size_t want = MM_SPAN_HDR + MM_BLOCK_OFFSET + block_size;
+  size_t want = MM_BLOCK_OFFSET + block_size;
   if (want < block_size) return NULL;  // overflow
   size_t bytes = mm_round_up(want, MM_CHUNK_SIZE);
   if (bytes < want) return NULL;
 
-  uint8_t *base = (uint8_t *)map_chunk_aligned(bytes);
-  if (base == NULL) return NULL;
+  mm_mutex_lock(&g_index_lock);
+  mm_span *s = span_desc_alloc();
+  mm_mutex_unlock(&g_index_lock);
+  if (s == NULL) return NULL;
 
-  mm_span *s = (mm_span *)(void *)base;
-  uint8_t *lo = base + MM_SPAN_HDR + MM_BLOCK_OFFSET;
+  uint8_t *base = (uint8_t *)map_chunk_aligned(bytes);
+  if (base == NULL) {
+    span_desc_free(s);
+    return NULL;
+  }
+
+  uint8_t *lo = base + MM_BLOCK_OFFSET;
   size_t usable = (size_t)(base + bytes - lo);
   usable -= usable % MM_ALIGNMENT;
 
@@ -391,6 +546,7 @@ static mm_span *map_span(size_t block_size, mm_span_kind_t kind) {
 
   if (!span_adopt(s)) {
     sys_unmap(base, bytes);
+    span_desc_free(s);
     return NULL;
   }
   g_arena.fresh_spans++;
@@ -400,7 +556,9 @@ static mm_span *map_span(size_t block_size, mm_span_kind_t kind) {
 int mm_arena_init_growable(void) {
   if (!mm_arena_can_grow()) return -1;
 
-  mm_arena_reset();
+  // Every arena, not only this thread's: this is the same lifecycle call
+  // mm_init is, and it discards whatever was installed before.
+  mm_arenas_reset();
   g_arena.secret = mm_draw_secret();
   g_arena.mode = MM_MODE_MANAGED;
   g_arena.growable = true;
@@ -453,10 +611,18 @@ void mm_arena_release_span(mm_span *s) {
 
   void *base = s->map_base;
   size_t bytes = s->map_size;
-  // The descriptor is inside the mapping, so nothing may be read out of `s`
-  // after this line.
+  // Disowned *before* the memory goes, and in this order. A lookup on another
+  // thread may already be holding this descriptor; what it must not do is
+  // conclude that an address is inside a span whose pages are about to be
+  // unmapped. Clearing the bounds first makes its range check fail, and
+  // clearing the magic makes the whole descriptor stop answering.
+  s->lo = NULL;
+  s->hi = NULL;
   s->magic = 0;
   sys_unmap(base, bytes);
+  // Only now, so that a descriptor cannot be recycled into a live span while
+  // another thread is still reading it as this one.
+  span_desc_free(s);
 }
 
 void mm_arena_reset(void) {
@@ -467,7 +633,13 @@ void mm_arena_reset(void) {
       mm_span_unregister(s);
     } else {
       mm_span_unregister(s);
-      sys_unmap(s->map_base, s->map_size);
+      void *base = s->map_base;
+      size_t bytes = s->map_size;
+      s->lo = NULL;
+      s->hi = NULL;
+      s->magic = 0;
+      sys_unmap(base, bytes);
+      span_desc_free(s);
     }
     s = next;
   }

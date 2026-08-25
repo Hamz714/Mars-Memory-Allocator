@@ -38,6 +38,15 @@
 // a span descriptor we own, and only then is anything dereferenced. The shift
 // is still what makes the key, so the alignment is still doing the work the
 // design asked of it -- the table is what makes asking safe.
+//
+// --- And under threads it is what makes asking cheap ------------------------
+//
+// Every free asks the table which span, and therefore which arena, a pointer
+// belongs to, so the table sits on the path of every free in the program. That
+// is why its readers take no lock at all: a reader-writer lock here would put
+// an atomic read-modify-write on one shared cache line into every free, and the
+// table would have become the global lock under a different name. mm_arena.c
+// says what makes lock-free reads safe.
 
 #ifndef MARS_MM_ARENA_H_
 #define MARS_MM_ARENA_H_
@@ -58,6 +67,13 @@
 // it they never can, so the chunk would be a dedicated mapping wearing a
 // chunk's clothes and would never be released until the whole arena was.
 #define MM_LARGE_THRESHOLD (MM_CHUNK_SIZE / 2)
+
+// Memory for the allocator's own structures -- span descriptors, index tables,
+// arenas. Mapped once and never handed back, because everything drawn from here
+// is something a lookup running on another thread may still be holding a
+// pointer to, and there is no moment at which that can be known to be over.
+// NULL where the platform cannot map anything.
+void *mm_sys_alloc(size_t bytes);
 
 // Whether this platform can map memory of its own. False on Windows, where the
 // arena is caller-supplied and fixed -- the shim is Unix-only by design, and a

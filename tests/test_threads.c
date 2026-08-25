@@ -22,6 +22,7 @@
 
 #include "mars/allocator.h"
 #include "mars_rng.h"
+#include "mm_arena.h"
 #include "mm_internal.h"
 
 #define ARENA_SIZE (32u * 1024u * 1024u)
@@ -40,10 +41,11 @@ static uint8_t *g_heap;
 MM_TEST(threads, the_build_says_which_locking_strategy_it_has) {
 #if MM_LOCK == MM_LOCK_NONE
   CHECK_STR_EQ(mm_lock_strategy(), "none");
-#else
+#elif MM_LOCK == MM_LOCK_GLOBAL
   CHECK_STR_EQ(mm_lock_strategy(), "global");
+#else
+  CHECK_STR_EQ(mm_lock_strategy(), "arena");
 #endif
-  CHECK_EQ(mm_arena_count(), 1u);
 }
 
 #if MM_LOCK != MM_LOCK_NONE
@@ -366,6 +368,264 @@ MM_TEST(threads, a_random_mix_of_operations_leaves_the_arena_walkable) {
   CHECK_EQ(s.live_blocks, 0u);
   CHECK_EQ(s.quarantined_blocks, 0u);
 #endif
+}
+
+// --- The same cases again, against an arena that can grow ------------------
+//
+// Everything above runs on a caller-supplied buffer, which is one fixed region
+// and cannot be divided between threads: under every strategy those cases are
+// exercising one shared arena and one contended lock. That is a real
+// configuration and it is worth testing, but it is not the one MARS_LOCK=arena
+// was written for.
+//
+// These run the same work against `mm_arena_init_growable()` -- what the preload
+// shim installs, and the only provider a per-thread arena can come from. Under
+// MARS_LOCK=arena that means several arenas, a free that has to find its way
+// back to the arena that owns the block, and a queue between the two.
+
+static void growable_or_skip(int *mm_failures_) {
+  if (!mm_arena_can_grow()) return;
+  REQUIRE_EQ(mm_arena_init_growable(), 0);
+}
+
+#define REQUIRE_GROWABLE()                    \
+  do {                                        \
+    if (!mm_arena_can_grow()) return;         \
+    growable_or_skip(mm_failures_);           \
+    if (!mm_arena_can_grow()) return;         \
+  } while (0)
+
+MM_TEST(threads, a_growable_arena_gives_each_thread_one_of_its_own) {
+  REQUIRE_GROWABLE();
+
+  worker w[THREADS];
+  run_workers(mm_failures_, w, THREADS, own_blocks);
+
+#if MM_LOCK == MM_LOCK_ARENA
+  // The claim this whole strategy rests on. Four worker threads and the one
+  // running the test, so five arenas -- but the assertion is the inequality,
+  // because how many a thread pool ends up with is not the allocator's promise;
+  // that no two threads share bins is.
+  CHECK_GT(mm_arena_count(), 1u);
+#else
+  CHECK_EQ(mm_arena_count(), 1u);
+#endif
+
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  mm_arena_reset();
+}
+
+// --- Cross-thread frees, in bulk and in both directions --------------------
+
+#define PING 2048
+
+typedef struct exchange {
+  void *mine[PING];
+  void *theirs[PING];
+  int failures;
+} exchange;
+
+static exchange g_swap;
+
+// Fills `mine` from this thread's own arena, then frees everything the other
+// side left in `theirs`. Both halves run on both threads, so blocks travel in
+// both directions at once and each arena is simultaneously freeing into
+// somebody else's and being freed into.
+static void *swapper(void *arg) {
+  worker *w = (worker *)arg;
+  mars_rng rng;
+  mars_rng_seed(&rng, w->seed);
+  void **give = w->index == 0 ? g_swap.mine : g_swap.theirs;
+  for (size_t i = 0; i < PING; i++) {
+    give[i] = mm_malloc(draw_size(&rng));
+    if (give[i] == NULL) note(w, "mm_malloc returned NULL");
+  }
+  return NULL;
+}
+
+static void *releaser(void *arg) {
+  worker *w = (worker *)arg;
+  // The other side's blocks, on purpose: index 0 frees what index 1 allocated.
+  void **take = w->index == 0 ? g_swap.theirs : g_swap.mine;
+  for (size_t i = 0; i < PING; i++) {
+    if (take[i] == NULL) continue;
+    if (!mm_owns(take[i])) note(w, "the arena disclaimed a pointer it made");
+    mm_free(take[i]);
+    if (mm_last_error() != MM_OK) note(w, "a cross-thread free reported");
+    w->completed++;
+  }
+  return NULL;
+}
+
+MM_TEST(threads, blocks_cross_between_arenas_in_both_directions) {
+  REQUIRE_GROWABLE();
+
+  memset(&g_swap, 0, sizeof(g_swap));
+  worker w[2];
+  run_workers(mm_failures_, w, 2, swapper);
+  run_workers(mm_failures_, w, 2, releaser);
+
+  uint64_t freed = 0;
+  for (unsigned i = 0; i < 2; i++) freed += w[i].completed;
+  CHECK_EQ(freed, (uint64_t)2 * PING);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  // The queue is drained on the owner's next call, so the space is not back
+  // until each arena has been entered again. Doing that here is what makes the
+  // check below a statement about the memory rather than about the queue.
+  mm_free(mm_malloc(64));
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  mm_arena_reset();
+}
+
+// --- More cross-thread frees than the queue can hold -----------------------
+//
+// MM_REMOTE_SLOTS pointers fit; the ones after that have to go the slow way,
+// by taking the owning arena's lock. The fallback is not an error path -- it is
+// the back-pressure a bounded queue is supposed to produce -- so it gets a
+// case rather than a comment.
+
+#define FLOOD (MM_REMOTE_SLOTS * 3)
+
+static void **g_flood;
+
+static void *flood_free(void *arg) {
+  worker *w = (worker *)arg;
+  for (size_t i = 0; i < FLOOD; i++) {
+    if (g_flood[i] == NULL) continue;
+    mm_free(g_flood[i]);
+    if (mm_last_error() != MM_OK) note(w, "a cross-thread free reported");
+    w->completed++;
+  }
+  return NULL;
+}
+
+MM_TEST(threads, a_full_remote_queue_falls_back_to_the_owners_lock) {
+  REQUIRE_GROWABLE();
+
+  g_flood = (void **)calloc(FLOOD, sizeof(void *));
+  REQUIRE_NOT_NULL(g_flood);
+  for (size_t i = 0; i < FLOOD; i++) {
+    g_flood[i] = mm_malloc(64);
+    if (g_flood[i] == NULL) break;
+  }
+
+  // The allocating thread deliberately does nothing while this runs, so it
+  // never drains and the queue really does fill.
+  worker w;
+  memset(&w, 0, sizeof(w));
+  REQUIRE_EQ(pthread_create(&w.id, NULL, flood_free, &w), 0);
+  pthread_join(w.id, NULL);
+  CHECK_EQ(w.failures, 0);
+  CHECK_EQ(w.completed, (uint64_t)FLOOD);
+
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  mm_free(mm_malloc(64));  // drains whatever is still queued
+  CHECK_EQ(mm_check_heap(), MM_OK);
+
+  free(g_flood);
+  g_flood = NULL;
+  mm_arena_reset();
+}
+
+// --- Resizing somebody else's block ----------------------------------------
+
+static void *g_grown[BEQUEATHED];
+
+static void *regrow(void *arg) {
+  worker *w = (worker *)arg;
+  uint8_t got[MAX_DRAW];
+  for (size_t i = 0; i < BEQUEATHED; i++) {
+    if (g_bequeathed[i] == NULL) continue;
+    size_t was = g_bequeathed_size[i];
+    void *q = mm_realloc(g_bequeathed[i], was + 64);
+    if (q == NULL) {
+      note(w, "mm_realloc of another thread's block returned NULL");
+      continue;
+    }
+    g_grown[i] = q;
+    // The contents have to survive the move, and the move is the whole of what
+    // a cross-arena realloc can do: it cannot resize in place, because that
+    // would mean rewriting a neighbour's metadata in an arena this thread does
+    // not own.
+    if (mm_read(q, 0, got, was) != (int64_t)was) note(w, "mm_read was short");
+    uint8_t expect[MAX_DRAW];
+    fill(expect, was, (unsigned)i);
+    if (memcmp(got, expect, was) != 0) note(w, "payload did not survive");
+    w->completed++;
+  }
+  return NULL;
+}
+
+MM_TEST(threads, another_threads_block_can_be_resized) {
+  REQUIRE_GROWABLE();
+
+  memset(g_grown, 0, sizeof(g_grown));
+  worker w;
+  memset(&w, 0, sizeof(w));
+  w.seed = mars_test_seed() + 11;
+  REQUIRE_EQ(pthread_create(&w.id, NULL, allocate_and_exit, &w), 0);
+  pthread_join(w.id, NULL);
+  CHECK_EQ(w.failures, 0);
+
+  memset(&w, 0, sizeof(w));
+  REQUIRE_EQ(pthread_create(&w.id, NULL, regrow, &w), 0);
+  pthread_join(w.id, NULL);
+  CHECK_EQ(w.failures, 0);
+  CHECK_GT(w.completed, (uint64_t)0);
+
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  for (size_t i = 0; i < BEQUEATHED; i++) mm_free(g_grown[i]);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  mm_arena_reset();
+}
+
+// --- A thread that exits, and the arena that outlives it -------------------
+
+MM_TEST(threads, an_arena_outlives_its_thread_and_is_handed_on) {
+  REQUIRE_GROWABLE();
+
+  size_t before = mm_arena_count();
+
+  // Sixteen threads one after another, each of which allocates and exits. If an
+  // arena were created per thread and never reused, this would leave sixteen
+  // of them behind; the pool is what stops that.
+  for (unsigned round = 0; round < 16; round++) {
+    worker w;
+    memset(&w, 0, sizeof(w));
+    w.seed = mars_test_seed() + round;
+    REQUIRE_EQ(pthread_create(&w.id, NULL, allocate_and_exit, &w), 0);
+    pthread_join(w.id, NULL);
+    CHECK_EQ(w.failures, 0);
+
+    // The blocks that thread left behind are still ours, still intact and
+    // still readable, which is what "the arena survives its thread" means.
+    for (size_t i = 0; i < BEQUEATHED; i++) {
+      if (g_bequeathed[i] == NULL) continue;
+      CHECK_TRUE(mm_owns(g_bequeathed[i]));
+      mm_free(g_bequeathed[i]);
+    }
+  }
+
+  size_t after = mm_arena_count();
+  // A handful at most: threads run one at a time here, so one recycled arena
+  // should serve all sixteen. The bound is loose because a pthread destructor
+  // is not promised to have run by the time pthread_join returns.
+  CHECK_LE(after, before + 4);
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  mm_arena_reset();
+}
+
+// --- The random mix again, with arenas in play -----------------------------
+
+MM_TEST(threads, a_random_mix_across_arenas_leaves_every_arena_walkable) {
+  REQUIRE_GROWABLE();
+
+  worker w[THREADS];
+  run_workers(mm_failures_, w, THREADS, stress);
+
+  CHECK_EQ(mm_check_heap(), MM_OK);
+  mm_arena_reset();
 }
 
 #endif  // MM_LOCK != MM_LOCK_NONE

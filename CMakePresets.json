@@ -94,6 +94,12 @@
       "cacheVariables": { "MARS_LOCK": "none" }
     },
     {
+      "name": "gcc-lock-global",
+      "displayName": "gcc / Release with one global lock instead of per-thread arenas",
+      "inherits": "gcc-release",
+      "cacheVariables": { "MARS_LOCK": "global" }
+    },
+    {
       "name": "gcc-asan-fast",
       "displayName": "gcc / ASan + UBSan, fast profile",
       "inherits": "gcc-asan-ubsan",
@@ -188,6 +194,7 @@
     { "name": "gcc-paranoid",     "configurePreset": "gcc-paranoid" },
     { "name": "gcc-nostats",      "configurePreset": "gcc-nostats" },
     { "name": "gcc-nolock",       "configurePreset": "gcc-nolock" },
+    { "name": "gcc-lock-global",  "configurePreset": "gcc-lock-global" },
     { "name": "gcc-asan-ubsan",   "configurePreset": "gcc-asan-ubsan" },
     { "name": "gcc-asan-fast",    "configurePreset": "gcc-asan-fast" },
     { "name": "gcc-asan-paranoid","configurePreset": "gcc-asan-paranoid" },
@@ -215,6 +222,7 @@
     { "name": "gcc-paranoid",     "inherits": "_test_base", "configurePreset": "gcc-paranoid" },
     { "name": "gcc-nostats",      "inherits": "_test_base", "configurePreset": "gcc-nostats" },
     { "name": "gcc-nolock",       "inherits": "_test_base", "configurePreset": "gcc-nolock" },
+    { "name": "gcc-lock-global",  "inherits": "_test_base", "configurePreset": "gcc-lock-global" },
     { "name": "gcc-asan-ubsan",   "inherits": "_test_base", "configurePreset": "gcc-asan-ubsan" },
     { "name": "gcc-asan-fast",    "inherits": "_test_base", "configurePreset": "gcc-asan-fast" },
     { "name": "gcc-asan-paranoid","inherits": "_test_base", "configurePreset": "gcc-asan-paranoid" },

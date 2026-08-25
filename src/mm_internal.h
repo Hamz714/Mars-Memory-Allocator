@@ -5,6 +5,7 @@
 
 #include "mars/allocator.h"
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -41,14 +42,23 @@ typedef enum mm_span_kind {
 } mm_span_kind_t;
 
 typedef struct mm_span {
-  // Guards the registry itself. The descriptor for a mapped chunk lives at the
-  // front of the chunk it describes, which is memory an overrun could reach;
-  // XOR-ing its own address in means a descriptor copied from elsewhere fails
-  // here as well as one that was overwritten.
+  // Guards the registry itself. Descriptors are drawn from a pool that is never
+  // handed back to the operating system, so one that has been recycled for a
+  // different mapping is still readable -- and XOR-ing its own address into the
+  // magic is what makes a descriptor copied from elsewhere fail here as well as
+  // one that was overwritten. Zeroed before its mapping is released, so a
+  // lookup that arrived a moment too late gets "not ours" rather than a pointer
+  // into memory that has gone.
   uint64_t magic;
   uint8_t *lo;  // first block
   uint8_t *hi;  // one past the last block
   struct mm_span *next;
+
+  // Which arena's lock has to be held to touch the metadata of any block in
+  // here. This is how a free finds the owner of a pointer another thread handed
+  // it: the registry answers "which span" without dereferencing the caller's
+  // pointer, and the span answers "whose".
+  struct mm_arena *owner;
 
   // Where this span's block indices start. A header checksum and a canary are
   // both bound to a block's index, which is what makes them detect a block
@@ -77,6 +87,60 @@ typedef struct mm_span {
 static inline uint64_t mm_span_magic_for(const mm_span *s) {
   return MM_SPAN_MAGIC ^ (uint64_t)(uintptr_t)s;
 }
+
+// --- Frees that cross a thread ---------------------------------------------
+//
+// When thread B frees a block belonging to thread A's arena, it may not touch
+// that block's metadata -- that needs A's lock, and taking it is precisely what
+// per-thread arenas exist to avoid on this path. So the pointer is handed to A,
+// and A does the free on its next call.
+//
+// **The queue holds pointers rather than being threaded through the freed
+// blocks themselves**, which is the usual trick and is the wrong one here.
+// Linking a block into a list means writing into it, and this allocator does
+// not write into a block it has not validated: the pointer might not be a block
+// start at all, and eight bytes through the middle of somebody's payload is
+// exactly the damage the rest of the design exists to detect. Validating first
+// would need A's lock, which is the thing being avoided. A ring of pointers
+// needs neither -- B hands over an address, and A puts it through the same
+// mm_free it would have done itself, rejections included.
+//
+// It is bounded, so it can be full. A push that finds no room falls back to
+// taking the owner's lock and freeing directly: correct, slower, and exactly
+// the back-pressure a full queue should produce. The owner drains on every call
+// it makes, so in practice the ring runs nearly empty.
+
+// A power of two. 1,024 pointers is 16 KB per arena.
+#define MM_REMOTE_SLOTS 1024u
+
+typedef struct mm_remote_cell {
+  // Vyukov's sequence trick: a cell may be written when its sequence equals the
+  // position claiming it, and read when it is one past. It is what makes
+  // several producers safe without a lock -- without it, a producer that
+  // stalled between claiming a slot and filling it would hand the consumer an
+  // address that had not been written yet.
+  _Atomic uint32_t seq;
+  void *ptr;
+} mm_remote_cell;
+
+struct mm_arena;
+
+// Hands `payload` to `a`'s owner. False when the queue is full, and the caller
+// must then free it the slow way. Nothing about the block is read or written.
+bool mm_remote_push(struct mm_arena *a, void *payload);
+
+// Frees everything on `a`'s queue. The caller holds `a`'s lock.
+void mm_remote_drain(struct mm_arena *a);
+
+// The next pointer off `a`'s queue, or NULL when there is none. Only the owner
+// calls this, which is what makes the consuming end need no atomic
+// read-modify-write.
+void *mm_remote_pop(struct mm_arena *a);
+
+// Empties the queue without freeing anything, and puts the sequence numbers
+// back to their starting lap. For a new arena, and for mm_init, which is
+// discarding the memory those pointers refer to anyway.
+void mm_remote_forget(struct mm_arena *a);
 
 // --- Arena state -----------------------------------------------------------
 
@@ -154,9 +218,72 @@ typedef struct mm_arena {
   // block metadata. See mm_lock.h -- including for why the read-only calls are
   // inside it too.
   mm_mutex lock;
+
+  // --- Nothing below is reached except under MM_LOCK_ARENA ------------------
+
+  // Frees performed by threads that do not own this arena, waiting for the
+  // owner to pick them up. See above.
+  //
+  // The two ends are on separate cache lines: the head is written by every
+  // thread that frees one of our blocks and the tail only by us, and sharing a
+  // line would make an idle arena's fast path pay for a neighbour's frees.
+  _Alignas(64) _Atomic uint32_t remote_head;
+  _Alignas(64) _Atomic uint32_t remote_tail;
+  mm_remote_cell remote[MM_REMOTE_SLOTS];
+
+  // Whether some thread has this arena as its own. An unclaimed one goes to the
+  // next thread that asks, which is what stops a program creating threads in a
+  // loop from accumulating an arena per thread.
+  bool claimed;
+
+  // Which round of mm_init this arena belongs to. A thread still pointing at an
+  // arena from an earlier round adopts again rather than allocating out of one
+  // that was torn down underneath it.
+  uint64_t epoch;
+
+  // The arenas, oldest first. Appended to and never unlinked from, which is
+  // what lets the whole-heap calls walk it without holding anything still.
+  struct mm_arena *next_arena;
+
+  // And, separately, the ones nobody is using. An arena is on both lists at
+  // once when its thread has gone: still enumerable by mm_check_heap, and still
+  // available to the next thread that needs one.
+  struct mm_arena *next_orphan;
 } mm_arena;
 
-extern mm_arena g_arena;
+// The arena the process starts on, and the only one there is under every
+// strategy but MM_LOCK_ARENA.
+extern mm_arena g_main_arena;
+
+// Bumped by mm_init. See mm_arena.epoch.
+extern uint64_t g_arena_epoch;
+
+#if MM_LOCK == MM_LOCK_ARENA
+// The arena this thread is working in. NULL until its first call.
+//
+// initial-exec rather than the default global-dynamic model: this library is
+// loaded at program start -- as the preload shim it has to be -- so the linker
+// can give the variable a fixed offset in the static TLS block, and reading it
+// becomes one load off %fs instead of a call to __tls_get_addr. Inside malloc
+// that difference is worth having.
+#  if defined(__GNUC__) && !defined(_WIN32)
+extern _Thread_local mm_arena *mm_self
+    __attribute__((tls_model("initial-exec")));
+#  else
+extern _Thread_local mm_arena *mm_self;
+#  endif
+
+// Everything in the allocator is written against `g_arena`, and under
+// MM_LOCK_ARENA that is whichever arena the calling thread is currently working
+// in: its own, except inside mm_enter_for, where it is deliberately the arena
+// that owns the pointer being asked about. That is what lets every call site
+// land in the right arena without one of them having to be told which.
+#  define g_arena (*mm_self)
+#else
+// One arena, named directly, so a build without per-thread arenas generates
+// exactly the code it generated before there were any.
+#  define g_arena g_main_arena
+#endif
 
 static inline bool mm_arena_live(void) { return g_arena.spans != NULL; }
 
@@ -172,19 +299,74 @@ static inline mm_span *mm_sole_span(void) { return g_arena.spans; }
 // when there was no lock, which is what kept this change out of the allocation
 // path altogether.
 //
-// **At most one arena lock is ever held at a time.** There is one arena today,
-// so that is trivially true; it is written down because it is the invariant
-// that has to survive there being more than one, and because it is why
-// mm_realloc and mm_memalign call unlocked helpers rather than the public
-// entry points they used to.
+// **At most one arena lock is ever held at a time.** That is the whole deadlock
+// argument. It is why mm_realloc of another thread's block reads the old size
+// under the owner's lock, gives the lock back, and only then allocates in its
+// own arena -- and why mm_realloc and mm_memalign call unlocked helpers rather
+// than the public entry points they are written in terms of.
 
 // The arena the calling thread works in, locked. Never NULL.
 static inline mm_arena *mm_enter(void) {
+#if MM_LOCK == MM_LOCK_ARENA
+  mm_arena *a = mm_self;
+  if (a == NULL || a->epoch != g_arena_epoch) a = mm_arena_adopt();
+  mm_mutex_lock(&a->lock);
+  // Blocks other threads freed while this one was away, returned to the bins
+  // now that their arena's lock is held. Cheap when there are none: two relaxed
+  // loads, one of them off a line nobody else writes.
+  if (atomic_load_explicit(&a->remote_head, memory_order_relaxed) !=
+      atomic_load_explicit(&a->remote_tail, memory_order_relaxed)) {
+    mm_remote_drain(a);
+  }
+  return a;
+#else
   mm_mutex_lock(&g_arena.lock);
   return &g_arena;
+#endif
 }
 
 static inline void mm_leave(mm_arena *a) { mm_mutex_unlock(&a->lock); }
+
+// What mm_enter_for hands back, so mm_leave_for can put both the lock and the
+// calling thread's own arena back the way they were.
+typedef struct mm_guard {
+  mm_arena *arena;  // the one now locked
+  mm_arena *saved;  // this thread's own arena, when it had to be set aside
+  bool swapped;     // whether it did -- `saved` of NULL is a real value
+} mm_guard;
+
+// Locks the arena that owns `ptr` rather than the calling thread's own, and
+// makes `g_arena` name it for the duration. For the operations that have to
+// read a block's metadata and cannot be deferred: verify, read, write, usable
+// size, and the size half of a cross-thread realloc.
+//
+// Falls back to the calling thread's own arena when `ptr` belongs to no arena.
+// The operation then fails on the pointer, which is what it should do, and
+// fails with the status it would have had single-threaded.
+mm_guard mm_enter_for(const void *ptr);
+void mm_leave_for(mm_guard g);
+
+// The same, for a named arena rather than one found from a pointer. For the
+// whole-heap calls -- mm_check_heap, mm_stats_get, mm_set_mode -- which visit
+// every arena in turn, one lock at a time.
+//
+// Deliberately does not drain the remote-free queue: that queue has exactly one
+// consumer, the arena's own thread, and a second one would race with it on the
+// consuming end. Blocks waiting on it are still marked in use in the tiling, so
+// a consistency check that steps over them is looking at a consistent heap.
+mm_guard mm_enter_arena(mm_arena *a);
+
+// The arena that owns `ptr`, or NULL if none does. Dereferences nothing this
+// allocator did not map: it is the span registry's answer, and the registry is
+// keyed on the 2 MB unit the address falls in rather than on anything read
+// through the pointer.
+mm_arena *mm_owner_of(const void *ptr);
+
+// The mode an arena created from now on starts in. Set by mm_set_mode, which
+// applies to every arena there is and to every arena there will be -- the shim
+// selects MM_MODE_LIBC once, at load time, and a thread created an hour later
+// must not get an arena that claims a payload checksum nobody is maintaining.
+mm_mode_t mm_mode_default(void);
 
 // Whether a payload checksum is being maintained, and therefore whether one
 // may be established or believed. False under MM_MODE_LIBC and false under a
@@ -209,6 +391,13 @@ void mm_clear_error(void);
 //
 // Out of line so that the cache check below stays a compare and a branch.
 mm_span *mm_span_lookup(const void *p);
+
+// The same question asked about a pointer that may belong to another arena
+// altogether, and therefore asked without the per-arena cache: caching another
+// arena's span would leave this thread holding a descriptor that arena is
+// entitled to release. Reads no arena state at all, so it is also the form that
+// works before a thread has an arena.
+mm_span *mm_span_lookup_uncached(const void *p);
 
 static inline mm_span *mm_span_of(const void *p) {
   const uint8_t *q = (const uint8_t *)p;

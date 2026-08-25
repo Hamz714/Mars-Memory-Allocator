@@ -23,13 +23,13 @@ set(MARS_SANITIZE "none" CACHE STRING
     "Sanitizer: none | address | thread")
 set_property(CACHE MARS_SANITIZE PROPERTY STRINGS none address thread)
 
-# Locking strategy. `global` is the default because an allocator that is
-# correct and does not scale is worth more than one that is fast and corrupts
-# memory; `none` is kept so the cost of the lock on a single-threaded program
-# is a measurement rather than an assumption. See src/mm_lock.h.
-set(MARS_LOCK "global" CACHE STRING
-    "Locking: none | global")
-set_property(CACHE MARS_LOCK PROPERTY STRINGS none global)
+# Locking strategy. `arena` is the default; `global` is kept because it is the
+# control the per-arena design is argued against and both curves are published;
+# `none` is kept so the cost of the lock on a single-threaded program is a
+# measurement rather than an assumption. See src/mm_lock.h.
+set(MARS_LOCK "arena" CACHE STRING
+    "Locking: none | global | arena")
+set_property(CACHE MARS_LOCK PROPERTY STRINGS none global arena)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -87,6 +87,8 @@ if(MARS_LOCK STREQUAL "none")
   set(_mars_lock_value 0)
 elseif(MARS_LOCK STREQUAL "global")
   set(_mars_lock_value 1)
+elseif(MARS_LOCK STREQUAL "arena")
+  set(_mars_lock_value 2)
 else()
   message(FATAL_ERROR "Unknown MARS_LOCK value: ${MARS_LOCK}")
 endif()

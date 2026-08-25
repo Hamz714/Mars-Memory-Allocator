@@ -17,13 +17,30 @@
 //
 // --- Threads ---------------------------------------------------------------
 //
-// **There is no lock, so this is single-threaded.** The allocator has none
-// either; per-thread arenas are a later phase, and the chunk alignment this one
-// introduced is the groundwork for them. Preloading this into a threaded
-// program will corrupt its heap, and the shim says so on stderr when it can
-// tell -- see the pthread_create interposer at the bottom. That is an honest
-// statement of where the project has got to, not a bug to be papered over with
-// a mutex added here in the hope that nothing else needs one.
+// **Safe under threads, and there is no lock in this file.** All of it is in
+// the allocator: each thread allocates from an arena of its own, and a free
+// that crosses a thread boundary is handed to the arena that owns the block.
+// See src/mm_lock.h. Adding a mutex here as well would serialise every thread
+// in the program on one lock in front of an allocator that no longer needs one.
+//
+// Two corners of *this file* are still single-threaded, and neither is reached
+// by a threaded program doing ordinary work:
+//
+//   * **Start-up.** `g_ready`, `g_starting` and the bootstrap pool are plain
+//     globals. Everything that touches them runs before the constructor below
+//     has finished, which is before the program has had a chance to create a
+//     thread. A library dlopen-ed from several threads at once could in
+//     principle get in first; a program that does that has a race with the
+//     dynamic loader as well.
+//
+//   * **MARS_SHIM_FLIP**, which counts allocations to stage a fault at the
+//     n-th one. It is a diagnostic that exists to be pointed at one program at
+//     a time, and under threads it flips a bit at an allocation nobody can
+//     name rather than at the one asked for.
+//
+// A build with `MARS_LOCK=none` has no locking at all, and preloading *that*
+// into a threaded program will corrupt its heap. The pthread_create interposer
+// at the bottom exists only in that build, and only to say so.
 //
 // --- The traps -------------------------------------------------------------
 //
@@ -501,17 +518,22 @@ void *__libc_memalign(size_t alignment, size_t size) {
 
 // --- Threads ---------------------------------------------------------------
 //
-// Interposed only in order to say no. There is no lock in the shim and none in
-// the allocator, so a second thread allocating means two threads mutating the
-// same bins and the same tiling. That does not produce a slow program, it
-// produces a corrupted one -- and it would be met as a mysterious crash inside
-// the program under test, with nothing pointing here.
+// Nothing here in the ordinary build. The allocator underneath gives each
+// thread its own arena and routes cross-thread frees between them, so a
+// threaded program needs no help from the shim and gets none -- interposing
+// pthread_create to say "this works" would be a diagnostic nobody asked for on
+// every threaded program in existence.
 //
-// So the first pthread_create says so, once, and then gets out of the way.
-// Refusing to create the thread would break the program outright; creating it
-// silently would break it in a way nobody could diagnose. Until per-thread
-// arenas land, saying so is the only honest option there is.
+// Under `MARS_LOCK=none` it is a different library. There is no locking
+// anywhere in it, so a second thread allocating means two threads mutating the
+// same bins and the same tiling, and that does not produce a slow program: it
+// produces a corrupted one, met as a mysterious crash inside the program under
+// test with nothing pointing back here. So that build, and only that build,
+// says so once and then gets out of the way. Refusing to create the thread
+// would break the program outright; creating it silently would break it in a
+// way nobody could diagnose.
 
+#if MM_LOCK == MM_LOCK_NONE
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                    void *(*fn)(void *), void *arg) {
   static int (*real_create)(pthread_t *, const pthread_attr_t *,
@@ -520,8 +542,9 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 
   if (!warned) {
     warned = true;
-    say("mars shim: this program creates threads and this allocator has no "
-        "lock yet -- its heap is not safe under LD_PRELOAD\n");
+    say("mars shim: this program creates threads and this build has no "
+        "locking (MARS_LOCK=none) -- its heap is not safe under "
+        "LD_PRELOAD\n");
   }
   if (real_create == NULL) {
     real_create = (int (*)(pthread_t *, const pthread_attr_t *,
@@ -531,3 +554,4 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
   if (real_create == NULL) return ENOSYS;
   return real_create(thread, attr, fn, arg);
 }
+#endif
