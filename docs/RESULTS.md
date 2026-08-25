@@ -234,15 +234,15 @@ What knowing a mapping is fresh saves `calloc`. `mars_nofresh` is the same build
 
 | Program | glibc | mars | IQR (mars) | mars / glibc | peak RSS |
 |---|---:|---:|---:|---:|---:|
-| `ls_recursive` | 24 ms | 33 ms | ±2 ms | 1.33× | 12 MB |
-| `git_status` | 170 ms | 175 ms | ±20 ms | 1.03× | 12 MB |
-| `git_log_stat` | 3,104 ms | 3,087 ms | ±111 ms | 0.99× | 12 MB |
-| `grep_recursive` | 42 ms | 46 ms | ±4 ms | 1.09× | 12 MB |
-| `python_sum` | 24 ms | 30 ms | ±4 ms | 1.23× | 12 MB |
-| `python_dict` | 103 ms | 111 ms | ±16 ms | 1.07× | 47 MB |
-| `gcc_compile` | 160 ms | 186 ms | ±25 ms | 1.16× | 25 MB |
-| `calloc_4mb_x200` | 36 ms | 10 ms | ±1 ms | 0.28× | 12 MB |
-| `calloc_4kb_x200000` | 13 ms | 65 ms | ±6 ms | 5.01× | 12 MB |
+| `ls_recursive` | 25 ms | 35 ms | ±7 ms | 1.40× | 12 MB |
+| `git_status` | 218 ms | 202 ms | ±83 ms | 0.93× | 12 MB |
+| `git_log_stat` | 4,331 ms | 3,932 ms | ±1,592 ms | 0.91× | 12 MB |
+| `grep_recursive` | 46 ms | 50 ms | ±21 ms | 1.08× | 12 MB |
+| `python_sum` | 24 ms | 30 ms | ±8 ms | 1.24× | 12 MB |
+| `python_dict` | 127 ms | 105 ms | ±42 ms | 0.83× | 47 MB |
+| `gcc_compile` | 209 ms | 246 ms | ±78 ms | 1.18× | 26 MB |
+| `calloc_4mb_x200` | 31 ms | 11 ms | ±2 ms | 0.36× | 12 MB |
+| `calloc_4kb_x200000` | 13 ms | 72 ms | ±3 ms | 5.34× | 12 MB |
 
 Heap checks after these runs: **11 consistent, 0 inconsistent**.
 
@@ -251,22 +251,22 @@ What knowing a mapping is fresh saves `calloc`. `mars_nofresh` is the same build
 
 | Program | glibc | mars | mars, memset always | saved |
 |---|---:|---:|---:|---:|
-| `calloc_4mb_x200` | 36.1 ms | 10.1 ms | 285.6 ms | 28.2× |
-| `calloc_4kb_x200000` | 12.9 ms | 64.7 ms | 66.2 ms | 1.0× |
+| `calloc_4mb_x200` | 31.2 ms | 11.3 ms | 292.6 ms | 26.0× |
+| `calloc_4kb_x200000` | 13.4 ms | 71.7 ms | 71.7 ms | 1.0× |
 
 ### `paranoid`
 
 | Program | glibc | mars | IQR (mars) | mars / glibc | peak RSS |
 |---|---:|---:|---:|---:|---:|
-| `ls_recursive` | 27 ms | 38 ms | ±17 ms | 1.40× | 12 MB |
-| `git_status` | 236 ms | 217 ms | ±124 ms | 0.92× | 12 MB |
-| `git_log_stat` | 3,727 ms | 3,599 ms | ±1,015 ms | 0.97× | 12 MB |
-| `grep_recursive` | 56 ms | 62 ms | ±24 ms | 1.10× | 12 MB |
-| `python_sum` | 27 ms | 35 ms | ±10 ms | 1.27× | 12 MB |
-| `python_dict` | 136 ms | 132 ms | ±51 ms | 0.97× | 47 MB |
-| `gcc_compile` | 169 ms | 212 ms | ±78 ms | 1.26× | 25 MB |
-| `calloc_4mb_x200` | 39 ms | 12 ms | ±3 ms | 0.30× | 12 MB |
-| `calloc_4kb_x200000` | 15 ms | 81 ms | ±23 ms | 5.57× | 12 MB |
+| `ls_recursive` | 23 ms | 33 ms | ±10 ms | 1.43× | 12 MB |
+| `git_status` | 183 ms | 178 ms | ±263 ms | 0.97× | 12 MB |
+| `git_log_stat` | 3,777 ms | 3,920 ms | ±6,291 ms | 1.04× | 12 MB |
+| `grep_recursive` | 77 ms | 74 ms | ±66 ms | 0.96× | 12 MB |
+| `python_sum` | 25 ms | 32 ms | ±14 ms | 1.27× | 12 MB |
+| `python_dict` | 127 ms | 126 ms | ±28 ms | 1.00× | 47 MB |
+| `gcc_compile` | 221 ms | 300 ms | ±184 ms | 1.36× | 26 MB |
+| `calloc_4mb_x200` | 36 ms | 11 ms | ±7 ms | 0.31× | 12 MB |
+| `calloc_4kb_x200000` | 15 ms | 91 ms | ±20 ms | 6.20× | 12 MB |
 
 Heap checks after these runs: **11 consistent, 0 inconsistent**.
 
@@ -275,8 +275,8 @@ What knowing a mapping is fresh saves `calloc`. `mars_nofresh` is the same build
 
 | Program | glibc | mars | mars, memset always | saved |
 |---|---:|---:|---:|---:|
-| `calloc_4mb_x200` | 39.1 ms | 11.7 ms | 306.4 ms | 26.3× |
-| `calloc_4kb_x200000` | 14.5 ms | 80.9 ms | 77.9 ms | 1.0× |
+| `calloc_4mb_x200` | 35.9 ms | 11.3 ms | 308.5 ms | 27.4× |
+| `calloc_4kb_x200000` | 14.6 ms | 90.6 ms | 79.1 ms | 0.9× |
 
 ## Fault injection
 

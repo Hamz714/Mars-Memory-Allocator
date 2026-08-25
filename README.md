@@ -128,29 +128,35 @@ repetitions, allocators alternating repetition by repetition:
 
 | Program | glibc | `hardened` | ratio | peak RSS |
 |---|---:|---:|---:|---:|
-| `ls_recursive` | 24 ms | 33 ms | 1.33× | 12 MB |
-| `git_status` | 170 ms | 175 ms | 1.03× | 12 MB |
-| `git_log_stat` | 3104 ms | 3087 ms | 0.99× | 12 MB |
-| `grep_recursive` | 42 ms | 46 ms | 1.09× | 12 MB |
-| `python_sum` | 24 ms | 30 ms | 1.23× | 12 MB |
-| `python_dict` | 103 ms | 111 ms | 1.07× | 47 MB |
-| `gcc_compile` | 160 ms | 186 ms | 1.16× | 25 MB |
+| `ls_recursive` | 25 ms | 35 ms | 1.40× | 12 MB |
+| `git_status` | 218 ms | 202 ms | 0.93× | 12 MB |
+| `git_log_stat` | 4,331 ms | 3,932 ms | 0.91× | 12 MB |
+| `grep_recursive` | 46 ms | 50 ms | 1.08× | 12 MB |
+| `python_sum` | 24 ms | 30 ms | 1.24× | 12 MB |
+| `python_dict` | 127 ms | 105 ms | 0.83× | 47 MB |
+| `gcc_compile` | 209 ms | 246 ms | 1.18× | 26 MB |
 
 **A ratio near 1.0 here means the allocator disappeared into everything else
-the process was doing, not that it matched glibc.** Most of what `git` or a
-Python interpreter does is not allocation; the per-operation cost is in the
-table above and it is unchanged by any of this. What these runs do establish is
-that the programs produce byte-identical output, and that `mm_check_heap()`
-walked the whole arena after each of them and found it consistent — 11 times,
-zero failures.
+the process was doing, not that it matched glibc** — and a ratio below 1.0 means
+that plus the machine moving, which whole-process wall time on a laptop does
+freely. Most of what `git` or a Python interpreter does is not allocation; the
+per-operation cost is in the table above, where it is visible. What these runs
+establish is that the programs produce byte-identical output, and that
+`mm_check_heap()` walked the whole arena after each of them and found it
+consistent — 11 times, zero failures.
+
+They now include threaded programs. CI runs eight threads through the shim,
+each minding its own blocks, and then a pair that hands every block from one
+thread to another for release — the case that needs a free to find its way back
+to the arena that owns it — and checks the heap afterwards.
 
 `calloc` is where the shape of the allocator shows through in both directions
 at once:
 
 | `calloc` shape | glibc | `hardened` | shortcut off |
 |---|---:|---:|---:|
-| `calloc_4mb_x200` | 36 ms | 10 ms | 286 ms |
-| `calloc_4kb_x200000` | 13 ms | 65 ms | 66 ms |
+| `calloc_4mb_x200` | 31 ms | 11 ms | 293 ms |
+| `calloc_4kb_x200000` | 13 ms | 72 ms | 72 ms |
 
 A large `calloc` is served by a mapping the kernel has just supplied, so its
 pages are already zero and the `memset` is skipped entirely; the last column is
