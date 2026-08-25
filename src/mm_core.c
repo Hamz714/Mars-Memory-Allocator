@@ -7,6 +7,23 @@
 
 #include "mm_arena.h"
 
+// --- The unlocked forms ----------------------------------------------------
+//
+// Every public entry point below is a wrapper: mm_enter, the work, mm_leave.
+// The work is these, and they exist because realloc and memalign are written
+// in terms of malloc and free -- calling the public forms from inside the lock
+// would take it twice, and a mutex that is not recursive is exactly the right
+// kind for an allocator to have. Making the nesting impossible is better than
+// making it survivable.
+static void *malloc_unlocked(size_t size, size_t *dirty_prefix);
+static void free_unlocked(void *ptr);
+static size_t size_of_live(const void *ptr);
+static void *memalign_unlocked(size_t align, size_t size);
+static void *realloc_unlocked(void *ptr, size_t new_size);
+#if MM_LOCK == MM_LOCK_ARENA
+static void *realloc_foreign(void *ptr, size_t new_size);
+#endif
+
 size_t mm_alignment(void) { return MM_ALIGNMENT; }
 
 size_t mm_min_arena(void) { return MM_BLOCK_OFFSET + MM_MIN_BLOCK; }
@@ -44,6 +61,11 @@ uint64_t mm_draw_secret(void) {
 
 // --- Initialisation --------------------------------------------------------
 
+// Installing an arena is a lifecycle call, not an allocator call: it discards
+// whatever was there, which is not something that can be made safe against a
+// thread allocating out of it at the same time. The lock is still taken, so
+// that a program which happens to serialise its own start-up correctly is not
+// then betrayed by a half-published arena.
 int mm_init(void *heap, size_t heap_size) {
   mm_clear_error();
   if (heap == NULL || heap_size < mm_min_arena()) {
@@ -55,10 +77,16 @@ int mm_init(void *heap, size_t heap_size) {
     return -1;
   }
 
-  // Whatever was installed before goes back to the operating system here, so
-  // that a program which starts with a growable arena and then hands over a
-  // buffer of its own -- which the tests do, repeatedly -- leaks nothing.
-  mm_arena_reset();
+  // Every arena there is, not only this thread's: installing a buffer discards
+  // whatever was there, and leaving another thread's arena pointing at memory
+  // this call is about to disown would be worse than refusing outright.
+  mm_arenas_reset();
+  mm_arena *a = mm_enter();
+
+  // Whatever was installed before went back to the operating system in
+  // mm_arenas_reset above, so that a program which starts with a growable arena
+  // and then hands over a buffer of its own -- which the tests do, repeatedly
+  // -- leaks nothing.
   g_arena.secret = mm_draw_secret();
   // A caller-supplied arena is reached through mm_read and mm_write, which is
   // what the managed mode means. Restoring it here means a program that turned
@@ -79,9 +107,11 @@ int mm_init(void *heap, size_t heap_size) {
   // not part of the arena. mm_arena_install_user does that arithmetic and
   // files the space as one free block.
   if (mm_arena_install_user(heap, heap_size) == NULL) {
+    mm_leave(a);
     mm_fail(MM_ERR_BAD_ARENA);
     return -1;
   }
+  mm_leave(a);
   return 0;
 }
 
@@ -330,6 +360,13 @@ static mm_block *grow_for(size_t need) {
 void *mm_malloc(size_t size) { return mm_malloc_fresh(size, NULL); }
 
 void *mm_malloc_fresh(size_t size, size_t *dirty_prefix) {
+  mm_arena *a = mm_enter();
+  void *p = malloc_unlocked(size, dirty_prefix);
+  mm_leave(a);
+  return p;
+}
+
+static void *malloc_unlocked(size_t size, size_t *dirty_prefix) {
   if (dirty_prefix != NULL) *dirty_prefix = SIZE_MAX;
   mm_clear_error();
   if (!mm_arena_live()) {
@@ -422,6 +459,15 @@ void *mm_malloc_fresh(size_t size, size_t *dirty_prefix) {
 
 size_t mm_usable_size(const void *ptr) {
   mm_clear_error();
+  mm_guard g = mm_enter_for(ptr);
+  size_t n = size_of_live(ptr);
+  mm_leave_for(g);
+  return n;
+}
+
+// The caller holds the lock of whichever arena owns `ptr`, and `g_arena` names
+// it. 0 for anything that is not a live block of ours.
+static size_t size_of_live(const void *ptr) {
   mm_block *b = mm_block_of(ptr);
   if (b == NULL || !mm_header_ok(b)) return 0;
   if (!mm_is_used(b) || mm_is_quarantined(b)) return 0;
@@ -443,7 +489,14 @@ size_t mm_usable_size(const void *ptr) {
 // like any other -- free, realloc, the consistency check and coalescing all
 // treat it as one, with no case of their own and no flag to get wrong.
 void *mm_memalign(size_t align, size_t size) {
-  if (align <= MM_ALIGNMENT) return mm_malloc(size);
+  mm_arena *a = mm_enter();
+  void *p = memalign_unlocked(align, size);
+  mm_leave(a);
+  return p;
+}
+
+static void *memalign_unlocked(size_t align, size_t size) {
+  if (align <= MM_ALIGNMENT) return malloc_unlocked(size, NULL);
 
   // Enough slack that an aligned address with room for a whole block in front
   // of it is guaranteed to exist: one alignment step to reach the boundary,
@@ -456,7 +509,7 @@ void *mm_memalign(size_t align, size_t size) {
     return NULL;
   }
 
-  uint8_t *raw = (uint8_t *)mm_malloc(size + pad);
+  uint8_t *raw = (uint8_t *)malloc_unlocked(size + pad, NULL);
   if (raw == NULL) return NULL;
 
   uint8_t *want = (uint8_t *)mm_round_up((uintptr_t)raw, align);
@@ -474,7 +527,7 @@ void *mm_memalign(size_t align, size_t size) {
     // aligned for anything up to MM_ALIGNMENT, so it is released rather than
     // returned: handing back an under-aligned pointer would be worse than
     // failing.
-    mm_free(raw);
+    free_unlocked(raw);
     mm_fail(MM_ERR_NOMEM);
     return NULL;
   }
@@ -540,8 +593,64 @@ static mm_block *live_block(const void *ptr) {
 }
 
 void mm_free(void *ptr) {
+  // Checked before the lock is taken. free(NULL) is legal, common, and does
+  // nothing; making it wait on a mutex would be a cost paid by every program
+  // that frees a null pointer in a loop.
+  if (ptr == NULL) {
+    mm_clear_error();
+    return;
+  }
+
+#if MM_LOCK == MM_LOCK_ARENA
+  // The one path that must not take the owner's lock. A producer/consumer
+  // program does this to every object it allocates, and waiting on the
+  // producer's lock here would serialise exactly what per-thread arenas exist
+  // to unserialise. See the remote-free queue in mm_internal.h -- including for
+  // why nothing about the block is read or written before it goes on there.
+  //
+  // A full queue falls through to the lock, which is correct, slower, and the
+  // back-pressure a full queue should produce.
+  mm_arena *owner = mm_owner_of(ptr);
+  if (owner != NULL && owner != mm_self) {
+    mm_clear_error();
+    if (mm_remote_push(owner, ptr)) return;
+    mm_mutex_lock(&owner->lock);
+    mm_arena *saved = mm_self;
+    mm_self = owner;
+    mm_remote_drain(owner);
+    free_unlocked(ptr);
+    mm_self = saved;
+    mm_mutex_unlock(&owner->lock);
+    return;
+  }
+#endif
+
+  mm_arena *a = mm_enter();
+  free_unlocked(ptr);
+  mm_leave(a);
+}
+
+// Blocks other threads handed over, put through exactly the free they would
+// have had if their own thread had done it -- rejections, reports and
+// quarantine included. The caller holds this arena's lock.
+void mm_remote_drain(mm_arena *a) {
+#if MM_LOCK == MM_LOCK_ARENA
+  // What the calling thread was in the middle of finding out. A queued free
+  // that runs into damage still quarantines the block and still counts it; what
+  // it must not do is overwrite the status of the call that happened to be
+  // passing through.
+  mm_status_t saved = mm_last_error();
+  for (void *p = mm_remote_pop(a); p != NULL; p = mm_remote_pop(a)) {
+    free_unlocked(p);
+  }
+  (void)mm_fail(saved);
+#else
+  (void)a;
+#endif
+}
+
+static void free_unlocked(void *ptr) {
   mm_clear_error();
-  if (ptr == NULL) return;
 
   mm_block *b = live_block(ptr);
   if (b == NULL) return;
@@ -581,6 +690,34 @@ void mm_free(void *ptr) {
 
 // --- Resize ----------------------------------------------------------------
 
+#if MM_LOCK == MM_LOCK_ARENA
+// A resize of a block belonging to another thread's arena. See mm_realloc.
+static void *realloc_foreign(void *ptr, size_t new_size) {
+  mm_clear_error();
+
+  mm_guard g = mm_enter_for(ptr);
+  size_t old_size = size_of_live(ptr);
+  mm_status_t why = mm_last_error();
+  mm_leave_for(g);
+
+  if (old_size == 0) {
+    mm_fail(why != MM_OK ? why : MM_ERR_INVALID_PTR);
+    return NULL;
+  }
+
+  void *fresh = mm_malloc(new_size);
+  if (fresh == NULL) return NULL;
+
+  // The payload is the caller's own memory and this thread is the one holding
+  // it, so copying it needs nobody's lock. It is the *metadata* that belongs to
+  // the other arena, and none of it is touched here.
+  memcpy(fresh, ptr, old_size < new_size ? old_size : new_size);
+  mm_free(ptr);
+  return fresh;
+}
+#endif
+
+
 // The payload checksum only means anything when every byte it covers has been
 // written. Carrying it forward is therefore valid exactly when the surviving
 // payload is entirely initialised -- that is, when the block is not growing.
@@ -611,11 +748,33 @@ static uint32_t payload_crc_of(const mm_block *b) {
 }
 
 void *mm_realloc(void *ptr, size_t new_size) {
+#if MM_LOCK == MM_LOCK_ARENA
+  // Resizing another thread's block cannot be done in place: growing or
+  // shrinking it means moving its neighbours' metadata about, and this thread
+  // would have to hold the owner's lock while allocating, which is the one
+  // thing the deadlock argument forbids. So it becomes allocate, copy, hand
+  // back -- and the hand-back is an ordinary cross-thread free.
+  //
+  // The old size is read under the owner's lock and the lock is then given up.
+  // Nothing can change it in between: the block is live and this thread is the
+  // one holding it.
+  if (ptr != NULL && new_size != 0) {
+    mm_arena *owner = mm_owner_of(ptr);
+    if (owner != NULL && owner != mm_self) return realloc_foreign(ptr, new_size);
+  }
+#endif
+  mm_arena *a = mm_enter();
+  void *p = realloc_unlocked(ptr, new_size);
+  mm_leave(a);
+  return p;
+}
+
+static void *realloc_unlocked(void *ptr, size_t new_size) {
   mm_clear_error();
-  if (ptr == NULL) return mm_malloc(new_size);
+  if (ptr == NULL) return malloc_unlocked(new_size, NULL);
 
   if (new_size == 0) {
-    mm_free(ptr);
+    free_unlocked(ptr);
     return NULL;
   }
 
@@ -701,7 +860,7 @@ void *mm_realloc(void *ptr, size_t new_size) {
 
   // Fall back to allocate, copy, release. Copy before freeing so a failed
   // allocation leaves the original block untouched.
-  void *fresh = mm_malloc(new_size);
+  void *fresh = malloc_unlocked(new_size, NULL);
   if (fresh == NULL) return NULL;
 
   size_t carry = old_size < new_size ? old_size : new_size;
@@ -713,6 +872,6 @@ void *mm_realloc(void *ptr, size_t new_size) {
     mm_seal(fresh_block);
   }
 
-  mm_free(ptr);
+  free_unlocked(ptr);
   return fresh;
 }

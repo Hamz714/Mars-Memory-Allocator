@@ -68,6 +68,12 @@ typedef struct bench_hist {
 void bench_hist_reset(bench_hist *h);
 void bench_hist_record(bench_hist *h, uint64_t value);
 
+// Folds `src` into `dst`. For the multithreaded driver, where each thread
+// records into its own histogram -- sharing one would make every timed
+// operation a write to a line every other core wants, which is a cost the
+// harness would then be measuring instead of the allocator.
+void bench_hist_merge(bench_hist *dst, const bench_hist *src);
+
 // Smallest value at or below which `q` of the distribution falls, q in [0,1].
 uint64_t bench_hist_quantile(const bench_hist *h, double q);
 double bench_hist_mean(const bench_hist *h);

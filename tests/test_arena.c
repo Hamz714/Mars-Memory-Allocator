@@ -84,10 +84,14 @@ MM_TEST(arena, every_mapped_chunk_is_chunk_aligned) {
   for (const mm_span *s = g_arena.spans; s != NULL; s = s->next) {
     CHECK_EQ((uintptr_t)s->map_base % MM_CHUNK_SIZE, 0);
     CHECK_EQ(s->map_size % MM_CHUNK_SIZE, 0);
-    // The descriptor sits at the front of the mapping it describes, so the
-    // tiling starts after it and inside it.
-    CHECK_PTR_EQ(s, (const mm_span *)s->map_base);
-    CHECK_TRUE(s->lo > (const uint8_t *)s->map_base);
+    // The descriptor sits *outside* the mapping it describes: it has to
+    // outlive it, so that a lookup arriving after a span was released reads a
+    // disowned descriptor rather than an unmapped page. The tiling therefore
+    // starts at the front of the mapping, shifted only by MM_BLOCK_OFFSET.
+    CHECK_TRUE((const uint8_t *)(const void *)s < (const uint8_t *)s->map_base ||
+               (const uint8_t *)(const void *)s >=
+                   (const uint8_t *)s->map_base + s->map_size);
+    CHECK_PTR_EQ(s->lo, (const uint8_t *)s->map_base + MM_BLOCK_OFFSET);
     CHECK_TRUE(s->hi <= (const uint8_t *)s->map_base + s->map_size);
   }
 

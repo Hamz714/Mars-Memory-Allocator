@@ -4,6 +4,11 @@
 
 #include <string.h>
 
+static int64_t read_unlocked(const void *ptr, size_t offset, void *buf,
+                             size_t len);
+static int64_t write_unlocked(void *ptr, size_t offset, const void *src,
+                              size_t len);
+
 // Validates a block and the requested range against it. Returns the block, or
 // NULL with the thread status set.
 static mm_block *checked_block(const void *ptr, size_t offset, size_t len) {
@@ -43,6 +48,15 @@ static mm_block *checked_block(const void *ptr, size_t offset, size_t len) {
   return b;
 }
 
+// Both of these are inside the lock of whichever arena owns the block -- not
+// necessarily this thread's -- for the whole of their work, the memcpy
+// included. Not because the caller's bytes need protecting -- they are the
+// caller's, and two threads writing the same payload is their business -- but
+// because the checks either side of the copy read the block's header, its
+// canary and its payload checksum, and the copy itself sits between a check
+// and a re-seal. Splitting the lock around the memcpy would leave a window in
+// which the block was validated, then changed, then sealed at an extent that
+// was no longer true.
 int64_t mm_read(const void *ptr, size_t offset, void *buf, size_t len) {
   mm_clear_error();
   if (buf == NULL && len != 0) {
@@ -50,6 +64,14 @@ int64_t mm_read(const void *ptr, size_t offset, void *buf, size_t len) {
     return -1;
   }
 
+  mm_guard g = mm_enter_for(ptr);
+  int64_t n = read_unlocked(ptr, offset, buf, len);
+  mm_leave_for(g);
+  return n;
+}
+
+static int64_t read_unlocked(const void *ptr, size_t offset, void *buf,
+                             size_t len) {
   mm_block *b = checked_block(ptr, offset, len);
   if (b == NULL) return -1;
 
@@ -80,6 +102,14 @@ int64_t mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     return -1;
   }
 
+  mm_guard g = mm_enter_for(ptr);
+  int64_t n = write_unlocked(ptr, offset, src, len);
+  mm_leave_for(g);
+  return n;
+}
+
+static int64_t write_unlocked(void *ptr, size_t offset, const void *src,
+                              size_t len) {
   mm_block *b = checked_block(ptr, offset, len);
   if (b == NULL) return -1;
 

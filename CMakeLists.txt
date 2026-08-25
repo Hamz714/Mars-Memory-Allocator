@@ -23,6 +23,14 @@ set(MARS_SANITIZE "none" CACHE STRING
     "Sanitizer: none | address | thread")
 set_property(CACHE MARS_SANITIZE PROPERTY STRINGS none address thread)
 
+# Locking strategy. `arena` is the default; `global` is kept because it is the
+# control the per-arena design is argued against and both curves are published;
+# `none` is kept so the cost of the lock on a single-threaded program is a
+# measurement rather than an assumption. See src/mm_lock.h.
+set(MARS_LOCK "arena" CACHE STRING
+    "Locking: none | global | arena")
+set_property(CACHE MARS_LOCK PROPERTY STRINGS none global arena)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -72,6 +80,32 @@ string(TOUPPER "${MARS_PROFILE}" _mars_profile_upper)
 target_compile_definitions(mars_flags INTERFACE
   MARS_PROFILE_${_mars_profile_upper}=1)
 
+# The strategy has to reach every translation unit that sees mm_arena, because
+# it decides whether that struct carries a mutex. Anything compiled against a
+# different value would be reading the arena at the wrong offsets.
+if(MARS_LOCK STREQUAL "none")
+  set(_mars_lock_value 0)
+elseif(MARS_LOCK STREQUAL "global")
+  set(_mars_lock_value 1)
+elseif(MARS_LOCK STREQUAL "arena")
+  set(_mars_lock_value 2)
+else()
+  message(FATAL_ERROR "Unknown MARS_LOCK value: ${MARS_LOCK}")
+endif()
+target_compile_definitions(mars_flags INTERFACE MM_LOCK=${_mars_lock_value})
+
+# pthread.h under -std=c11 with C_EXTENSIONS OFF: strict ISO C hides the POSIX
+# declarations unless the feature-test macro asks for them. Set once, here,
+# rather than at the top of each file that needs it -- a file that forgot would
+# fail to compile in a way that looks like a missing header rather than a
+# missing #define.
+if(NOT WIN32)
+  target_compile_definitions(mars_flags INTERFACE _POSIX_C_SOURCE=200809L)
+endif()
+
+find_package(Threads REQUIRED)
+target_link_libraries(mars_flags INTERFACE Threads::Threads)
+
 # Sanitizers and coverage are applied to every target so that instrumentation
 # is consistent across the library boundary.
 if(NOT MARS_SANITIZE STREQUAL "none")
@@ -119,6 +153,7 @@ set(MARS_SOURCES
   src/mm_freelist.c
   src/mm_integrity.c
   src/mm_access.c
+  src/mm_lock.c
   src/mm_stats.c
   src/mm_crc32.c)
 
@@ -233,6 +268,13 @@ if(BUILD_TESTING)
   mars_add_test(test_integrity   tests/test_integrity.c)
   mars_add_test(test_regressions tests/test_regressions.c)
 
+  # Threads are slower than everything else here even when they pass, and far
+  # slower under valgrind, which serialises them. A longer timeout rather than
+  # less work: the point of the file is interleaving, and less work is less
+  # interleaving.
+  mars_add_test(test_threads     tests/test_threads.c)
+  set_tests_properties(test_threads PROPERTIES TIMEOUT 300)
+
   # Linked against the preload library rather than against libmars, so that
   # every allocation it makes -- its own and the test framework's -- goes
   # through the shim. Built only where the shim is; see MARS_BUILD_SHIM above
@@ -271,14 +313,45 @@ endif()
 if(MARS_BUILD_BENCH)
   add_executable(bench
     bench/bench_main.c
+    bench/bench_env.c
     bench/bench_timer.c
     bench/workloads.c)
   target_link_libraries(bench PRIVATE mars mars_flags mars_flags_strict)
+  # src/ for mm_lock.h, which the provenance block reads the locking strategy
+  # from: two runs are only comparable when it matches.
   target_include_directories(bench
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   set_target_properties(bench PROPERTIES
     C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+
+  # The thread-scaling driver. Unix only, and for the same reason the shim is:
+  # it measures `mars` through a growable arena, which is what a threaded
+  # program actually gets and what mm_arena.c only provides over mmap.
+  if(UNIX)
+    add_executable(bench_mt
+      bench/bench_mt.c
+      bench/bench_env.c
+      bench/bench_timer.c
+      bench/workloads.c
+      bench/workloads_mt.c)
+    target_link_libraries(bench_mt PRIVATE mars mars_flags mars_flags_strict)
+    target_include_directories(bench_mt
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench
+              ${CMAKE_CURRENT_SOURCE_DIR}/src
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    set_target_properties(bench_mt PROPERTIES
+      C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+
+    # A tiny run, purely to catch the harness breaking -- the same bargain the
+    # single-threaded smoke test makes. Real curves are taken deliberately.
+    if(BUILD_TESTING)
+      add_test(NAME bench_mt_smoke
+               COMMAND bench_mt --ops 2000 --reps 1 --threads 1,2 --quiet)
+      set_tests_properties(bench_mt_smoke PROPERTIES TIMEOUT 300)
+    endif()
+  endif()
 
   # Prices the fresh-mapping shortcut in calloc. Deliberately linked against
   # nothing of ours: it has to run under LD_PRELOAD against whichever allocator
@@ -365,6 +438,7 @@ message(STATUS "  build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  compiler   : ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
 message(STATUS "  profile    : ${MARS_PROFILE}")
 message(STATUS "  sanitizer  : ${MARS_SANITIZE}")
+message(STATUS "  locking    : ${MARS_LOCK}")
 message(STATUS "  coverage   : ${MARS_COVERAGE}")
 message(STATUS "  warn=error : ${MARS_WERROR}")
 message(STATUS "  counters   : ${MARS_STATS}")

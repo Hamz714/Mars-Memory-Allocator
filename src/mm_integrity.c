@@ -6,8 +6,6 @@
 
 #include "mm_arena.h"
 
-mm_arena g_arena;
-
 static _Thread_local mm_status_t g_last_error = MM_OK;
 
 mm_status_t mm_last_error(void) { return g_last_error; }
@@ -42,7 +40,19 @@ const char *mm_profile(void) { return MM_PROFILE_NAME; }
 
 // --- Modes -----------------------------------------------------------------
 
-mm_mode_t mm_get_mode(void) { return g_arena.mode; }
+// What mm_set_mode was last told, and what an arena created from now on starts
+// in. A thread created an hour after the shim selected MM_MODE_LIBC must not
+// get an arena that claims a payload checksum nobody is maintaining.
+static mm_mode_t g_mode_default = MM_MODE_MANAGED;
+
+mm_mode_t mm_mode_default(void) { return g_mode_default; }
+
+mm_mode_t mm_get_mode(void) {
+  mm_arena *a = mm_enter();
+  mm_mode_t m = a->mode;
+  mm_leave(a);
+  return m;
+}
 
 // Whether a payload checksum is being kept up to date at all. Two things have
 // to hold: the profile must carry the field, and the mode must be one where
@@ -80,13 +90,24 @@ static void forget_payload_crcs(void) {
 }
 #endif
 
+// Every arena, one at a time. The mode is a statement about how the program
+// reaches its memory -- through mm_read and mm_write, or through raw pointers
+// -- and that is not a thing one thread can have a different answer to.
 void mm_set_mode(mm_mode_t mode) {
   if (mode != MM_MODE_MANAGED && mode != MM_MODE_LIBC) return;
-  if (g_arena.mode == mode) return;
-  g_arena.mode = mode;
+  g_mode_default = mode;
+  for (mm_arena *a = mm_arena_first(); a != NULL; a = mm_arena_next(a)) {
+    mm_guard g = mm_enter_arena(a);
+    if (a->mode != mode) {
+      a->mode = mode;
 #if MM_HAS_CRC
-  if (mode == MM_MODE_LIBC && mm_arena_live()) forget_payload_crcs();
+      // Inside the lock, and it has to be: this rewrites the header of every
+      // block in the arena.
+      if (mode == MM_MODE_LIBC && mm_arena_live()) forget_payload_crcs();
 #endif
+    }
+    mm_leave_for(g);
+  }
 }
 
 size_t mm_metadata_overhead(void) { return MM_HDR_SIZE + MM_TRAIL; }
@@ -588,14 +609,20 @@ mm_block *mm_recover_next(mm_block *owner) {
 #define MM_SCRUB_INTERVAL_DEFAULT ((size_t)1024)
 #define MM_SCRUB_BUDGET_DEFAULT ((size_t)16)
 
+// Configuration, not state: how often the patrol runs and how much it does.
+// Deliberately not in the arena -- it is a property of how the program wants
+// the allocator tuned, not of any one arena's contents -- and deliberately set
+// before threads exist. How overdue a patrol is *is* arena state, and lives in
+// mm_arena.ops_since_scrub.
 static size_t g_scrub_interval = MM_SCRUB_INTERVAL_DEFAULT;
 static size_t g_scrub_budget = MM_SCRUB_BUDGET_DEFAULT;
-static size_t g_ops_since_scrub;
 
 void mm_set_scrub_interval(size_t ops, size_t budget_blocks) {
+  mm_arena *a = mm_enter();
   g_scrub_interval = ops;
   g_scrub_budget = budget_blocks == 0 ? MM_SCRUB_BUDGET_DEFAULT : budget_blocks;
-  g_ops_since_scrub = 0;
+  a->ops_since_scrub = 0;
+  mm_leave(a);
 }
 
 void mm_scrub_forget(uint8_t *from, uint8_t *to) {
@@ -746,26 +773,34 @@ void mm_scrub_tick(void) {
   // against it whether or not the patrol is running at all.
   g_arena.ops++;
   if (g_scrub_interval == 0 || !mm_arena_live()) return;
-  if (++g_ops_since_scrub < g_scrub_interval) return;
-  g_ops_since_scrub = 0;
+  if (++g_arena.ops_since_scrub < g_scrub_interval) return;
+  g_arena.ops_since_scrub = 0;
   (void)scrub_run(g_scrub_budget);
 }
 
 mm_status_t mm_scrub(size_t budget_blocks) {
   mm_clear_error();
-  if (!mm_arena_live()) return mm_fail(MM_ERR_NOT_INITIALIZED);
-  return scrub_run(budget_blocks);
+  mm_arena *a = mm_enter();
+  mm_status_t s = mm_arena_live() ? scrub_run(budget_blocks)
+                                  : mm_fail(MM_ERR_NOT_INITIALIZED);
+  mm_leave(a);
+  return s;
 }
 
 // --- Pointer recovery ------------------------------------------------------
 
 bool mm_owns(const void *ptr) {
+  // No lock, and none is needed: the span registry answers this without
+  // dereferencing the caller's pointer and without reading any arena's state.
+  // Taking a lock here would put one on the path of every free the shim sees,
+  // including the ones for pointers that turn out not to be ours at all.
+  //
   // Deliberately the whole of the test, and deliberately silent. Anything
   // inside one of our spans is ours to deal with, block start or not: a shim
   // that handed a pointer from its own arena to the system free() because it
   // was not quite where a block should begin would have turned a report into
   // an abort inside somebody else's allocator.
-  return ptr != NULL && mm_span_of(ptr) != NULL;
+  return mm_owner_of(ptr) != NULL;
 }
 
 mm_block *mm_block_of(const void *ptr) {
@@ -800,9 +835,24 @@ mm_block *mm_block_of(const void *ptr) {
 }
 
 // --- Public checks ---------------------------------------------------------
+//
+// Read-only, and still inside the lock. A consistency check that raced with an
+// allocation would read a control word and a checksum mid-update and report
+// MM_ERR_CORRUPT_HEADER -- which is precisely the answer nobody could tell
+// apart from a real one.
+
+static mm_status_t verify_unlocked(const void *ptr);
+static mm_status_t check_heap_unlocked(void);
 
 mm_status_t mm_verify(const void *ptr) {
   mm_clear_error();
+  mm_guard g = mm_enter_for(ptr);
+  mm_status_t s = verify_unlocked(ptr);
+  mm_leave_for(g);
+  return s;
+}
+
+static mm_status_t verify_unlocked(const void *ptr) {
   mm_block *b = mm_block_of(ptr);
   if (b == NULL) return mm_last_error();
 
@@ -826,8 +876,30 @@ mm_status_t mm_verify(const void *ptr) {
   return MM_OK;
 }
 
+// Every arena, one lock at a time. Holding them all at once would be the only
+// way to get a single instant's answer for the whole process, and an allocator
+// has no order to take them in -- so this is a walk, and what it reports is the
+// first arena that was inconsistent when it was looked at.
 mm_status_t mm_check_heap(void) {
   mm_clear_error();
+  bool any = false;
+  for (mm_arena *a = mm_arena_first(); a != NULL; a = mm_arena_next(a)) {
+    mm_guard g = mm_enter_arena(a);
+    // An arena holding nothing is skipped rather than reported. A thread that
+    // has gone leaves one behind, and mm_init empties every one of them, so
+    // there are usually several -- and "this arena has no memory in it" is not
+    // a thing that can be inconsistent. MM_ERR_NOT_INITIALIZED is reserved for
+    // the case it means: no arena anywhere has any memory.
+    bool live = mm_arena_live();
+    mm_status_t s = live ? check_heap_unlocked() : MM_OK;
+    mm_leave_for(g);
+    any = any || live;
+    if (s != MM_OK) return s;
+  }
+  return any ? MM_OK : mm_fail(MM_ERR_NOT_INITIALIZED);
+}
+
+static mm_status_t check_heap_unlocked(void) {
   if (!mm_arena_live()) return mm_fail(MM_ERR_NOT_INITIALIZED);
 
   size_t lost = 0;

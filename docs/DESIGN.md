@@ -118,13 +118,15 @@ src/mm_freelist.{h,c}      bin indexing, the 128-bit bitmap, hardened unlink
 src/mm_internal.h          arena state, spans, constants, internal declarations
 src/mm_arena.{h,c}         where memory comes from: providers, chunk growth,
                            the span registry, MADV_DONTNEED
+src/mm_lock.{h,c}          the locking strategy, per-thread arenas, and the
+                           queue a free uses when it crosses between them
 src/mm_core.c              init, malloc, free, realloc, memalign, split,
                            coalesce
 src/mm_integrity.c         checksums, canary, validation, recovery, quarantine,
                            modes, mm_check_heap, mm_scrub
 src/mm_access.c            mm_read / mm_write
 src/mm_crc32.{h,c}         CRC32C: runtime SSE4.2 dispatch, table fallback
-src/mm_stats.c             counters, compiled out unless MM_STATS
+src/mm_stats.c             per-arena counters, compiled out unless MM_STATS
 
 shim/mm_shim.c             the LD_PRELOAD malloc family -- Unix only
 ```
@@ -133,6 +135,13 @@ Everything that knows how a block is shaped lives in `mm_layout.h`, and the
 rest of the allocator is written against its accessors. That is what makes the
 integrity profile a compile-time choice rather than a fork of the allocator:
 `-DMARS_PROFILE=fast|hardened|paranoid` changes one header and nothing else.
+
+A build is configured along three axes that are orthogonal to each other and to
+everything above: `MARS_PROFILE` selects how much integrity metadata a block
+carries, `MARS_STATS` whether the counters exist, and `MARS_LOCK` which of the
+three locking strategies is compiled in. Each one is a compile-time choice
+because each one changes a structure layout, and a program linking against a
+library built with a different answer would be reading it at the wrong offsets.
 
 There are two ways to install an arena, and they are alternatives rather than
 layers. `mm_init` takes a caller-supplied buffer, zeroes it once so that a
@@ -165,8 +174,8 @@ and trimming both ends. The alignment is the whole design, and it buys one
 thing: the span a pointer belongs to is identified by
 `(uintptr_t)p >> 21`, spending **zero header bits**. There are none to spend —
 every field in the control word is load-bearing and the whole word is
-checksummed — and a per-thread arena, which is what the next phase needs, has
-exactly the same question to answer.
+checksummed — and a per-thread arena has exactly the same question to answer,
+which is what the section on threads below spends that alignment on.
 
 The shift produces the key; a small open-addressed table maps it to a span.
 Dereferencing `p & ~(CHUNK-1)` directly would be a byte cheaper and unsafe: the
@@ -186,6 +195,170 @@ chunks are kept and reused -- churning mappings for ordinary allocations would
 trade a free-list operation for two syscalls and a storm of page faults -- and
 what they hand back instead is the resident pages of a large enough free run,
 through `MADV_DONTNEED`.
+
+## Threads: one arena each, and the two curves that argued for it
+
+### What makes this allocator's threading problem its own
+
+The usual reason an allocator needs a lock is that two threads would corrupt one
+free list. That is true here too, and it is not the interesting part.
+
+The interesting part is that this allocator's metadata is **in band and
+checksummed**. Freeing a block writes `PREV_IN_USE` into the header of the block
+after it, and allocating one does the same — so a thread working in its own
+memory writes into the headers of blocks *other* threads are holding. Each of
+those writes is a control word and a CRC that have to move together. A reader
+racing with one does not see a torn size; it sees a word and a checksum that
+disagree, and this allocator's answer to that is `MM_ERR_CORRUPT_HEADER`.
+
+So a race here does not make the allocator slightly wrong. It makes it **report
+corruption that never happened**, which is the one failure a fault-tolerant
+allocator cannot have — every other claim in this repository is a claim about
+believing its own reports. That is why the rule is stated as it is:
+
+> A block's metadata is only ever touched under its own arena's lock.
+
+and why the read-only entry points are inside the lock as well. `mm_verify` and
+`mm_check_heap` are exactly the calls a racing header would lie to.
+
+### Step one: one lock, and the curve it produced
+
+`MARS_LOCK=global` wraps every public entry point in a single mutex. It is
+correct, it is about fifteen lines, and it is the control everything after it
+had to beat. [RESULTS.md](RESULTS.md) has the measurement, and it is worse than
+"flat": on both multithreaded workloads, *total* throughput at 8 threads is
+below what one thread achieves on its own. Contention is only half of that — the
+other half is that every thread is reading and writing the same bins, the same
+bitmap and the same counters, so each acquisition also pays for cache lines that
+have been invalidated by whoever held the lock last.
+
+The glibc column in the same table is what makes that a statement about the
+allocator rather than about the benchmark: on the same machine, the same
+workload and the same harness, glibc's own throughput climbs.
+
+That curve is kept, and `MARS_LOCK=global` is kept buildable and tested, because
+a design justified against a measured alternative is worth more than one
+asserted — and because it is the configuration a caller-supplied arena falls
+back to anyway. See below.
+
+### Step two: one arena per thread
+
+`MARS_LOCK=arena`, the default, is four pieces.
+
+**A thread-local arena pointer.** `mm_self` names the arena the calling thread
+works in, and every function in the allocator is still written against `g_arena`
+— which is a macro for `*mm_self` under this strategy and for the one static
+arena under the others. That is what kept the change out of the allocation path:
+`mm_malloc` is the same function it was, working in whichever arena the thread
+that called it has. It is declared `initial-exec`, so reading it is one load off
+`%fs` rather than a call into `__tls_get_addr`; a preload library is loaded at
+program start, which is what makes that model available.
+
+**Ownership through the span registry, not through the address.** The obvious
+answer is `arena = (mm_arena *)((uintptr_t)hdr & ~(CHUNK - 1))` — the 2 MB
+alignment makes it a single instruction. It is also a dereference of memory
+chosen by the caller, and this allocator is handed pointers it never produced on
+every `free` the shim sees: a program may free something it obtained before the
+shim was loaded, and the 2 MB-aligned address below such a pointer need not be
+mapped at all. That instruction would be a segfault inside `free`, which is the
+worst place there is to have one.
+
+So the shift still makes the key and the key still costs zero header bits, but
+it indexes the open-addressed table of spans this allocator mapped itself, and
+the span says which arena owns it. A miss is a foreign pointer and costs one
+probe. The table's readers take **no lock** — a reader-writer lock there would
+put an atomic read-modify-write on one shared cache line into every `free` in
+the program, and the table would have become the global lock under another name.
+What makes lock-free reads safe is set out in `src/mm_arena.c`: tables are never
+freed, deletion leaves a tombstone rather than shifting entries a concurrent
+probe has already walked past, and span descriptors now live *outside* the
+mapping they describe so that one released a moment ago is still readable and
+reads as disowned.
+
+**A bounded queue for frees that cross a thread.** When thread B frees a block
+belonging to A's arena, it may not touch that block's metadata — and taking A's
+lock is exactly what per-thread arenas exist to avoid on this path, because a
+producer/consumer program does it to every object it allocates. So the pointer
+goes on A's remote-free queue and A performs the free on its next call, through
+the same `mm_free` it would have used itself, rejections and reports included.
+
+The usual shape for that queue is a stack threaded through the freed blocks
+themselves, pushed with one atomic exchange. **It is the wrong shape here**, and
+for the same reason as everything else on this page: linking a block into a list
+means writing into it, and the pointer being freed might not be a block start at
+all. Eight bytes written through the middle of somebody's payload is precisely
+the damage the rest of this design exists to detect, and validating first would
+need the owner's lock. A bounded ring of *pointers* needs neither: B hands over
+an address and touches nothing. It can fill, and a push that finds it full falls
+back to taking the owner's lock — which is correct, slower, and exactly the
+back-pressure a bounded queue should produce. The owner drains on every call it
+makes, so in practice the ring runs nearly empty.
+
+**A mutex per arena, which is the part that looks like a compromise and is
+not.** The textbook per-thread design has the owning thread take no lock at all.
+That cannot work here, for the reason at the top of this section: a live block
+handed to another thread has its header rewritten by its own arena's ordinary
+traffic, so anything that reads that header — a cross-thread `realloc`,
+`malloc_usable_size`, `mm_verify` — has to be able to exclude the owner. Each
+arena therefore has a lock, and what changed between the two strategies is not
+whether there is one but **who else is waiting on it**. For the owning thread it
+is uncontended, which is two atomic operations and no syscall.
+
+The rule that makes that deadlock-free is worth stating on its own: **at most
+one arena lock is held at a time.** A `realloc` of another thread's block reads
+the old size under the owner's lock, gives the lock back, and only then
+allocates in its own arena and copies. It cannot resize in place — that would
+mean rewriting a neighbour's metadata in an arena it does not own — so a
+cross-arena `realloc` is always allocate, copy, hand back, and the hand-back is
+an ordinary cross-thread free.
+
+### Where per-thread arenas do not apply, and why that is not hidden
+
+An arena over a **caller-supplied buffer cannot be divided**. It is one fixed
+region; there is nothing to give a second thread. So under `MARS_LOCK=arena` a
+program that called `mm_init` gets exactly one arena and every thread contends
+for its lock — which is `MARS_LOCK=global`'s behaviour, arrived at honestly
+rather than a per-thread design quietly not happening. `mm_arena_count()` stays
+at 1 and says so, and the thread-scaling runs use a growable arena for that
+reason: measuring per-thread scaling against a fixed buffer would be measuring
+the fallback.
+
+A growable arena is also what a threaded program actually gets. It is what the
+preload shim installs, and the shim is the only route by which software that was
+not written against this allocator ever reaches it.
+
+### Arenas outlive their threads
+
+A thread that exits with blocks still live does not take them with it. Its arena
+is not destroyed and its memory is not reclaimed — the blocks stay allocated,
+readable, verifiable and freeable by whoever holds them. What happens instead is
+that the arena stops being spoken for and goes into a pool, so the next thread
+that needs one takes it rather than making another; a program that creates
+threads in a loop does not accumulate an arena per thread.
+
+### What is not here
+
+- **No thread cache in front of the bins.** The brief that led to this phase
+  asked for a 32-bin × 8-entry one, and it is the usual next move — but its job
+  is to keep a thread off a lock it would otherwise contend, and after step two
+  each thread's bins are already its own and its lock is already uncontended.
+  What is left for a cache to remove is a handful of pointer operations, not
+  contention, and it would cost something real: a cached block is allocated as
+  far as the tiling is concerned but owned by nobody, which is the shape of a
+  quarantined block and would have to be excluded from `live_blocks`, from the
+  utilisation figures, and from what `mm_check_heap` reconciles. That is a
+  measurable amount of accounting to buy an unmeasured win, so it is not here.
+- **One window that per-arena locking does not close.** A lookup for an address
+  *inside a mapping this allocator has just released* can still be holding that
+  span when the memory goes. Reaching it requires a pointer into memory that has
+  already been freed — a use-after-free in the caller, the same program error
+  that makes glibc abort — and closing it would mean deferring every unmap until
+  every thread had been observed to leave the allocator. `src/mm_arena.c` names
+  it rather than implying it is impossible.
+- **The shim's start-up and its fault-injection hook are still
+  single-threaded.** Both run before a program has had a chance to create a
+  thread, or are a diagnostic pointed at one program at a time. `shim/mm_shim.c`
+  says which is which.
 
 ## The block, per profile
 
@@ -308,6 +481,14 @@ checks all of them, and the differential fuzzer runs it continuously.
 - **`mm_last_error` is reset on entry, never on the way out.** A call that
   succeeds after stepping over corruption still reports what it saw, and the
   patrol never clears it.
+- **A block's metadata is only touched under its own arena's lock.** Not just
+  the writes: the reads too, because the thing a race produces here is a control
+  word and a checksum that disagree, and that is indistinguishable from real
+  corruption. `mm_last_error` is already `_Thread_local`, so what a thread saw
+  stays that thread's.
+- **At most one arena lock is held at a time.** That is the entire deadlock
+  argument, and it is why a cross-arena `realloc` reads the old size under the
+  owner's lock, gives it back, and only then allocates in its own arena.
 
 ## Threat model
 
@@ -407,18 +588,21 @@ offer it is with the price on the label.
 
 ## What this is not
 
-- **Not thread-safe, and that now matters more than it did.** There is no lock
-  and no per-thread cache, and the `LD_PRELOAD` shim has neither. Preloading it
-  into a threaded program will corrupt that program's heap; the shim interposes
-  `pthread_create` solely to say so on stderr the first time, because the
-  alternative is a mysterious crash inside the program under test with nothing
-  pointing at the allocator. Per-thread arenas are the next phase, and the
-  chunk alignment described above is the groundwork for them. None of the
-  published numbers say anything about behaviour under concurrency.
+- **Not a per-thread cache in front of the free lists.** That is what glibc has
+  and this does not, and it is a large part of why glibc's absolute throughput
+  is what it is. The section above says why one was not added here: after
+  per-thread arenas there is no contention left for it to remove, and a cached
+  block is one the tiling calls allocated and nobody owns, which every
+  accounting invariant in this document would then have to make an exception
+  for.
+- **Not free of a lock, even on the thread that owns the arena.** The in-band
+  checksummed metadata is why, and the price is measured rather than assumed:
+  [RESULTS.md](RESULTS.md) has what an uncontended mutex costs a program with
+  one thread.
 - Not a *complete* `malloc` replacement. The shim exports the whole family and
-  runs `git`, a Python interpreter and a compiler correctly, but it is
-  single-threaded, Unix-only, and has no equivalent of glibc's per-size caching
-  — which is visible in the numbers: see the small-`calloc` row in
+  runs `git`, a Python interpreter and a compiler correctly under threads, but
+  it is Unix-only and has no equivalent of glibc's per-size caching — which is
+  visible in the numbers: see the small-`calloc` row in
   [RESULTS.md](RESULTS.md).
 - Not radiation hardening. Real hardening is ECC memory, redundant hardware and
   physical shielding. Nothing in software stops a bit flipping — this can only

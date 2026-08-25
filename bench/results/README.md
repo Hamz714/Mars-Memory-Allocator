@@ -31,6 +31,8 @@ is `$(git rev-parse --short HEAD)`.
 | `bench-hardened.csv` | `gcc-release` | the same, default profile | as above |
 | `bench-paranoid.csv` | `gcc-paranoid` | the same, tail mirror | as above |
 | `bench-hardened-nostats.csv` | `gcc-nostats` | the same again with `MARS_STATS` off, to price the counters | as above |
+| `bench-hardened-nolock.csv` | `gcc-nolock` | and again with `MARS_LOCK` off, to price the lock | as above |
+| `bench-hardened-repeat.csv` | `gcc-release` | **the same build as `bench-hardened.csv`, run again minutes later.** The machine's own run-to-run movement, which is what the two comparisons above are judged against | as above |
 | `preload-fast.csv` | `gcc-fast` | Wall time of nine real programs under `LD_PRELOAD`, against the same programs on glibc | `taskset -c 2 python3 tools/preload_bench.py --preload build/gcc-fast/bin/libmars_preload.so --probe build/gcc-fast/bin/calloc_probe --profile fast --reps 11 --git-sha SHA --out FILE` |
 | `preload-hardened.csv` | `gcc-release` | the same, default profile | as above, with `gcc-release` and `--profile hardened` |
 | `preload-paranoid.csv` | `gcc-paranoid` | the same, tail mirror | as above, with `gcc-paranoid` and `--profile paranoid` |
@@ -40,6 +42,24 @@ is `$(git rev-parse --short HEAD)`.
 | `scrub-fast.csv` | `gcc-fast` | Detection rate and detection latency against the scrub interval | `for s in 1 256 1024 4096 off; do faultinject --trials 2000 --bits 1,2 --scrub-interval $s --git-sha SHA --csv FILE; done` |
 | `scrub-hardened.csv` | `gcc-release` | the same | as above |
 | `scrub-paranoid.csv` | `gcc-paranoid` | the same | as above |
+| `threads-arena.csv` | `gcc-release` | Total throughput of `mt_churn` and `producer_consumer` at 1, 2, 4 and 8 threads, mars against glibc, with one arena per thread | `bench_mt --ops 200000 --reps 11 --threads 1,2,4,8 --git-sha SHA --out FILE` |
+| `threads-global.csv` | `gcc-lock-global` | the same, with one mutex around every entry point instead | as above |
+
+**The four `bench-hardened*` files were taken in one alternating pass**, in the
+order `hardened`, `nostats`, `nolock`, `hardened` again — not one after another
+in whatever order was convenient. The counter and lock tables in
+`docs/RESULTS.md` are the only comparisons in this directory that hold two
+*different builds* against each other, and they are the ones a drifting machine
+can invent a result for. Running them minutes apart inside one window, and
+running the first build a second time at the end of it, is what makes the
+difference between them checkable against the instrument's own error.
+
+**That error is larger than it looks.** Two runs of identical code, on an idle
+pinned core, differ by up to 43% on this machine — `bench-hardened-repeat.csv`
+is that measurement, and `docs/RESULTS.md` prints it as a column beside every
+build-to-build comparison. The inter-quartile range of a single run is *not*
+the same quantity and is several times smaller: eleven repetitions inside one
+process agree far more closely than two processes minutes apart do.
 
 The benchmark writes one row per repetition and does not aggregate. That is
 deliberate: raw repetitions are what let a reader see the variance rather than
@@ -50,6 +70,57 @@ trust a single figure, and it means the median and the inter-quartile range in
 only when creating it, which is what lets the five scrub intervals accumulate
 into one table. The scrub interval is a per-row column rather than a header
 field for exactly that reason.
+
+**The `faults-*.csv` files are not re-measured when they do not change, and
+whether they change is checked rather than assumed.** Every trial is seeded and
+forked, so the matrix is deterministic: re-running it against new code either
+reproduces the committed file byte for byte or it does not, and which of those
+happened is a result in itself. The three matrices here were re-run after
+per-thread arenas landed and came back identical, which is the evidence that
+nothing about detection moved — a claim that would otherwise have rested on
+somebody's reading of the diff.
+
+## Reading the `threads-*.csv` files
+
+These are the only files here that are a **curve** rather than a set of
+independent cells, and they are read down a column rather than across. `ops` is
+the total across all threads and scales with the thread count by construction —
+each thread performs `ops_per_thread` timed operations whatever T is — so
+`ops_per_sec` is total throughput and an allocator that scales perfectly makes
+it a straight line. What matters is that shape, not any single row.
+
+One file per **locking strategy**, which is the variable the whole set exists to
+compare. It is in the `# lock=` header field — which every file in this
+directory now carries — as well as in a per-row column, so that two files
+cannot be confused for each other. `MARS_LOCK` is a CMake option; the benchmark
+records what the library it was linked against was actually built with, not
+what anyone intended.
+
+**Taken without `taskset`**, unlike everything else in this directory. Pinning a
+thread-scaling run to one core would measure the scheduler. The machine has
+**4 physical cores and 8 hardware threads**, so the 8-thread rows put two
+threads on a core and cannot double the 4-thread rows even for code that scales
+perfectly — the 1→4 part of each column is the part that is about the
+allocator.
+
+`mars` is driven through a **growable** arena here rather than a
+caller-supplied buffer, which is recorded in the `# arena=growable` header
+field. A fixed buffer is one region and cannot be divided between threads, so
+measuring per-thread scaling against one would measure the fallback rather than
+the design. Under a global lock the two are the same, which is what keeps the
+files comparable across strategies.
+
+The glibc columns are a scale rather than a target: glibc has a per-thread
+cache in front of its free lists and does no integrity checking at all. Its
+*speedup* column is the useful part — it says what this machine and this
+workload are capable of, which is what makes a flat column beside it a
+statement about the allocator rather than about the benchmark. Its
+`producer_consumer` row is worth reading too: it does not scale cleanly either,
+because cross-thread frees cost glibc something as well.
+
+`alloc_failures` counts allocations that came back NULL. It is zero in every
+committed row; anything else means the arena ran out and the row is measuring
+exhaustion rather than throughput.
 
 ## Reading the `preload-*.csv` files
 
