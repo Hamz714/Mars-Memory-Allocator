@@ -87,6 +87,8 @@ def csv_candidates():
         report.RESULTS / "bench-hardened-nostats.csv")
     matrices = {p: report.load("faults", p) for p in report.PROFILES}
     sweeps = {p: report.load("scrub", p) for p in report.PROFILES}
+    curves = {k: report.load("threads", k, required=False)
+              for k in report.LOCKS}
 
     # Raw cells, from every file in the directory including the earlier
     # reference runs -- a number lifted straight out of a CSV is traceable
@@ -154,6 +156,35 @@ def csv_candidates():
                                if r["workload"] == wl and r["allocator"] == "mars"])
             if a:
                 add(100.0 * (b - a) / a)
+
+    # Thread scaling, aggregated as RESULTS.md aggregates it: the median of
+    # each cell, and the two ratios a reader would quote from the table -- the
+    # speedup against that allocator's own one-thread row, and mars against
+    # glibc at the same thread count.
+    for _, rows in curves.values():
+        if not rows:
+            continue
+        for wl in report.workloads(rows):
+            base = {al: report.median(report.at(rows, wl, al, 1))
+                    for al in ("mars", "system")}
+            for th in report.thread_counts(rows):
+                per = {}
+                for al in ("mars", "system"):
+                    for col in ("ops_per_sec", "ops_per_sec_per_thread",
+                                "p50_ns", "p99_ns", "mean_ns"):
+                        vals = report.at(rows, wl, al, th, col)
+                        add(report.median(vals))
+                        add(report.iqr(vals))
+                        add(report.iqr(vals) / 2)
+                    per[al] = report.median(report.at(rows, wl, al, th))
+                    if base[al]:
+                        add(per[al] / base[al])
+                        add(base[al] / per[al])
+                if per["system"]:
+                    add(per["mars"] / per["system"])
+                if per["mars"]:
+                    add(per["system"] / per["mars"])
+        add(len(report.thread_counts(rows)))
 
     # Fault injection: per target, per profile, and the totals across all of
     # them -- which is the headline the README is most likely to quote.

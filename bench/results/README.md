@@ -40,6 +40,7 @@ is `$(git rev-parse --short HEAD)`.
 | `scrub-fast.csv` | `gcc-fast` | Detection rate and detection latency against the scrub interval | `for s in 1 256 1024 4096 off; do faultinject --trials 2000 --bits 1,2 --scrub-interval $s --git-sha SHA --csv FILE; done` |
 | `scrub-hardened.csv` | `gcc-release` | the same | as above |
 | `scrub-paranoid.csv` | `gcc-paranoid` | the same | as above |
+| `threads-global.csv` | `gcc-release` | Total throughput of `mt_churn` and `producer_consumer` at 1, 2, 4 and 8 threads, mars against glibc, with one mutex around every entry point | `bench_mt --ops 200000 --reps 11 --threads 1,2,4,8 --git-sha SHA --out FILE` |
 
 The benchmark writes one row per repetition and does not aggregate. That is
 deliberate: raw repetitions are what let a reader see the variance rather than
@@ -50,6 +51,47 @@ trust a single figure, and it means the median and the inter-quartile range in
 only when creating it, which is what lets the five scrub intervals accumulate
 into one table. The scrub interval is a per-row column rather than a header
 field for exactly that reason.
+
+## Reading the `threads-*.csv` files
+
+These are the only files here that are a **curve** rather than a set of
+independent cells, and they are read down a column rather than across. `ops` is
+the total across all threads and scales with the thread count by construction —
+each thread performs `ops_per_thread` timed operations whatever T is — so
+`ops_per_sec` is total throughput and an allocator that scales perfectly makes
+it a straight line. What matters is that shape, not any single row.
+
+One file per **locking strategy**, which is the variable the whole set exists to
+compare, and it is in the `# lock=` header field as well as in a per-row column
+so that two files cannot be confused for each other. `MARS_LOCK` is a CMake
+option; `bench_mt` records what the library it was linked against was built
+with, not what anyone intended.
+
+**Taken without `taskset`**, unlike everything else in this directory. Pinning a
+thread-scaling run to one core would measure the scheduler. The machine has
+**4 physical cores and 8 hardware threads**, so the 8-thread rows put two
+threads on a core and cannot double the 4-thread rows even for code that scales
+perfectly — the 1→4 part of each column is the part that is about the
+allocator.
+
+`mars` is driven through a **growable** arena here rather than a
+caller-supplied buffer, which is recorded in the `# arena=growable` header
+field. A fixed buffer is one region and cannot be divided between threads, so
+measuring per-thread scaling against one would measure the fallback rather than
+the design. Under a global lock the two are the same, which is what keeps the
+files comparable across strategies.
+
+The glibc columns are a scale rather than a target: glibc has a per-thread
+cache in front of its free lists and does no integrity checking at all. Its
+*speedup* column is the useful part — it says what this machine and this
+workload are capable of, which is what makes a flat column beside it a
+statement about the allocator rather than about the benchmark. Its
+`producer_consumer` row is worth reading too: it does not scale cleanly either,
+because cross-thread frees cost glibc something as well.
+
+`alloc_failures` counts allocations that came back NULL. It is zero in every
+committed row; anything else means the arena ran out and the row is measuring
+exhaustion rather than throughput.
 
 ## Reading the `preload-*.csv` files
 

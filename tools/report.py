@@ -18,6 +18,8 @@ that goes stale:
   preload-<profile>.csv          wall time of real programs under LD_PRELOAD
   faults-<profile>.csv           the full target x bits matrix
   scrub-<profile>.csv            the same targets swept over scrub intervals
+  threads-<lock>.csv             total throughput against the thread count,
+                                 one file per locking strategy
 
 No charts. GitHub strips inline SVG out of rendered Markdown, so a chart here
 would be an asset that only renders locally -- and an external asset file is
@@ -36,6 +38,28 @@ RESULTS = REPO / "bench" / "results"
 OUT = REPO / "docs" / "RESULTS.md"
 
 PROFILES = ["fast", "hardened", "paranoid"]
+
+# Locking strategies, in the order the design arrived at them. The thread
+# scaling section is a comparison between them, so the order is the argument.
+LOCKS = ["global", "arena"]
+
+LOCK_BLURB = {
+    "global": "One mutex around every public entry point. Correct under "
+              "threads, and the control anything that follows it has to be "
+              "measured against.",
+    "arena": "One arena per thread, each with its own lock, and a lock-free "
+             "stack for frees that cross a thread boundary.",
+}
+
+MT_BLURB = {
+    "mt_churn": "T independent copies of the `churn` workload, sharing "
+                "nothing. Anything that fails to scale here is the allocator "
+                "rather than the workload.",
+    "producer_consumer": "Half the threads allocate and enqueue, half dequeue "
+                         "and free, so **every block is freed by a thread that "
+                         "did not allocate it**. This is the case a per-thread "
+                         "arena has to answer for.",
+}
 
 # The order the fault injector emits, kept so a table reads the same way the
 # tool's own output does.
@@ -416,6 +440,71 @@ def scrub(o, sweeps):
               f"these numbers rather than gating them.\n")
 
 
+def thread_counts(rows):
+    return sorted({int(r["threads"]) for r in rows})
+
+
+def at(rows, workload, allocator, threads, column="ops_per_sec"):
+    """Every repetition of one cell of the scaling curve."""
+    return [float(r[column]) for r in rows
+            if r["workload"] == workload and r["allocator"] == allocator
+            and int(r["threads"]) == threads]
+
+
+def thread_scaling(o, curves):
+    """How throughput moves with the thread count, one table per strategy.
+
+    The one section here that is a *curve* rather than a set of independent
+    cells, and it is read down a column rather than across: what matters is not
+    what any single row says but whether the column climbs. Speedup is measured
+    against that same allocator's own one-thread row and never against glibc's,
+    because what is being compared is a configuration with itself under load."""
+    if not any(rows for _, rows in curves.values()):
+        return
+
+    o("\n## Thread scaling\n")
+    o("T threads doing T times the work, so an allocator that scales perfectly "
+      "draws a straight line in total throughput and one that serialises "
+      "completely draws a flat one. Median of the repetitions; `speedup` is "
+      "against the same allocator's own one-thread row.\n")
+    o("**This machine has 4 physical cores and 8 hardware threads**, so the "
+      "8-thread row is two threads to a core and would not double the 4-thread "
+      "row even for code that scales perfectly. The 1→4 part of each column is "
+      "the part that is about the allocator.\n")
+    o("Unlike every other run in this directory these are taken *without* "
+      "`taskset`: pinning a thread-scaling measurement to one core would "
+      "measure the scheduler instead.\n")
+
+    for lock in LOCKS:
+        _, rows = curves[lock]
+        if not rows:
+            continue
+        o(f"\n### `MARS_LOCK={lock}`\n")
+        o(f"{LOCK_BLURB[lock]}\n")
+        for wl in workloads(rows):
+            o(f"\n**`{wl}`** — {MT_BLURB.get(wl, '')}\n")
+            o("| Threads | mars ops/s | speedup | mars p50 | glibc ops/s | "
+              "speedup | mars / glibc |")
+            o("|---:|---:|---:|---:|---:|---:|---:|")
+            base = {al: median(at(rows, wl, al, 1))
+                    for al in ("mars", "system")}
+            for t in thread_counts(rows):
+                ours = median(at(rows, wl, "mars", t))
+                theirs = median(at(rows, wl, "system", t))
+                p50 = median(at(rows, wl, "mars", t, "p50_ns"))
+                ratio = ours / theirs if theirs else float("nan")
+                o(f"| {t} | {si(ours)} | {ours / base['mars']:.2f}× | "
+                  f"{p50:,.0f} ns | {si(theirs)} | "
+                  f"{theirs / base['system']:.2f}× | {ratio:.3f}× |")
+
+    o("\nThe glibc columns are a scale rather than a target. glibc keeps a "
+      "per-thread cache in front of its free lists and does no integrity "
+      "checking at all, so its absolute figures say little about this "
+      "allocator — but its *speedup* column says what this machine and this "
+      "workload are capable of, and that is what makes a flat column beside it "
+      "a statement about the allocator rather than about the benchmark.\n")
+
+
 def preload(o, preloads):
     """Wall time of real programs, this allocator against glibc.
 
@@ -534,6 +623,10 @@ def build():
     # platform that cannot build it has no such file and the section is simply
     # absent rather than the report refusing to generate.
     preloads = {p: load("preload", p, required=False) for p in PROFILES}
+    # One file per locking strategy. A strategy that has not been measured is
+    # simply absent rather than an error, which is what lets the global lock's
+    # curve be published before there is a second curve to compare it with.
+    curves = {k: load("threads", k, required=False) for k in LOCKS}
 
     o("# Results\n")
     o("Generated by `tools/report.py` from the CSVs in "
@@ -550,6 +643,7 @@ def build():
     latency(o, benches)
     space(o, benches)
     counters(o, benches, nostats)
+    thread_scaling(o, curves)
     preload(o, preloads)
     faults(o, matrices)
     scrub(o, sweeps)

@@ -101,6 +101,41 @@ A positive figure is throughput the counters cost; a negative one is the build w
 So the counters are not free: on the allocation-heavy workloads they cost something this machine can actually resolve. On the rest, the honest statement is that the cost is below what it can measure — not that there is none.
 
 
+## Thread scaling
+
+T threads doing T times the work, so an allocator that scales perfectly draws a straight line in total throughput and one that serialises completely draws a flat one. Median of the repetitions; `speedup` is against the same allocator's own one-thread row.
+
+**This machine has 4 physical cores and 8 hardware threads**, so the 8-thread row is two threads to a core and would not double the 4-thread row even for code that scales perfectly. The 1→4 part of each column is the part that is about the allocator.
+
+Unlike every other run in this directory these are taken *without* `taskset`: pinning a thread-scaling measurement to one core would measure the scheduler instead.
+
+
+### `MARS_LOCK=global`
+
+One mutex around every public entry point. Correct under threads, and the control anything that follows it has to be measured against.
+
+
+**`mt_churn`** — T independent copies of the `churn` workload, sharing nothing. Anything that fails to scale here is the allocator rather than the workload.
+
+| Threads | mars ops/s | speedup | mars p50 | glibc ops/s | speedup | mars / glibc |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 6,229,181 | 1.00× | 100 ns | 18,788,529 | 1.00× | 0.332× |
+| 2 | 2,985,730 | 0.48× | 159 ns | 27,255,084 | 1.45× | 0.110× |
+| 4 | 1,769,886 | 0.28× | 323 ns | 39,152,787 | 2.08× | 0.045× |
+| 8 | 915,769 | 0.15× | 813 ns | 63,085,366 | 3.36× | 0.015× |
+
+**`producer_consumer`** — Half the threads allocate and enqueue, half dequeue and free, so **every block is freed by a thread that did not allocate it**. This is the case a per-thread arena has to answer for.
+
+| Threads | mars ops/s | speedup | mars p50 | glibc ops/s | speedup | mars / glibc |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 4,465,428 | 1.00× | 140 ns | 16,278,043 | 1.00× | 0.274× |
+| 2 | 1,842,896 | 0.41× | 186 ns | 5,406,183 | 0.33× | 0.341× |
+| 4 | 1,344,288 | 0.30× | 388 ns | 8,579,298 | 0.53× | 0.157× |
+| 8 | 952,472 | 0.21× | 848 ns | 14,709,794 | 0.90× | 0.065× |
+
+The glibc columns are a scale rather than a target. glibc keeps a per-thread cache in front of its free lists and does no integrity checking at all, so its absolute figures say little about this allocator — but its *speedup* column says what this machine and this workload are capable of, and that is what makes a flat column beside it a statement about the allocator rather than about the benchmark.
+
+
 ## Real programs under LD_PRELOAD
 
 Wall time of a whole process, median of the repetitions, with the inter-quartile range beside it. `LD_PRELOAD=libmars_preload.so` against the same program with the system allocator, alternating repetition by repetition so that a machine drifting during the run does not land on one of them.
