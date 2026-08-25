@@ -6,8 +6,6 @@
 
 #include "mm_arena.h"
 
-mm_arena g_arena;
-
 static _Thread_local mm_status_t g_last_error = MM_OK;
 
 mm_status_t mm_last_error(void) { return g_last_error; }
@@ -42,7 +40,12 @@ const char *mm_profile(void) { return MM_PROFILE_NAME; }
 
 // --- Modes -----------------------------------------------------------------
 
-mm_mode_t mm_get_mode(void) { return g_arena.mode; }
+mm_mode_t mm_get_mode(void) {
+  mm_arena *a = mm_enter();
+  mm_mode_t m = a->mode;
+  mm_leave(a);
+  return m;
+}
 
 // Whether a payload checksum is being kept up to date at all. Two things have
 // to hold: the profile must carry the field, and the mode must be one where
@@ -82,11 +85,16 @@ static void forget_payload_crcs(void) {
 
 void mm_set_mode(mm_mode_t mode) {
   if (mode != MM_MODE_MANAGED && mode != MM_MODE_LIBC) return;
-  if (g_arena.mode == mode) return;
-  g_arena.mode = mode;
+  mm_arena *a = mm_enter();
+  if (a->mode != mode) {
+    a->mode = mode;
 #if MM_HAS_CRC
-  if (mode == MM_MODE_LIBC && mm_arena_live()) forget_payload_crcs();
+    // Inside the lock, and it has to be: this rewrites the header of every
+    // block in the arena.
+    if (mode == MM_MODE_LIBC && mm_arena_live()) forget_payload_crcs();
 #endif
+  }
+  mm_leave(a);
 }
 
 size_t mm_metadata_overhead(void) { return MM_HDR_SIZE + MM_TRAIL; }
@@ -588,14 +596,20 @@ mm_block *mm_recover_next(mm_block *owner) {
 #define MM_SCRUB_INTERVAL_DEFAULT ((size_t)1024)
 #define MM_SCRUB_BUDGET_DEFAULT ((size_t)16)
 
+// Configuration, not state: how often the patrol runs and how much it does.
+// Deliberately not in the arena -- it is a property of how the program wants
+// the allocator tuned, not of any one arena's contents -- and deliberately set
+// before threads exist. How overdue a patrol is *is* arena state, and lives in
+// mm_arena.ops_since_scrub.
 static size_t g_scrub_interval = MM_SCRUB_INTERVAL_DEFAULT;
 static size_t g_scrub_budget = MM_SCRUB_BUDGET_DEFAULT;
-static size_t g_ops_since_scrub;
 
 void mm_set_scrub_interval(size_t ops, size_t budget_blocks) {
+  mm_arena *a = mm_enter();
   g_scrub_interval = ops;
   g_scrub_budget = budget_blocks == 0 ? MM_SCRUB_BUDGET_DEFAULT : budget_blocks;
-  g_ops_since_scrub = 0;
+  a->ops_since_scrub = 0;
+  mm_leave(a);
 }
 
 void mm_scrub_forget(uint8_t *from, uint8_t *to) {
@@ -746,26 +760,37 @@ void mm_scrub_tick(void) {
   // against it whether or not the patrol is running at all.
   g_arena.ops++;
   if (g_scrub_interval == 0 || !mm_arena_live()) return;
-  if (++g_ops_since_scrub < g_scrub_interval) return;
-  g_ops_since_scrub = 0;
+  if (++g_arena.ops_since_scrub < g_scrub_interval) return;
+  g_arena.ops_since_scrub = 0;
   (void)scrub_run(g_scrub_budget);
 }
 
 mm_status_t mm_scrub(size_t budget_blocks) {
   mm_clear_error();
-  if (!mm_arena_live()) return mm_fail(MM_ERR_NOT_INITIALIZED);
-  return scrub_run(budget_blocks);
+  mm_arena *a = mm_enter();
+  mm_status_t s = mm_arena_live() ? scrub_run(budget_blocks)
+                                  : mm_fail(MM_ERR_NOT_INITIALIZED);
+  mm_leave(a);
+  return s;
 }
 
 // --- Pointer recovery ------------------------------------------------------
 
 bool mm_owns(const void *ptr) {
+  if (ptr == NULL) return false;
+  // Inside the lock because the span registry is arena state: a span can be
+  // unmapped by a large free on another thread, and reading the list of them
+  // while that happens is how a question asked to avoid a segfault causes one.
+  //
   // Deliberately the whole of the test, and deliberately silent. Anything
   // inside one of our spans is ours to deal with, block start or not: a shim
   // that handed a pointer from its own arena to the system free() because it
   // was not quite where a block should begin would have turned a report into
   // an abort inside somebody else's allocator.
-  return ptr != NULL && mm_span_of(ptr) != NULL;
+  mm_arena *a = mm_enter();
+  bool ours = mm_span_of(ptr) != NULL;
+  mm_leave(a);
+  return ours;
 }
 
 mm_block *mm_block_of(const void *ptr) {
@@ -800,9 +825,24 @@ mm_block *mm_block_of(const void *ptr) {
 }
 
 // --- Public checks ---------------------------------------------------------
+//
+// Read-only, and still inside the lock. A consistency check that raced with an
+// allocation would read a control word and a checksum mid-update and report
+// MM_ERR_CORRUPT_HEADER -- which is precisely the answer nobody could tell
+// apart from a real one.
+
+static mm_status_t verify_unlocked(const void *ptr);
+static mm_status_t check_heap_unlocked(void);
 
 mm_status_t mm_verify(const void *ptr) {
   mm_clear_error();
+  mm_arena *a = mm_enter();
+  mm_status_t s = verify_unlocked(ptr);
+  mm_leave(a);
+  return s;
+}
+
+static mm_status_t verify_unlocked(const void *ptr) {
   mm_block *b = mm_block_of(ptr);
   if (b == NULL) return mm_last_error();
 
@@ -828,6 +868,13 @@ mm_status_t mm_verify(const void *ptr) {
 
 mm_status_t mm_check_heap(void) {
   mm_clear_error();
+  mm_arena *a = mm_enter();
+  mm_status_t s = check_heap_unlocked();
+  mm_leave(a);
+  return s;
+}
+
+static mm_status_t check_heap_unlocked(void) {
   if (!mm_arena_live()) return mm_fail(MM_ERR_NOT_INITIALIZED);
 
   size_t lost = 0;

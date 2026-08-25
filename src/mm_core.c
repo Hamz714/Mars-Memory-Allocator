@@ -7,6 +7,19 @@
 
 #include "mm_arena.h"
 
+// --- The unlocked forms ----------------------------------------------------
+//
+// Every public entry point below is a wrapper: mm_enter, the work, mm_leave.
+// The work is these, and they exist because realloc and memalign are written
+// in terms of malloc and free -- calling the public forms from inside the lock
+// would take it twice, and a mutex that is not recursive is exactly the right
+// kind for an allocator to have. Making the nesting impossible is better than
+// making it survivable.
+static void *malloc_unlocked(size_t size, size_t *dirty_prefix);
+static void free_unlocked(void *ptr);
+static void *memalign_unlocked(size_t align, size_t size);
+static void *realloc_unlocked(void *ptr, size_t new_size);
+
 size_t mm_alignment(void) { return MM_ALIGNMENT; }
 
 size_t mm_min_arena(void) { return MM_BLOCK_OFFSET + MM_MIN_BLOCK; }
@@ -44,6 +57,11 @@ uint64_t mm_draw_secret(void) {
 
 // --- Initialisation --------------------------------------------------------
 
+// Installing an arena is a lifecycle call, not an allocator call: it discards
+// whatever was there, which is not something that can be made safe against a
+// thread allocating out of it at the same time. The lock is still taken, so
+// that a program which happens to serialise its own start-up correctly is not
+// then betrayed by a half-published arena.
 int mm_init(void *heap, size_t heap_size) {
   mm_clear_error();
   if (heap == NULL || heap_size < mm_min_arena()) {
@@ -54,6 +72,8 @@ int mm_init(void *heap, size_t heap_size) {
     mm_fail(MM_ERR_BAD_ARENA);
     return -1;
   }
+
+  mm_arena *a = mm_enter();
 
   // Whatever was installed before goes back to the operating system here, so
   // that a program which starts with a growable arena and then hands over a
@@ -79,9 +99,11 @@ int mm_init(void *heap, size_t heap_size) {
   // not part of the arena. mm_arena_install_user does that arithmetic and
   // files the space as one free block.
   if (mm_arena_install_user(heap, heap_size) == NULL) {
+    mm_leave(a);
     mm_fail(MM_ERR_BAD_ARENA);
     return -1;
   }
+  mm_leave(a);
   return 0;
 }
 
@@ -330,6 +352,13 @@ static mm_block *grow_for(size_t need) {
 void *mm_malloc(size_t size) { return mm_malloc_fresh(size, NULL); }
 
 void *mm_malloc_fresh(size_t size, size_t *dirty_prefix) {
+  mm_arena *a = mm_enter();
+  void *p = malloc_unlocked(size, dirty_prefix);
+  mm_leave(a);
+  return p;
+}
+
+static void *malloc_unlocked(size_t size, size_t *dirty_prefix) {
   if (dirty_prefix != NULL) *dirty_prefix = SIZE_MAX;
   mm_clear_error();
   if (!mm_arena_live()) {
@@ -422,10 +451,14 @@ void *mm_malloc_fresh(size_t size, size_t *dirty_prefix) {
 
 size_t mm_usable_size(const void *ptr) {
   mm_clear_error();
+  mm_arena *a = mm_enter();
+  size_t n = 0;
   mm_block *b = mm_block_of(ptr);
-  if (b == NULL || !mm_header_ok(b)) return 0;
-  if (!mm_is_used(b) || mm_is_quarantined(b)) return 0;
-  return mm_requested_size(b);
+  if (b != NULL && mm_header_ok(b) && mm_is_used(b) && !mm_is_quarantined(b)) {
+    n = mm_requested_size(b);
+  }
+  mm_leave(a);
+  return n;
 }
 
 // Allocates at an address that is a multiple of `align`.
@@ -443,7 +476,14 @@ size_t mm_usable_size(const void *ptr) {
 // like any other -- free, realloc, the consistency check and coalescing all
 // treat it as one, with no case of their own and no flag to get wrong.
 void *mm_memalign(size_t align, size_t size) {
-  if (align <= MM_ALIGNMENT) return mm_malloc(size);
+  mm_arena *a = mm_enter();
+  void *p = memalign_unlocked(align, size);
+  mm_leave(a);
+  return p;
+}
+
+static void *memalign_unlocked(size_t align, size_t size) {
+  if (align <= MM_ALIGNMENT) return malloc_unlocked(size, NULL);
 
   // Enough slack that an aligned address with room for a whole block in front
   // of it is guaranteed to exist: one alignment step to reach the boundary,
@@ -456,7 +496,7 @@ void *mm_memalign(size_t align, size_t size) {
     return NULL;
   }
 
-  uint8_t *raw = (uint8_t *)mm_malloc(size + pad);
+  uint8_t *raw = (uint8_t *)malloc_unlocked(size + pad, NULL);
   if (raw == NULL) return NULL;
 
   uint8_t *want = (uint8_t *)mm_round_up((uintptr_t)raw, align);
@@ -474,7 +514,7 @@ void *mm_memalign(size_t align, size_t size) {
     // aligned for anything up to MM_ALIGNMENT, so it is released rather than
     // returned: handing back an under-aligned pointer would be worse than
     // failing.
-    mm_free(raw);
+    free_unlocked(raw);
     mm_fail(MM_ERR_NOMEM);
     return NULL;
   }
@@ -540,8 +580,20 @@ static mm_block *live_block(const void *ptr) {
 }
 
 void mm_free(void *ptr) {
+  // Checked before the lock is taken. free(NULL) is legal, common, and does
+  // nothing; making it wait on a mutex would be a cost paid by every program
+  // that frees a null pointer in a loop.
+  if (ptr == NULL) {
+    mm_clear_error();
+    return;
+  }
+  mm_arena *a = mm_enter();
+  free_unlocked(ptr);
+  mm_leave(a);
+}
+
+static void free_unlocked(void *ptr) {
   mm_clear_error();
-  if (ptr == NULL) return;
 
   mm_block *b = live_block(ptr);
   if (b == NULL) return;
@@ -611,11 +663,18 @@ static uint32_t payload_crc_of(const mm_block *b) {
 }
 
 void *mm_realloc(void *ptr, size_t new_size) {
+  mm_arena *a = mm_enter();
+  void *p = realloc_unlocked(ptr, new_size);
+  mm_leave(a);
+  return p;
+}
+
+static void *realloc_unlocked(void *ptr, size_t new_size) {
   mm_clear_error();
-  if (ptr == NULL) return mm_malloc(new_size);
+  if (ptr == NULL) return malloc_unlocked(new_size, NULL);
 
   if (new_size == 0) {
-    mm_free(ptr);
+    free_unlocked(ptr);
     return NULL;
   }
 
@@ -701,7 +760,7 @@ void *mm_realloc(void *ptr, size_t new_size) {
 
   // Fall back to allocate, copy, release. Copy before freeing so a failed
   // allocation leaves the original block untouched.
-  void *fresh = mm_malloc(new_size);
+  void *fresh = malloc_unlocked(new_size, NULL);
   if (fresh == NULL) return NULL;
 
   size_t carry = old_size < new_size ? old_size : new_size;
@@ -713,6 +772,6 @@ void *mm_realloc(void *ptr, size_t new_size) {
     mm_seal(fresh_block);
   }
 
-  mm_free(ptr);
+  free_unlocked(ptr);
   return fresh;
 }

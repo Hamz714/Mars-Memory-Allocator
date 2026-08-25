@@ -11,6 +11,7 @@
 
 #include "mm_freelist.h"
 #include "mm_layout.h"
+#include "mm_lock.h"
 
 // --- Spans -----------------------------------------------------------------
 //
@@ -136,6 +137,23 @@ typedef struct mm_arena {
 
   // Whether payload integrity can be maintained at all. See mm_set_mode.
   mm_mode_t mode;
+
+  // Allocator activity. In the arena rather than a file-static of its own,
+  // because an arena is exactly the scope over which "live blocks" and "peak
+  // occupancy" mean anything -- and because a counter outside the thing the
+  // lock protects is a counter the lock does not protect. Only ever touched
+  // with this arena's lock held.
+  mm_stats_t stats;
+
+  // Calls since the patrol last ran, for the same reason: the patrol walks one
+  // arena's spans, so how overdue it is is that arena's property. The interval
+  // and the budget are configuration and stay global.
+  size_t ops_since_scrub;
+
+  // Held for the whole of any operation that reads or writes this arena's
+  // block metadata. See mm_lock.h -- including for why the read-only calls are
+  // inside it too.
+  mm_mutex lock;
 } mm_arena;
 
 extern mm_arena g_arena;
@@ -146,6 +164,27 @@ static inline bool mm_arena_live(void) { return g_arena.spans != NULL; }
 // to corrupt a specific block and were written when a single contiguous
 // tiling was the only thing there was. NULL when nothing is installed.
 static inline mm_span *mm_sole_span(void) { return g_arena.spans; }
+
+// --- Entering and leaving --------------------------------------------------
+//
+// Every public entry point is a thin wrapper: take the arena, do the work,
+// give it back. The work itself is written against `g_arena` exactly as it was
+// when there was no lock, which is what kept this change out of the allocation
+// path altogether.
+//
+// **At most one arena lock is ever held at a time.** There is one arena today,
+// so that is trivially true; it is written down because it is the invariant
+// that has to survive there being more than one, and because it is why
+// mm_realloc and mm_memalign call unlocked helpers rather than the public
+// entry points they used to.
+
+// The arena the calling thread works in, locked. Never NULL.
+static inline mm_arena *mm_enter(void) {
+  mm_mutex_lock(&g_arena.lock);
+  return &g_arena;
+}
+
+static inline void mm_leave(mm_arena *a) { mm_mutex_unlock(&a->lock); }
 
 // Whether a payload checksum is being maintained, and therefore whether one
 // may be established or believed. False under MM_MODE_LIBC and false under a
