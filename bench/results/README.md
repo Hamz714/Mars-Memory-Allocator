@@ -71,6 +71,15 @@ only when creating it, which is what lets the five scrub intervals accumulate
 into one table. The scrub interval is a per-row column rather than a header
 field for exactly that reason.
 
+**The `faults-*.csv` files are not re-measured when they do not change, and
+whether they change is checked rather than assumed.** Every trial is seeded and
+forked, so the matrix is deterministic: re-running it against new code either
+reproduces the committed file byte for byte or it does not, and which of those
+happened is a result in itself. The three matrices here were re-run after
+per-thread arenas landed and came back identical, which is the evidence that
+nothing about detection moved — a claim that would otherwise have rested on
+somebody's reading of the diff.
+
 ## Reading the `threads-*.csv` files
 
 These are the only files here that are a **curve** rather than a set of
