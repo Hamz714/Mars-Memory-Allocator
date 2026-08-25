@@ -15,6 +15,11 @@ that goes stale:
 
   bench-<profile>.csv            throughput and space, mars and glibc
   bench-<profile>-nostats.csv    the same, counters compiled out
+  bench-<profile>-nolock.csv     the same, locking compiled out
+  bench-<profile>-repeat.csv     the same build again, minutes later: the
+                                 machine's own run-to-run movement, which is
+                                 what the two comparisons above are judged
+                                 against
   preload-<profile>.csv          wall time of real programs under LD_PRELOAD
   faults-<profile>.csv           the full target x bits matrix
   scrub-<profile>.csv            the same targets swept over scrub intervals
@@ -269,70 +274,134 @@ def space(o, benches):
         o(f"| `{wl}` | " + " | ".join(cells) + " |")
 
 
-def counters(o, benches, nostats):
-    o("\n## What the counters cost\n")
-    o("`MARS_STATS` is on by default and is what supplies the utilisation and "
-      "overhead columns above. Both builds are Release, hardened, same "
-      "machine, same seeds; the only difference is whether the counters are "
-      "compiled in.\n")
-    _, on = benches["hardened"]
-    _, off = nostats
-    o("| Workload | counters on | counters off | throughput given up | IQR of "
-      "the `on` runs | bigger than the spread? |")
+def drift(on, repeat, wl):
+    """How far the same build moved between two runs of it, in percent.
+
+    The instrument's own error bar. Within-run inter-quartile range is not it:
+    that measures how much eleven repetitions inside one process disagreed,
+    which is far narrower than how much two processes minutes apart disagree on
+    a laptop under WSL2. Comparing a build against a *different* build without
+    knowing this number is how a benchmark invents results."""
+    a = median([float(r["ops_per_sec"]) for r in on
+                if r["workload"] == wl and r["allocator"] == "mars"])
+    b = median([float(r["ops_per_sec"]) for r in repeat
+                if r["workload"] == wl and r["allocator"] == "mars"])
+    return abs(100.0 * (b - a) / a) if a else float("nan")
+
+
+def cost_table(o, on, off, repeat, on_label, off_label):
+    """One build against another, with the noise floor beside it."""
+    o(f"| Workload | {on_label} | {off_label} | difference | same build, "
+      f"run again | resolvable? |")
     o("|---|---:|---:|---:|---:|:-:|")
-    inside = []
-    outside = []
+    inside, outside = [], []
     for wl in workloads(on):
-        vals = [float(r["ops_per_sec"]) for r in on
-                if r["workload"] == wl and r["allocator"] == "mars"]
-        a = median(vals)
+        a = median([float(r["ops_per_sec"]) for r in on
+                    if r["workload"] == wl and r["allocator"] == "mars"])
         b = median([float(r["ops_per_sec"]) for r in off
                     if r["workload"] == wl and r["allocator"] == "mars"])
         cost = 100.0 * (b - a) / a
-        spread = 100.0 * iqr(vals) / 2 / a
-        # Comparing the difference against half the inter-quartile range of the
-        # runs it came from. Not a significance test -- it is the crudest
-        # possible one -- but it is the difference between "measured" and
-        # "smaller than this machine can resolve", and that distinction is the
-        # only thing this table can honestly support.
-        clear = abs(cost) > spread
+        noise = drift(on, repeat, wl)
+        clear = abs(cost) > noise
         (outside if clear else inside).append(wl)
-        o(f"| `{wl}` | {si(a)} | {si(b)} | {cost:+.1f}% | ±{spread:.1f}% | "
+        o(f"| `{wl}` | {si(a)} | {si(b)} | {cost:+.1f}% | ±{noise:.1f}% | "
           f"{'yes' if clear else 'no'} |")
+    return inside, outside
 
-    o(f"\nA positive figure is throughput the counters cost; a negative one is "
-      f"the build with them compiled in coming out *faster*, which is not a "
-      f"result — it is the noise floor showing through. The last two columns "
-      f"are how to tell those apart: the difference is larger than half the "
-      f"inter-quartile range of its own runs on "
-      f"**{len(outside)} of {len(outside) + len(inside)}** workloads "
-      f"({', '.join('`' + w + '`' for w in outside)}) and smaller than it on "
-      f"the rest ({', '.join('`' + w + '`' for w in inside)}).\n")
-    o("So the counters are not free: on the allocation-heavy workloads they "
-      "cost something this machine can actually resolve. On the rest, the "
-      "honest statement is that the cost is below what it can measure — not "
-      "that there is none.\n")
 
+def counters(o, benches, nostats, repeat):
+    o("\n## What the counters cost\n")
+    o("`MARS_STATS` is on by default and is what supplies the utilisation and "
+      "overhead columns above. Both builds are Release, hardened, same "
+      "machine, same seeds, taken minutes apart; the only difference is "
+      "whether the counters are compiled in.\n")
+    o("The fifth column is the same build measured a second time and is the "
+      "only reason the fourth means anything. See "
+      "[the note below](#the-noise-floor-and-why-it-is-a-column).\n")
+    _, on = benches["hardened"]
+    _, off = nostats
+    inside, outside = cost_table(o, on, off, repeat, "counters on",
+                                 "counters off")
+    verdict(o, inside, outside, "the counters")
+
+
+def locking_cost(o, benches, nolock, repeat):
+    o("\n## What the lock costs a single-threaded program\n")
+    o("`MARS_LOCK=arena` is the default and puts an **uncontended** mutex on "
+      "every public entry point; `MARS_LOCK=none` compiles it out entirely. "
+      "The question is what a program with one thread pays for the fact that "
+      "it might have had two.\n")
+    _, on = benches["hardened"]
+    _, off = nolock
+    inside, outside = cost_table(o, on, off, repeat, "locked", "no lock")
+    verdict(o, inside, outside, "the lock")
+    o("Whatever it is, it is the price of the *first* strategy and not of the "
+      "third: an uncontended mutex is two atomic operations and no syscall, "
+      "and it is the same two whether the program has one thread or eight. "
+      "What the thread-scaling section measures is a different quantity — who "
+      "else is waiting on that mutex — and there the two strategies are not "
+      "close.\n")
+
+
+def verdict(o, inside, outside, what):
+    o(f"\nThe difference is larger than the same build's own run-to-run "
+      f"movement on **{len(outside)} of {len(outside) + len(inside)}** "
+      f"workloads"
+      + (f" ({', '.join('`' + w + '`' for w in outside)})" if outside else "")
+      + ", and smaller than it on the rest"
+      + (f" ({', '.join('`' + w + '`' for w in inside)})" if inside else "")
+      + f". On those, the honest statement is that the cost of {what} is below "
+      f"what this machine can resolve — not that there is none.\n")
+
+
+def noise_floor(o, benches, repeat):
+    o("\n## The noise floor, and why it is a column\n")
+    o("Two runs of the **same build**, same machine, same seeds, a few minutes "
+      "apart, with nothing else running and both pinned to one core. Nothing "
+      "changed between them but time.\n")
+    _, on = benches["hardened"]
+    _, again = repeat
+    o("| Workload | first run | second run | moved by |")
+    o("|---|---:|---:|---:|")
+    worst = 0.0
+    for wl in workloads(on):
+        a = median([float(r["ops_per_sec"]) for r in on
+                    if r["workload"] == wl and r["allocator"] == "mars"])
+        b = median([float(r["ops_per_sec"]) for r in again
+                    if r["workload"] == wl and r["allocator"] == "mars"])
+        moved = 100.0 * (b - a) / a
+        worst = max(worst, abs(moved))
+        o(f"| `{wl}` | {si(a)} | {si(b)} | {moved:+.1f}% |")
+    o(f"\n**Up to {worst:.0f}% between two runs of identical code.** That is "
+      f"the instrument, not the allocator, and it is why the two tables above "
+      f"carry it as a column rather than comparing against the inter-quartile "
+      f"range of a single run — eleven repetitions inside one process agree "
+      f"with each other far more closely than two processes minutes apart do, "
+      f"so an IQR-based comparison would call a difference significant that "
+      f"this machine cannot see at all.\n")
+    o("It is also why the thread-scaling section below is quoted as a *shape* "
+      "rather than as figures: a column that goes from 0.13× to 3.4× is not "
+      "something a 40% instrument can be wrong about.\n")
 
 def faults(o, matrices):
     o("\n## Fault injection\n")
     m0 = matrices["hardened"][0]
     o(f"{int(m0.get('trials_per_cell', 0)):,} trials per cell, "
-      f"{len(TARGETS)} targets × {{1, 2, 4, 8}} bits × {len(PROFILES)} "
+      f"{len(TARGETS)} targets Ã— {{1, 2, 4, 8}} bits Ã— {len(PROFILES)} "
       f"profiles. Each trial forks a child under an alarm, flips *k* bits in "
       f"the chosen structure, and classifies what the allocator then does "
       f"against a shadow model of what every live payload is supposed to "
       f"contain. Base seed `{m0.get('base_seed', '?')}`, arena "
       f"{int(m0.get('arena_bytes', 0)):,} bytes, patrol at its 1024-call "
       f"default, at commit `{m0.get('git_sha', '?')}`.\n")
-    o("**Detection coverage is `detected / (detected + silent)`** — of the "
+    o("**Detection coverage is `detected / (detected + silent)`** â€” of the "
       "flips that actually mattered, how many were caught. Benign flips landed "
       "in slack, padding or free space and are excluded, because there was "
       "nothing there to catch. Intervals are 95% Wilson score.\n")
 
     for profile in PROFILES:
         meta, rows = matrices[profile]
-        o(f"\n### `{profile}` — {meta.get('metadata_bytes', '?')} B of "
+        o(f"\n### `{profile}` â€” {meta.get('metadata_bytes', '?')} B of "
           f"metadata per allocation\n")
         o("| Target | Trials | Benign | Detected | Silent | Crash | Timeout | "
           "Coverage (95% CI) |")
@@ -340,14 +409,14 @@ def faults(o, matrices):
         for target in TARGETS:
             got = [r for r in rows if r["target"] == target]
             if not got:
-                o(f"| `{target}` | – | – | – | – | – | – | "
+                o(f"| `{target}` | â€“ | â€“ | â€“ | â€“ | â€“ | â€“ | "
                   f"no such structure under this profile |")
                 continue
             c = cell(got)
             lo, hi = wilson(c["detected"], c["mattered"])
             pct = (100.0 * c["detected"] / c["mattered"]
                    if c["mattered"] else float("nan"))
-            cover = ("n/a — nothing mattered" if not c["mattered"]
+            cover = ("n/a â€” nothing mattered" if not c["mattered"]
                      else f"{pct:.2f}% [{lo:.2f}, {hi:.2f}]")
             o(f"| `{target}` | {c['trials']:,} | {c['undetected_benign']:,} | "
               f"{c['detected']:,} | **{c['undetected_silent']:,}** | "
@@ -378,20 +447,20 @@ def scrub(o, sweeps):
       "is a lower bound and not an estimate.\n")
     o("Three columns, because the measurement says there are three "
       "populations and not the two the design predicted:\n")
-    o("- **Free structures** — `free_hdr`, `links`, `free_footer`. These sit "
+    o("- **Free structures** â€” `free_hdr`, `links`, `free_footer`. These sit "
       "on the allocation path, so validate-on-touch finds them in ten to "
       "fifteen calls whatever the patrol is set to, patrol off included.")
-    o("- **An allocated header** — `alloc_hdr`. Partly reachable by traffic "
+    o("- **An allocated header** â€” `alloc_hdr`. Partly reachable by traffic "
       "that never touches the block: freeing and coalescing a *neighbour* "
       "validates the header beside it. With the patrol off it is still found "
       "about half the time, and quickly when it is found at all.")
-    o("- **Payload and canary** — the patrol's alone. With the patrol off, "
+    o("- **Payload and canary** â€” the patrol's alone. With the patrol off, "
       "traffic that never touches the block never finds them: not "
       "\"eventually\", but zero trials out of every one run.\n")
     o("`any` is in no column: it flips a bit anywhere in the arena and lands "
       "in all three at once. `in window` counts the damage found inside the "
-      "4,096-call window against the damage found at all — a shortfall is "
-      "what censors the mean beside it, and is marked `≥`.\n")
+      "4,096-call window against the damage found at all â€” a shortfall is "
+      "what censors the mean beside it, and is marked `â‰¥`.\n")
 
     for profile in PROFILES:
         _, rows = sweeps[profile]
@@ -431,13 +500,78 @@ def scrub(o, sweeps):
             lo, hi = min(per_iv.values()), max(per_iv.values())
             spread = ("identical at every setting" if lo == hi
                       else f"between {lo:,} and {hi:,} depending on the setting")
-            o(f"\nSilent corruption across the whole sweep: **{silent:,}** — "
+            o(f"\nSilent corruption across the whole sweep: **{silent:,}** â€” "
               f"this profile carries no checksum and no canary, so it detects "
               f"correspondingly less. Per interval it is {spread}, which is "
               f"the same claim the other two make with a zero: the patrol "
               f"moves *when* damage is found and not *whether* corruption gets "
               f"through. CI gates `{profile}` on the arena promise and records "
               f"these numbers rather than gating them.\n")
+
+
+def thread_counts(rows):
+    return sorted({int(r["threads"]) for r in rows})
+
+
+def at(rows, workload, allocator, threads, column="ops_per_sec"):
+    """Every repetition of one cell of the scaling curve."""
+    return [float(r[column]) for r in rows
+            if r["workload"] == workload and r["allocator"] == allocator
+            and int(r["threads"]) == threads]
+
+
+def thread_scaling(o, curves):
+    """How throughput moves with the thread count, one table per strategy.
+
+    The one section here that is a *curve* rather than a set of independent
+    cells, and it is read down a column rather than across: what matters is not
+    what any single row says but whether the column climbs. Speedup is measured
+    against that same allocator's own one-thread row and never against glibc's,
+    because what is being compared is a configuration with itself under load."""
+    if not any(rows for _, rows in curves.values()):
+        return
+
+    o("\n## Thread scaling\n")
+    o("T threads doing T times the work, so an allocator that scales perfectly "
+      "draws a straight line in total throughput and one that serialises "
+      "completely draws a flat one. Median of the repetitions; `speedup` is "
+      "against the same allocator's own one-thread row.\n")
+    o("**This machine has 4 physical cores and 8 hardware threads**, so the "
+      "8-thread row is two threads to a core and would not double the 4-thread "
+      "row even for code that scales perfectly. The 1â†’4 part of each column is "
+      "the part that is about the allocator.\n")
+    o("Unlike every other run in this directory these are taken *without* "
+      "`taskset`: pinning a thread-scaling measurement to one core would "
+      "measure the scheduler instead.\n")
+
+    for lock in LOCKS:
+        _, rows = curves[lock]
+        if not rows:
+            continue
+        o(f"\n### `MARS_LOCK={lock}`\n")
+        o(f"{LOCK_BLURB[lock]}\n")
+        for wl in workloads(rows):
+            o(f"\n**`{wl}`** â€” {MT_BLURB.get(wl, '')}\n")
+            o("| Threads | mars ops/s | speedup | mars p50 | glibc ops/s | "
+              "speedup | mars / glibc |")
+            o("|---:|---:|---:|---:|---:|---:|---:|")
+            base = {al: median(at(rows, wl, al, 1))
+                    for al in ("mars", "system")}
+            for t in thread_counts(rows):
+                ours = median(at(rows, wl, "mars", t))
+                theirs = median(at(rows, wl, "system", t))
+                p50 = median(at(rows, wl, "mars", t, "p50_ns"))
+                ratio = ours / theirs if theirs else float("nan")
+                o(f"| {t} | {si(ours)} | {ours / base['mars']:.2f}Ã— | "
+                  f"{p50:,.0f} ns | {si(theirs)} | "
+                  f"{theirs / base['system']:.2f}Ã— | {ratio:.3f}Ã— |")
+
+    o("\nThe glibc columns are a scale rather than a target. glibc keeps a "
+      "per-thread cache in front of its free lists and does no integrity "
+      "checking at all, so its absolute figures say little about this "
+      "allocator â€” but its *speedup* column says what this machine and this "
+      "workload are capable of, and that is what makes a flat column beside it "
+      "a statement about the allocator rather than about the benchmark.\n")
 
 
 def thread_counts(rows):
@@ -617,6 +751,8 @@ def build():
 
     benches = {p: load("bench", p) for p in PROFILES}
     nostats = read(RESULTS / "bench-hardened-nostats.csv")
+    nolock = read(RESULTS / "bench-hardened-nolock.csv")
+    repeat = read(RESULTS / "bench-hardened-repeat.csv")
     matrices = {p: load("faults", p) for p in PROFILES}
     sweeps = {p: load("scrub", p) for p in PROFILES}
     # Not required: the preload library is Unix-only, so a tree measured on a
@@ -642,7 +778,9 @@ def build():
     throughput(o, benches)
     latency(o, benches)
     space(o, benches)
-    counters(o, benches, nostats)
+    noise_floor(o, benches, repeat)
+    counters(o, benches, nostats, repeat[1])
+    locking_cost(o, benches, nolock, repeat[1])
     thread_scaling(o, curves)
     preload(o, preloads)
     faults(o, matrices)

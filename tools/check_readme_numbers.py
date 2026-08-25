@@ -85,6 +85,10 @@ def csv_candidates():
     benches = {p: report.load("bench", p) for p in report.PROFILES}
     benches["hardened-nostats"] = report.read(
         report.RESULTS / "bench-hardened-nostats.csv")
+    benches["hardened-nolock"] = report.read(
+        report.RESULTS / "bench-hardened-nolock.csv")
+    benches["hardened-repeat"] = report.read(
+        report.RESULTS / "bench-hardened-repeat.csv")
     matrices = {p: report.load("faults", p) for p in report.PROFILES}
     sweeps = {p: report.load("scrub", p) for p in report.PROFILES}
     curves = {k: report.load("threads", k, required=False)
@@ -146,16 +150,22 @@ def csv_candidates():
                 add(report.median(mars) / report.median(sysl))
                 add(report.median(sysl) / report.median(mars))
 
-        # The counter cost, as a percentage either way round.
+        # What the counters and the lock each cost, as a percentage either way
+        # round, and the spread each is compared against.
         on = benches["hardened"][1]
-        off = benches["hardened-nostats"][1]
-        for wl in report.workloads(on):
-            a = report.median([float(r["ops_per_sec"]) for r in on
-                               if r["workload"] == wl and r["allocator"] == "mars"])
-            b = report.median([float(r["ops_per_sec"]) for r in off
-                               if r["workload"] == wl and r["allocator"] == "mars"])
-            if a:
-                add(100.0 * (b - a) / a)
+        for against in ("hardened-nostats", "hardened-nolock",
+                        "hardened-repeat"):
+            off = benches[against][1]
+            for wl in report.workloads(on):
+                vals = [float(r["ops_per_sec"]) for r in on
+                        if r["workload"] == wl and r["allocator"] == "mars"]
+                a = report.median(vals)
+                b = report.median([float(r["ops_per_sec"]) for r in off
+                                   if r["workload"] == wl
+                                   and r["allocator"] == "mars"])
+                if a:
+                    add(100.0 * (b - a) / a)
+                    add(100.0 * report.iqr(vals) / 2 / a)
 
     # Thread scaling, aggregated as RESULTS.md aggregates it: the median of
     # each cell, and the two ratios a reader would quote from the table -- the
@@ -176,6 +186,11 @@ def csv_candidates():
                         add(report.median(vals))
                         add(report.iqr(vals))
                         add(report.iqr(vals) / 2)
+                    # Millions of operations per second, which is the unit the
+                    # README's scaling table is quoted in. A number is only
+                    # traceable if the units it is written in are traceable
+                    # too.
+                    add(report.median(report.at(rows, wl, al, th)) / 1e6)
                     per[al] = report.median(report.at(rows, wl, al, th))
                     if base[al]:
                         add(per[al] / base[al])

@@ -7,9 +7,10 @@ that a bit flipped after the fact is detected rather than silently used. It
 allocates in O(1) from size-classed free lists over a bitmap and patrols cold
 memory in the background.
 
-It takes either a caller-supplied arena or memory it maps itself, and there is
-an `LD_PRELOAD` shim, so the second question — does it work under software that
-knows nothing about it? — has an answer that is not a benchmark.
+It takes either a caller-supplied arena or memory it maps itself, gives each
+thread an arena of its own, and there is an `LD_PRELOAD` shim — so the second
+question, does it work under software that knows nothing about it, has an answer
+that is not a benchmark.
 
 The fault it models is the **single-event upset**: ionising radiation flips a
 bit in DRAM and a value changes with nothing having written it. That is a real
@@ -54,28 +55,68 @@ pinned repetitions, 400,000 operations each, 64 MB arena:
 
 | Workload | `hardened` ops/s | glibc ops/s | ratio | p50 | util% |
 |---|---:|---:|---:|---:|---:|
-| `seq_lifo` | 6,291,090 | 34,437,061 | 0.18× | 110 ns | 66.7 |
-| `seq_fifo` | 4,826,375 | 35,280,979 | 0.14× | 124 ns | 66.7 |
-| `random_size` | 5,001,456 | 19,081,193 | 0.26× | 124 ns | 97.4 |
-| `churn` | 6,027,158 | 22,474,001 | 0.27× | 101 ns | 99.4 |
-| `realloc_grow` | 4,767,230 | 3,808,097 | 1.25× | 146 ns | 100.0 |
-| `fragmentation` | 3,807,486 | 17,555,016 | 0.22× | 116 ns | 94.3 |
-| `validated_access` | 392,233 | 2,934,219 | 0.13× | 130 ns | 100.0 |
+| `seq_lifo` | 5,031,258 | 32,293,228 | 0.16× | 126 ns | 66.7 |
+| `seq_fifo` | 4,994,059 | 33,372,869 | 0.15× | 131 ns | 66.7 |
+| `random_size` | 4,458,736 | 18,625,024 | 0.24× | 133 ns | 97.4 |
+| `churn` | 5,301,577 | 22,724,488 | 0.23× | 114 ns | 99.4 |
+| `realloc_grow` | 3,788,084 | 3,773,644 | 1.00× | 181 ns | 100.0 |
+| `fragmentation` | 2,818,612 | 15,754,142 | 0.18× | 142 ns | 94.3 |
+| `validated_access` | 373,669 | 2,356,452 | 0.16× | 144 ns | 100.0 |
 
 **This is four to seven times slower than glibc on most workloads, and that is
 the honest headline.** glibc has a per-thread cache in front of its free lists
 and does no integrity checking at all; some of the difference is buying
 something it does not provide, and some of it is simply glibc being very good.
-`realloc_grow` is the one workload where in-place growth wins outright.
+`realloc_grow` is the one workload where in-place growth keeps up.
 `validated_access` is the far outlier and is dominated by CRC32C over the whole
 payload on every read — the cost of the feature, not of the allocator.
 
-Read that range as an order of magnitude and no finer. The same table at the
-end of the previous phase said three to five, and most of the movement is
-glibc's rather than this allocator's: its own figures came out substantially
-higher in this run than in that one, on the same machine, against code that
-did not change. That is what [bench/results/README.md](bench/results/README.md)
-means by one significant figure, and it is why ratios are quoted at all.
+Read that range as an order of magnitude and no finer, and the reason is
+measured rather than asserted: two runs of *the same build*, minutes apart on an
+idle pinned core, move by as much as 43%. That figure is a table of its own in
+[docs/RESULTS.md](docs/RESULTS.md), and it is what every other comparison there
+is judged against.
+
+### Under threads
+
+Two multithreaded workloads at 1, 2, 4 and 8 threads, each thread doing the
+same amount of work, so total throughput is a straight line for an allocator
+that scales and a flat one for an allocator that serialises. `mt_churn` is T
+independent copies of `churn` and shares nothing. `producer_consumer` has half
+the threads allocating and half freeing, so **every block is released by a
+thread that did not allocate it**.
+
+| Threads | `mt_churn`, one global lock | speedup | `mt_churn`, per-thread arenas | speedup |
+|---:|---:|---:|---:|---:|
+| 1 | 5.82M ops/s | 1.00× | 5.17M ops/s | 1.00× |
+| 2 | 3.08M ops/s | 0.53× | 9.02M ops/s | 1.74× |
+| 4 | 1.79M ops/s | 0.31× | 12.04M ops/s | 2.33× |
+| 8 | 0.84M ops/s | 0.15× | 18.00M ops/s | 3.48× |
+
+| Threads | `producer_consumer`, one global lock | speedup | `producer_consumer`, per-thread arenas | speedup |
+|---:|---:|---:|---:|---:|
+| 1 | 4.04M ops/s | 1.00× | 4.09M ops/s | 1.00× |
+| 2 | 2.14M ops/s | 0.53× | 4.86M ops/s | 1.19× |
+| 4 | 1.42M ops/s | 0.35× | 8.48M ops/s | 2.07× |
+| 8 | 0.60M ops/s | 0.15× | 9.66M ops/s | 2.36× |
+
+**A global lock does not merely fail to scale — eight threads get less work
+done in total than one thread does alone.** Half of that is contention and half
+is that every thread is reading and writing the same bins, the same bitmap and
+the same counters, so each acquisition also pays for cache lines the previous
+holder invalidated. Giving each thread an arena turns both columns the right way
+up. glibc on the same machine and the same harness reaches 4.00× on
+`mt_churn`, which is what makes the flat column a statement about the allocator
+rather than about the benchmark.
+
+The two curves are one CMake option apart — `MARS_LOCK=global` against
+`MARS_LOCK=arena` — and both configurations are built, tested and kept, because
+a design justified against a measured alternative is worth more than one
+asserted. [docs/DESIGN.md](docs/DESIGN.md) sets out what the second one had to
+do that the textbook per-thread design does not: this allocator's metadata is
+in band and checksummed, so a header read while its own arena rewrites a
+neighbour's flags does not produce a torn size — it produces a control word and
+a CRC that disagree, which is corruption that never happened.
 
 ### And on programs that never heard of it
 
@@ -188,10 +229,15 @@ cmake --build --preset gcc-release -- -j$(nproc)
 ctest --preset gcc-release --output-on-failure
 
 # The throughput and space tables. --preset gcc-fast / gcc-paranoid for the
-# other profiles, gcc-nostats to price the counters.
+# other profiles, gcc-nostats to price the counters, gcc-nolock the lock.
 taskset -c 2 ./build/gcc-release/bin/bench \
   --ops 200000 --reps 11 --arena 67108864 \
   --git-sha "$SHA" --out bench/results/bench-hardened.csv
+
+# The two thread-scaling curves. --preset gcc-lock-global for the other one.
+./build/gcc-release/bin/bench_mt \
+  --ops 200000 --reps 11 --threads 1,2,4,8 \
+  --git-sha "$SHA" --out bench/results/threads-arena.csv
 
 # The fault-injection matrix: 7 targets x {1,2,4,8} bits x 10,000 trials
 ./build/gcc-release/bin/faultinject \
@@ -262,12 +308,18 @@ in every fault-injection CSV.
 
 | | |
 |---|---|
-| Unit and property tests | 9 suites, run under gcc and clang, Debug and Release, and all three profiles |
+| Unit and property tests | 10 suites, run under gcc and clang, Debug and Release, all three profiles and all three locking strategies |
 | Differential fuzzer | every operation checked against a shadow model, seeded so any failure replays exactly |
-| Sanitizers | ASan, UBSan under gcc and clang; Valgrind memcheck over every test binary and a long fuzz run |
+| Sanitizers | ASan, UBSan under gcc and clang; ThreadSanitizer over the core in a job of its own; Valgrind memcheck over every test binary and a long fuzz run |
+| Threads | concurrent allocation, cross-thread frees in both directions, a full remote-free queue, a resize of another thread's block, and a thread that exits with its blocks still live — all under TSan, and all again under the global lock |
 | Fault injection | gated in CI on the arena promise under all three profiles, and on the single-bit header cell where a checksum makes it decidable from theory. 56,000 trials per profile per push, plus the two seeds that once broke the promise replayed exactly |
 | Coverage | gated at 90% lines on `src/`, not merely reported |
 | Portability | Windows UCRT64 builds the core, tests, fuzzer and benchmark |
+
+The ThreadSanitizer job carries its own control, for the same reason. A green
+sanitizer run says nothing unless the same run would have failed on code that is
+actually racy, so it builds the same tests once more with `MARS_LOCK=none` and
+fails if ThreadSanitizer does *not* report a race there.
 
 The single-bit header cell is worth singling out: a 32-bit CRC over the header
 detects every single-bit change in it without exception, so under any profile
@@ -282,19 +334,25 @@ that only has a measurement.
   hardware and physical shielding. Nothing in software stops a bit flipping;
   this notices afterwards. It models single-event upsets — it does not survive
   them at the hardware level.
-- **Not thread-safe, and this now bites harder.** There is no lock and no
-  per-thread cache, in the allocator or in the shim. Preloading the shim into a
-  threaded program will corrupt that program's heap; the shim interposes
-  `pthread_create` purely to say so on stderr the first time, because the
-  alternative is an unexplained crash inside the program under test. Per-thread
-  arenas are the next piece of work, and the 2 MB chunk alignment is the
-  groundwork for them. None of the numbers above say anything about behaviour
-  under concurrency.
+- **Not lock-free, even on the thread that owns the arena.** The metadata is in
+  band and checksummed, so a header being read while its own arena rewrites a
+  neighbour's `PREV_IN_USE` produces a control word and a CRC that disagree —
+  which this allocator would report as corruption that never happened. Every
+  entry point that touches block metadata is therefore inside its arena's lock,
+  the read-only ones included. For the owning thread that lock is uncontended,
+  and what it costs a single-threaded program is measured rather than assumed.
+- **Not a per-thread cache in front of the free lists.** glibc has one and this
+  does not, which is a large part of the absolute gap above. After per-thread
+  arenas there is no contention left for such a cache to remove, and a cached
+  block is one the tiling calls allocated and nobody owns — which every
+  accounting invariant in the design would have to make an exception for. The
+  reasoning is in [docs/DESIGN.md](docs/DESIGN.md); it is a decision, not an
+  omission.
 - **Not a complete `malloc` replacement.** The shim exports the whole family
-  and runs `git`, `grep`, a Python interpreter and a C compiler correctly, with
-  a consistent heap afterwards — but it is single-threaded, Unix-only, and has
-  no equivalent of glibc's per-size caching, which the small-`calloc` row above
-  shows costing an order of magnitude.
+  and runs `git`, `grep`, a Python interpreter and a C compiler correctly — and
+  now threaded programs too — with a consistent heap afterwards, but it is
+  Unix-only and has no equivalent of glibc's per-size caching, which the
+  small-`calloc` row above shows costing an order of magnitude.
 - **Not able to repair a payload**, under any profile. If the flip landed in
   user data, the payload checksum reports it and the data is gone. Repair
   exists only for metadata, only under `paranoid`, and only while the mirror

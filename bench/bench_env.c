@@ -79,4 +79,8 @@ void bench_write_env(FILE *out, const char *git_sha) {
 #else
   fprintf(out, "# counters=off\n");
 #endif
+  // Which locking strategy the library was built with. Two runs are only
+  // comparable when it matches, and a whole phase of this project is a
+  // comparison between two values of it.
+  fprintf(out, "# lock=%s\n", mm_lock_strategy());
 }
