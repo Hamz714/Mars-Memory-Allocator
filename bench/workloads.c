@@ -46,7 +46,11 @@ const bench_alloc bench_alloc_system = {
 // --- Size distributions ----------------------------------------------------
 
 // Mostly small, occasionally large: the shape most programs actually produce.
-static size_t draw_size(mars_rng *r) {
+//
+// Not static: bench/workloads_mt.c draws from the same distribution, so that
+// `mt_churn` is the `churn` workload below run on T threads rather than
+// something that merely resembles it.
+size_t bench_draw_size(mars_rng *r) {
   uint64_t roll = mars_rng_below(r, 1000);
   if (roll < 900) return 1 + mars_rng_below(r, 128);
   if (roll < 999) {
@@ -95,7 +99,7 @@ static void w_random_size(bench_ctx *ctx) {
   while (remaining > 0) {
     size_t n = 0;
     while (n < MAX_LIVE && remaining > 0) {
-      size_t sz = draw_size(&ctx->rng);
+      size_t sz = bench_draw_size(&ctx->rng);
       void *p = NULL;
       BENCH_TIMED(ctx, p = ctx->alloc->alloc(sz));
       remaining--;
@@ -125,7 +129,7 @@ static void w_churn(bench_ctx *ctx) {
 
   size_t live = 0;
   while (live < target) {
-    void *p = ctx->alloc->alloc(draw_size(&ctx->rng));
+    void *p = ctx->alloc->alloc(bench_draw_size(&ctx->rng));
     if (p == NULL) break;
     held[live++] = p;
   }
@@ -137,7 +141,7 @@ static void w_churn(bench_ctx *ctx) {
     BENCH_TIMED(ctx, ctx->alloc->release(held[slot]));
 
     void *p = NULL;
-    size_t sz = draw_size(&ctx->rng);
+    size_t sz = bench_draw_size(&ctx->rng);
     BENCH_TIMED(ctx, p = ctx->alloc->alloc(sz));
     held[slot] = p;
     if (p == NULL) {

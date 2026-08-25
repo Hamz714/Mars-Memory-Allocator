@@ -185,6 +185,16 @@ void bench_hist_record(bench_hist *h, uint64_t value) {
   if (value > h->max) h->max = value;
 }
 
+void bench_hist_merge(bench_hist *dst, const bench_hist *src) {
+  for (size_t i = 0; i < BENCH_HIST_SLOTS; i++) dst->slots[i] += src->slots[i];
+  dst->count += src->count;
+  dst->total += src->total;
+  // An empty histogram has min == UINT64_MAX and max == 0 from the reset, so
+  // folding one in changes neither bound and needs no case of its own.
+  if (src->min < dst->min) dst->min = src->min;
+  if (src->max > dst->max) dst->max = src->max;
+}
+
 uint64_t bench_hist_quantile(const bench_hist *h, double q) {
   if (h->count == 0) return 0;
   if (q <= 0.0) return h->min;

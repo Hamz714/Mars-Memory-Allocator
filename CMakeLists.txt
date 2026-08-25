@@ -311,14 +311,45 @@ endif()
 if(MARS_BUILD_BENCH)
   add_executable(bench
     bench/bench_main.c
+    bench/bench_env.c
     bench/bench_timer.c
     bench/workloads.c)
   target_link_libraries(bench PRIVATE mars mars_flags mars_flags_strict)
+  # src/ for mm_lock.h, which the provenance block reads the locking strategy
+  # from: two runs are only comparable when it matches.
   target_include_directories(bench
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   set_target_properties(bench PROPERTIES
     C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+
+  # The thread-scaling driver. Unix only, and for the same reason the shim is:
+  # it measures `mars` through a growable arena, which is what a threaded
+  # program actually gets and what mm_arena.c only provides over mmap.
+  if(UNIX)
+    add_executable(bench_mt
+      bench/bench_mt.c
+      bench/bench_env.c
+      bench/bench_timer.c
+      bench/workloads.c
+      bench/workloads_mt.c)
+    target_link_libraries(bench_mt PRIVATE mars mars_flags mars_flags_strict)
+    target_include_directories(bench_mt
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench
+              ${CMAKE_CURRENT_SOURCE_DIR}/src
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    set_target_properties(bench_mt PROPERTIES
+      C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+
+    # A tiny run, purely to catch the harness breaking -- the same bargain the
+    # single-threaded smoke test makes. Real curves are taken deliberately.
+    if(BUILD_TESTING)
+      add_test(NAME bench_mt_smoke
+               COMMAND bench_mt --ops 2000 --reps 1 --threads 1,2 --quiet)
+      set_tests_properties(bench_mt_smoke PROPERTIES TIMEOUT 300)
+    endif()
+  endif()
 
   # Prices the fresh-mapping shortcut in calloc. Deliberately linked against
   # nothing of ours: it has to run under LD_PRELOAD against whichever allocator
