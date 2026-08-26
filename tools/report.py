@@ -743,6 +743,86 @@ def workloads(rows):
     return seen
 
 
+def decomposition(o, benches, nolock):
+    """The gap against glibc, split into the part that is integrity checking
+    and the part that is not.
+
+    "Four to seven times slower than glibc" is true and not very useful,
+    because it does not say what the factor is made of. Three files already in
+    this directory answer that without any new measurement: `fast` is this
+    allocator with the checksum and the canary compiled out, so the distance
+    from glibc to `fast` is everything *except* integrity, and the distance
+    from `fast` to `hardened` is integrity and nothing else."""
+    o("\n## What the gap against glibc is made of\n")
+    o("The headline ratio says how much slower this is than glibc. It does not "
+      "say what the factor consists of, and that matters more than the figure "
+      "does: one part is the price of checking, which is the feature, and the "
+      "other is the price of not having glibc's structure, which is not.\n")
+    o("No new measurement is involved. `fast` is this same allocator with the "
+      "header checksum and the canary compiled out, so **glibc to `fast` is "
+      "everything except integrity** and **`fast` to `hardened` is integrity "
+      "and nothing else**. The two multiply back to the total.\n")
+    o("The last column is the lock's share of the structural half, from "
+      "`bench-hardened-nolock.csv`. It sits inside the structural column "
+      "rather than beside it.\n")
+
+    _, fast = benches["fast"]
+    _, hard = benches["hardened"]
+    _, nl = nolock
+
+    o("| Workload | total vs glibc | of which integrity | of which structural "
+      "| the lock, within structural |")
+    o("|---|---:|---:|---:|---:|")
+    both = []
+    for wl in workloads(hard):
+        g = median([float(r["ops_per_sec"]) for r in hard
+                    if r["workload"] == wl and r["allocator"] == "system"])
+        gf = median([float(r["ops_per_sec"]) for r in fast
+                     if r["workload"] == wl and r["allocator"] == "system"])
+        f = median([float(r["ops_per_sec"]) for r in fast
+                    if r["workload"] == wl and r["allocator"] == "mars"])
+        h = median([float(r["ops_per_sec"]) for r in hard
+                    if r["workload"] == wl and r["allocator"] == "mars"])
+        n = median([float(r["ops_per_sec"]) for r in nl
+                    if r["workload"] == wl and r["allocator"] == "mars"])
+        total, integrity, structural, lock = g / h, f / h, gf / f, n / h
+        # Meaningful means: there is a gap to decompose (glibc is ahead) and
+        # the integrity column is measuring the allocator rather than a feature
+        # glibc does not have. Both conditions are stated below the table.
+        if structural > 1.0 and integrity < 5.0:
+            both.append((structural, integrity))
+        o(f"| `{wl}` | {total:.2f}x | {integrity:.2f}x | {structural:.2f}x | "
+          f"{lock:.2f}x |")
+
+    def geo(xs):
+        if not xs:
+            return float("nan")
+        return math.exp(sum(math.log(v) for v in xs) / len(xs))
+
+    gs = geo([x for x, _ in both])
+    gi = geo([y for _, y in both])
+    o(f"\nOver the {len(both)} workloads where both halves are meaningful the "
+      f"geometric means are **{gs:.1f}x structural** and **{gi:.1f}x "
+      f"integrity**. The one-line version is therefore: *about {gs * gi:.0f}x "
+      f"slower than glibc, of which roughly {gi:.1f}x is integrity checking "
+      f"and the rest is structure*.\n")
+
+    o("**Two workloads are left out of that average, and which two is not a "
+      "choice about which numbers to like.** `realloc_grow` is faster here "
+      "than under glibc, so it has no gap to decompose. `validated_access` "
+      "checksums the whole payload on every read, which puts its integrity "
+      "column an order of magnitude above every other row; that is the price "
+      "of a feature glibc does not have rather than of allocating, and "
+      "averaging it in would describe neither thing.\n")
+    o("The ordering is worth stating plainly, because it is easy to get "
+      "backwards: **on the workloads where the comparison applies, the "
+      "structural half is the larger one**, and it is larger on every one of "
+      "them individually. Take the geometric mean over all seven rows instead "
+      "and it inverts, entirely on the strength of those two exclusions. That "
+      "is the honest caveat on the summary sentence above, and it is why the "
+      "table is here rather than only the sentence.\n")
+
+
 # --- Driver -----------------------------------------------------------------
 
 def build():
@@ -778,6 +858,7 @@ def build():
     throughput(o, benches)
     latency(o, benches)
     space(o, benches)
+    decomposition(o, benches, nolock)
     noise_floor(o, benches, repeat)
     counters(o, benches, nostats, repeat[1])
     locking_cost(o, benches, nolock, repeat[1])

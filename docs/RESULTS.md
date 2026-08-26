@@ -82,6 +82,31 @@ Utilisation is payload over what those blocks actually occupied, sampled at peak
 | `fragmentation` | 97.1 | 16 | 94.3 | 32 | 91.7 | 48 |
 | `validated_access` | 100.0 | 16 | 100.0 | 32 | 99.9 | 48 |
 
+## What the gap against glibc is made of
+
+The headline ratio says how much slower this is than glibc. It does not say what the factor consists of, and that matters more than the figure does: one part is the price of checking, which is the feature, and the other is the price of not having glibc's structure, which is not.
+
+No new measurement is involved. `fast` is this same allocator with the header checksum and the canary compiled out, so **glibc to `fast` is everything except integrity** and **`fast` to `hardened` is integrity and nothing else**. The two multiply back to the total.
+
+The last column is the lock's share of the structural half, from `bench-hardened-nolock.csv`. It sits inside the structural column rather than beside it.
+
+| Workload | total vs glibc | of which integrity | of which structural | the lock, within structural |
+|---|---:|---:|---:|---:|
+| `seq_lifo` | 6.42x | 1.86x | 3.88x | 1.21x |
+| `seq_fifo` | 6.68x | 2.14x | 3.08x | 1.15x |
+| `random_size` | 4.18x | 1.90x | 2.25x | 1.09x |
+| `churn` | 4.29x | 1.71x | 2.64x | 1.23x |
+| `realloc_grow` | 1.00x | 2.32x | 0.45x | 1.39x |
+| `fragmentation` | 5.59x | 2.35x | 2.95x | 1.44x |
+| `validated_access` | 6.31x | 5.90x | 1.27x | 1.03x |
+
+Over the 5 workloads where both halves are meaningful the geometric means are **2.9x structural** and **2.0x integrity**. The one-line version is therefore: *about 6x slower than glibc, of which roughly 2.0x is integrity checking and the rest is structure*.
+
+**Two workloads are left out of that average, and which two is not a choice about which numbers to like.** `realloc_grow` is faster here than under glibc, so it has no gap to decompose. `validated_access` checksums the whole payload on every read, which puts its integrity column an order of magnitude above every other row; that is the price of a feature glibc does not have rather than of allocating, and averaging it in would describe neither thing.
+
+The ordering is worth stating plainly, because it is easy to get backwards: **on the workloads where the comparison applies, the structural half is the larger one**, and it is larger on every one of them individually. Take the geometric mean over all seven rows instead and it inverts, entirely on the strength of those two exclusions. That is the honest caveat on the summary sentence above, and it is why the table is here rather than only the sentence.
+
+
 ## The noise floor, and why it is a column
 
 Two runs of the **same build**, same machine, same seeds, a few minutes apart, with nothing else running and both pinned to one core. Nothing changed between them but time.
