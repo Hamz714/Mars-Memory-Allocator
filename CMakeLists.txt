@@ -350,6 +350,14 @@ if(MARS_BUILD_BENCH)
       add_test(NAME bench_mt_smoke
                COMMAND bench_mt --ops 2000 --reps 1 --threads 1,2 --quiet)
       set_tests_properties(bench_mt_smoke PROPERTIES TIMEOUT 300)
+      # Under MARS_LOCK=none bench_mt refuses the 2-thread leg and exits 2, so
+      # the smoke test inverts. Kept pointed at the same thread list on purpose:
+      # what it still proves there is that the driver builds, links and parses
+      # its arguments in the configuration nobody ships, which is the whole
+      # reason gcc-nolock is in the CI matrix.
+      if(MARS_LOCK STREQUAL "none")
+        set_tests_properties(bench_mt_smoke PROPERTIES WILL_FAIL TRUE)
+      endif()
     endif()
   endif()
 

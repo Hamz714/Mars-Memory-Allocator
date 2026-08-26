@@ -247,6 +247,24 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+  // Locking compiled out means one arena and no mutex, so a second thread here
+  // is two threads mutating the same bins and the same tiling. That does not
+  // make a slow benchmark, it makes an invalid one: the row still prints, with
+  // ops/sec computed off a heap both threads were corrupting, and it is shaped
+  // exactly like a row that means something. test_threads compiles its threaded
+  // cases out under this build for the same reason. This is the one place that
+  // cannot, because the count arrives at runtime.
+  if (strcmp(mm_lock_strategy(), "none") == 0) {
+    for (unsigned t = 0; t < thread_count; t++) {
+      if (threads[t] > 1) {
+        fprintf(stderr,
+                "bench_mt: this build has no locking (MARS_LOCK=none) and "
+                "cannot be measured above one thread\n");
+        return 2;
+      }
+    }
+  }
+
   FILE *out = stdout;
   if (out_path != NULL) {
     out = fopen(out_path, "w");
