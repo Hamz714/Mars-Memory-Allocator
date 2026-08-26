@@ -18,7 +18,7 @@ with the wall clock would largely measure the clock.
 The timestamp counter is only comparable across an interval if the CPU keeps it
 running at a fixed rate. On Linux the harness reads `constant_tsc` and
 `nonstop_tsc` from `/proc/cpuinfo` and records what it found in the CSV header
-(`tsc_usable`, `tsc_flags_known`). Where the flags cannot be read — Windows —
+(`tsc_usable`, `tsc_flags_known`). Where the flags cannot be read, Windows,
 `tsc_flags_known=0` is recorded rather than assuming the answer. **A latency
 figure taken with `tsc_usable=0` should not be quoted.**
 
@@ -57,11 +57,11 @@ ever produced.
 | Name | Shape |
 |---|---|
 | `seq_lifo` | allocate a run of equal blocks, release newest first |
-| `seq_fifo` | same, release oldest first — exposes coalescing behaviour |
+| `seq_fifo` | same, release oldest first, exposes coalescing behaviour |
 | `random_size` | 90% at most 128 B, ~10% log-uniform 8–4096 B, 0.1% at 64 KB–1 MB; released in shuffled order |
 | `churn` | steady population of 512 blocks; every allocation preceded by a release |
 | `realloc_grow` | vector-style growth, ×1.5 each step |
-| `fragmentation` | interleaved small and large, large ones reclaimed, then medium requests — measures how much of the arena survives as usable space |
+| `fragmentation` | interleaved small and large, large ones reclaimed, then medium requests, measures how much of the arena survives as usable space |
 | `validated_access` | integrity-checked reads and writes at 8 B, 64 B, 1 KB and 64 KB |
 
 Each is seeded, so the same seed performs the same sequence of requests every
@@ -86,7 +86,7 @@ The comparison is still not like-for-like, and the difference matters:
 
 - The benchmark drives this allocator over a fixed caller-supplied arena.
   glibc's `malloc` requests memory from the kernel and grows. (The allocator
-  can now grow too, and does under the shim — but the benchmark deliberately
+  can now grow too, and does under the shim, but the benchmark deliberately
   does not use that, so the arena parameter stays a parameter and the numbers
   stay comparable with every earlier run.)
 - glibc has a per-thread cache in front of its free lists.
@@ -94,7 +94,7 @@ The comparison is still not like-for-like, and the difference matters:
   checking at all. Some of the cost being measured buys something glibc does
   not provide.
 
-None of that makes glibc a bad reference point — it makes it the *only* honest
+None of that makes glibc a bad reference point: it makes it the *only* honest
 one, provided the caveats travel with the number.
 
 ## The second measurement: real programs under LD_PRELOAD
@@ -104,8 +104,8 @@ weakness and no amount of care inside the harness fixes it, because the person
 who chose the allocation pattern is the person who wrote the allocator.
 
 `tools/preload_bench.py` is the answer to it. It `LD_PRELOAD`s the shim into
-programs that know nothing about any of this — `ls`, `git`, `grep`, a Python
-interpreter, a C compiler — and times the whole process against the same
+programs that know nothing about any of this, `ls`, `git`, `grep`, a Python
+interpreter, a C compiler, and times the whole process against the same
 program on glibc. Nobody chose those allocation patterns to suit anything here.
 
 The method differs from the one above in ways that follow from the instrument:
@@ -144,7 +144,7 @@ repetitions is reported, and why the spread is published rather than hidden.
 
 They are not a claim about behaviour under concurrency: the allocator is
 single-threaded, and so is the shim. And a throughput figure says nothing about
-whether the memory handed back was correct — that is what the test suite, the
+whether the memory handed back was correct. That is what the test suite, the
 fuzzer, and the fault injector are for.
 
 The microbenchmarks are also not a claim about real programs; a workload is a

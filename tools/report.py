@@ -213,7 +213,7 @@ def provenance(o, benches):
       "by as much as 1.5×, so **one significant figure is what these "
       "throughput numbers support**: ratios that hold across runs and "
       "differences of an order of magnitude are what they are good for. The "
-      "fault-injection counts below do not have this problem — they come from "
+      "fault-injection counts below do not have this problem, they come from "
       "seeded, deterministic trials and reproduce exactly.\n")
 
 
@@ -338,8 +338,8 @@ def locking_cost(o, benches, nolock, repeat):
     o("Whatever it is, it is the price of the *first* strategy and not of the "
       "third: an uncontended mutex is two atomic operations and no syscall, "
       "and it is the same two whether the program has one thread or eight. "
-      "What the thread-scaling section measures is a different quantity — who "
-      "else is waiting on that mutex — and there the two strategies are not "
+      "What the thread-scaling section measures is a different quantity: who "
+      "else is waiting on that mutex, and there the two strategies are not "
       "close.\n")
 
 
@@ -351,7 +351,7 @@ def verdict(o, inside, outside, what):
       + ", and smaller than it on the rest"
       + (f" ({', '.join('`' + w + '`' for w in inside)})" if inside else "")
       + f". On those, the honest statement is that the cost of {what} is below "
-      f"what this machine can resolve — not that there is none.\n")
+      f"what this machine can resolve, not that there is none.\n")
 
 
 def noise_floor(o, benches, repeat):
@@ -375,7 +375,7 @@ def noise_floor(o, benches, repeat):
     o(f"\n**Up to {worst:.0f}% between two runs of identical code.** That is "
       f"the instrument, not the allocator, and it is why the two tables above "
       f"carry it as a column rather than comparing against the inter-quartile "
-      f"range of a single run — eleven repetitions inside one process agree "
+      f"range of a single run, eleven repetitions inside one process agree "
       f"with each other far more closely than two processes minutes apart do, "
       f"so an IQR-based comparison would call a difference significant that "
       f"this machine cannot see at all.\n")
@@ -387,7 +387,7 @@ def faults(o, matrices):
     o("\n## Fault injection\n")
     m0 = matrices["hardened"][0]
     o(f"{int(m0.get('trials_per_cell', 0)):,} trials per cell, "
-      f"{len(TARGETS)} targets Ã— {{1, 2, 4, 8}} bits Ã— {len(PROFILES)} "
+      f"{len(TARGETS)} targets Ã,  {{1, 2, 4, 8}} bits Ã,  {len(PROFILES)} "
       f"profiles. Each trial forks a child under an alarm, flips *k* bits in "
       f"the chosen structure, and classifies what the allocator then does "
       f"against a shadow model of what every live payload is supposed to "
@@ -562,9 +562,9 @@ def thread_scaling(o, curves):
                 theirs = median(at(rows, wl, "system", t))
                 p50 = median(at(rows, wl, "mars", t, "p50_ns"))
                 ratio = ours / theirs if theirs else float("nan")
-                o(f"| {t} | {si(ours)} | {ours / base['mars']:.2f}Ã— | "
+                o(f"| {t} | {si(ours)} | {ours / base['mars']:.2f}Ã,  | "
                   f"{p50:,.0f} ns | {si(theirs)} | "
-                  f"{theirs / base['system']:.2f}Ã— | {ratio:.3f}Ã— |")
+                  f"{theirs / base['system']:.2f}Ã,  | {ratio:.3f}Ã,  |")
 
     o("\nThe glibc columns are a scale rather than a target. glibc keeps a "
       "per-thread cache in front of its free lists and does no integrity "
@@ -616,7 +616,7 @@ def thread_scaling(o, curves):
         o(f"\n### `MARS_LOCK={lock}`\n")
         o(f"{LOCK_BLURB[lock]}\n")
         for wl in workloads(rows):
-            o(f"\n**`{wl}`** — {MT_BLURB.get(wl, '')}\n")
+            o(f"\n**`{wl}`**, {MT_BLURB.get(wl, '')}\n")
             o("| Threads | mars ops/s | speedup | mars p50 | glibc ops/s | "
               "speedup | mars / glibc |")
             o("|---:|---:|---:|---:|---:|---:|---:|")
@@ -634,7 +634,7 @@ def thread_scaling(o, curves):
     o("\nThe glibc columns are a scale rather than a target. glibc keeps a "
       "per-thread cache in front of its free lists and does no integrity "
       "checking at all, so its absolute figures say little about this "
-      "allocator — but its *speedup* column says what this machine and this "
+      "allocator, though its *speedup* column says what this machine and this "
       "workload are capable of, and that is what makes a flat column beside it "
       "a statement about the allocator rather than about the benchmark.\n")
 
@@ -660,7 +660,7 @@ def preload(o, preloads):
       "Nothing here was written to be allocated for: the programs, their "
       "allocation patterns and their sizes were all decided by somebody else "
       "for other reasons. It is also the measurement where the allocator "
-      "matters least — most of what these processes do is not allocation — so "
+      "matters least (most of what these processes do is not allocation), so "
       "**a ratio near 1.0 means the allocator disappeared into the noise, not "
       "that it is as fast as glibc.** The microbenchmarks above are where the "
       "per-operation cost is visible.\n")
@@ -766,7 +766,7 @@ def build():
 
     o("# Results\n")
     o("Generated by `tools/report.py` from the CSVs in "
-      "[`bench/results/`](../bench/results/). Do not edit by hand — regenerate "
+      "[`bench/results/`](../bench/results/). Do not edit by hand, regenerate "
       "it. Every number below traces to a committed file, which is the rule "
       "`tools/check_readme_numbers.py` enforces on the README.\n")
     o("The method behind each figure is in "

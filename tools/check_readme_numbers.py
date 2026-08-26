@@ -310,8 +310,22 @@ def main():
 
     # A placeholder that survived into the README is the failure this gate was
     # written for first: it means a table was laid out and never filled in.
+    #
+    # Code spans are exempt for the same reason they are exempt from the number
+    # check below: `__builtin_ctzll` and `__libc_malloc` are identifiers the
+    # README is entitled to name, and a placeholder is never written inside
+    # backticks. Fenced blocks are blanked rather than removed so the line
+    # numbers reported here stay the ones a reader would look at.
+    in_fence = False
     for lineno, line in enumerate(text.splitlines(), 1):
-        if "__" in line:
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        prose = re.sub(r"`[^`]*`", "", line)
+        prose = re.sub(r"\]\([^)]*\)", "]", prose)
+        if "__" in prose:
             bad.append((lineno, "__", "placeholder left in the README"))
 
     csv_vals = csv_candidates()

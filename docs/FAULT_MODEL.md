@@ -33,7 +33,7 @@ enough to measure a detection rate and nothing like enough to claim the
 detection works, because both sides of the experiment were written here.
 
 So the same event is staged under `LD_PRELOAD`. `MARS_SHIM_FLIP=<n>` flips one
-bit in the header of the n-th allocation a program makes — the second byte of
+bit in the header of the n-th allocation a program makes, the second byte of
 the control word, which carries the low bits of the block extent, because an
 extent is what every later walk is positioned by and getting it wrong is how a
 corrupted header becomes a wild write. Then the program runs, and the allocator
@@ -48,14 +48,14 @@ LD_PRELOAD=./build/gcc-release/bin/libmars_preload.so \
 Under `hardened` and `paranoid` this reports `block header corrupted` from
 inside `free`, the block is surrendered, and the program finishes with the
 right answer. Under `fast` the header carries no checksum, so what catches it
-instead is the free block's boundary tag failing to corroborate the extent —
-reported as `block list inconsistent` — and where the damaged block is never
+instead is the free block's boundary tag failing to corroborate the extent,
+reported as `block list inconsistent`, and where the damaged block is never
 touched again, `fast` does not catch it at all. That is the same trade the
 matrix above prices, observed in software that has never heard of it.
 
 Two things about this are worth stating plainly. It is a **demonstration**, not
 a measurement: one flip, one program, no repetition, no interval. And a clean
-run is part of it — the same programs under the same shim with no flip injected
+run is part of it, the same programs under the same shim with no flip injected
 report nothing at all, which is what makes a report mean something when one
 appears.
 
@@ -71,7 +71,7 @@ impressive.
   mirror survives.** Nothing reconstructs a payload: if the flip landed in user
   data, the payload checksum reports it and the data is gone. Under `hardened`
   and `fast` there is no second copy of the metadata either, so a damaged
-  header means a surrendered block — detection without repair is the trade
+  header means a surrendered block, detection without repair is the trade
   those profiles make, and it is what buys back 48 bytes per allocation.
 - **Read-after-write verification would not be brownout protection.** An
   earlier version of this allocator wrote each metadata field, read it back,
@@ -99,7 +99,7 @@ impressive.
 | Topology | `PREV_IN_USE` agreement, no adjacent free blocks, exact tiling, bin membership against the tiling | `mm_check_heap` |
 | Anything untouched | the bounded patrol, resuming where it stopped | every `N` allocator calls |
 
-A neighbour that fails validation is never *written through* — a block's
+A neighbour that fails validation is never *written through*, a block's
 control word decides where its own trailer lands, so sealing a corrupted
 neighbour would scatter writes across the arena. Space surrendered is counted,
 so the consistency check can tell deliberate loss from memory that has
@@ -109,7 +109,7 @@ genuinely gone missing.
 
 Blocks tile the arena in address order, which means a damaged block's **start**
 is known from its predecessor even when its own header is unreadable. What is
-missing is its extent — and the extent is exactly what decides where anything
+missing is its extent, and the extent is exactly what decides where anything
 else belonging to the block can be found.
 
 So the walk resynchronises first: it scans forward for the next header that
@@ -128,14 +128,14 @@ candidate extent. It is accepted only when
 - its checksum holds *for the index of the position it would restore*.
 
 The second condition is what refuses a mirror belonging to a different block.
-A test copies one block's mirror verbatim over another's — correct extent,
-correct flags, correct checksum over its own fields — and requires it to be
+A test copies one block's mirror verbatim over another's, correct extent,
+correct flags, correct checksum over its own fields, and requires it to be
 rejected. **A wrong repair is worse than no repair:** it would hand back a
 block of the wrong extent overlapping a live neighbour.
 
 When nothing can be rebuilt, the span between the damage and the
 resynchronisation point is surrendered, and only that span. Truncating the walk
-instead would cost the entire remainder of the arena — measured at 99.8% of it
+instead would cost the entire remainder of the arena, measured at 99.8% of it
 for a single flipped bit, before this was addressed.
 
 Quarantine no longer needs to poison anything. A block given up on stays in the
@@ -153,9 +153,9 @@ Every trial lands in exactly one bucket:
 | `detected_no_loss` | flagged; the block was rebuilt or the damage cost nothing, and the allocator gave up no memory |
 | `detected_quarantined` | flagged; a block was isolated and its space surrendered |
 | `detected_fatal` | flagged, but the allocator could no longer serve requests |
-| `undetected_benign` | not flagged, and nothing was wrong — the flip landed in slack, padding, or free space |
+| `undetected_benign` | not flagged, and nothing was wrong: the flip landed in slack, padding or free space |
 | `undetected_silent` | not flagged, **and the data came back wrong** |
-| `crash` | the trial died on a signal — the arena promise broken |
+| `crash` | the trial died on a signal, the arena promise broken |
 | `timeout` | the trial was still running after five seconds |
 
 `crash` and `timeout` are separate buckets for the same reason the two
@@ -169,8 +169,8 @@ with a different fix.
 **Separating the two undetected buckets is the point of the whole exercise.**
 Most flips into a large arena land somewhere that never mattered. Counting
 those as failures would understate the allocator badly; counting them as
-successes would overstate it just as badly. Only `undetected_silent` — where a
-read reported success and returned different bytes than were written — is a
+successes would overstate it just as badly. Only `undetected_silent`, where a
+read reported success and returned different bytes than were written, is a
 real failure to detect.
 
 This is why every trial carries a shadow model of what each live block is
@@ -188,7 +188,7 @@ distinguished from "harmless", and a detection rate means nothing.
   inside [0, 1] near the extremes where the textbook normal approximation does
   not. At 1,000 trials the interval is roughly ±2 percentage points, which is
   why a detection rate should never be quoted without its trial count.
-- **Detection coverage** is `detected / (detected + silent)` — of the flips
+- **Detection coverage** is `detected / (detected + silent)`, of the flips
   that actually mattered, how many were caught. Benign flips are excluded,
   because there was nothing there to catch.
 
@@ -214,7 +214,7 @@ the window produces exactly that.
 
 `bench/results/scrub-sweep.csv` holds the curve. What it shows is two different
 populations. `free_hdr` and `links` sit on the allocation path and are found in
-ten to fifteen calls at every setting, patrol included or not — validate-on-
+ten to fifteen calls at every setting, patrol included or not, validate-on-
 touch is what catches them. An allocated block's header, canary and payload
 track the interval almost exactly, and with the patrol off are not found by
 traffic at all. That second row is the honest price of O(1) allocation, and the
@@ -223,7 +223,7 @@ patrol is what buys it back.
 ## A free correctness oracle
 
 Theory says what some of these numbers must be. A 32-bit CRC over the header
-detects any single-bit change in it, without exception — so under any profile
+detects any single-bit change in it, without exception, so under any profile
 that carries one, single-bit header corruption must come out at 100% detection
 with zero silent corruption. If it does not, the harness has found a bug rather
 than a statistic. CI gates exactly that cell for `hardened` and `paranoid`.
@@ -231,7 +231,7 @@ than a statistic. CI gates exactly that cell for `hardened` and `paranoid`.
 `fast` carries no checksum, so no such prediction exists for it and the cell is
 recorded rather than gated. The crash count is gated for all three, because
 every profile is *supposed* to promise never to read or write outside the
-arena whatever a corrupted control word says — a promise that should not depend
+arena whatever a corrupted control word says, a promise that should not depend
 on being able to detect the corruption.
 
 ## Where that promise once did not hold
@@ -240,7 +240,7 @@ It held under `hardened` and `paranoid` and was **broken under `fast`**: an
 earlier run recorded 2 crashes in 240,000 trials, both from single cells of the
 `free_hdr` target, both writing a boundary tag about 115 MB past a 262 KB arena.
 That is fixed. The two trials are replayed by seed as ctest cases under every
-profile — `faultinject_arena_promise_free_hdr_2bit` and `_4bit`, which is what
+profile, `faultinject_arena_promise_free_hdr_2bit` and `_4bit`, which is what
 `--fail-on-crash` exists for. They reproduce standalone too:
 
 ```bash
@@ -259,7 +259,7 @@ rather than fixed it.
 
 **1. The flip made a free block illegible, not merely wrong.** Two bits in a
 free block's control word gave it a recorded extent of 4 GB. `mm_header_ok`
-under `fast` is a bounds check and nothing more, and 4 GB fails it — so every
+under `fast` is a bounds check and nothing more, and 4 GB fails it, so every
 walk stopped at that block. The bins were rebuilt and came out empty, and the
 allocator stopped serving requests. All of that is correct behaviour.
 
@@ -267,7 +267,7 @@ allocator stopped serving requests. All of that is correct behaviour.
 boundary.** Freeing the block in front of the damage sent `mm_publish` →
 `mm_recover_next` → `scan_resync` looking for the next place the tiling could be
 picked up again. It accepted the first address whose header was bounds-plausible
-and whose extent tiled with another bounds-plausible header — which under `fast`
+and whose extent tiled with another bounds-plausible header, which under `fast`
 is a very weak test, and it matched a run of payload bytes 16 bytes short of the
 real boundary. 80 bytes were surrendered where the damaged block was 96, and
 **the tiling was now permanently out of step.**
@@ -278,7 +278,7 @@ walks the tiling from `lo` filing every free block it meets. Out of step, that
 walk was reading payload bytes as control words, and two of them read as free
 blocks. Filing a block into a bin *writes two link words into it*: one of those
 writes, the `NULL` predecessor of a phantom, landed exactly on a live free
-block's control word and replaced it with `NULL ^ secret` — the arena secret,
+block's control word and replaced it with `NULL ^ secret`, the arena secret,
 whose top 54 bits read as an extent of 115,020,032 bytes.
 
 **4. A coalesce added an extent it had validated before the write.**
@@ -291,7 +291,7 @@ added its size. The size it added was the one the rebuild had just left behind.
 
 In one sentence: **a free block carries a second copy of its extent in its
 boundary tag, and neither of the two walks that write into blocks was consulting
-it.** That is also exactly why `hardened` and `paranoid` never crashed — their
+it.** That is also exactly why `hardened` and `paranoid` never crashed, their
 header checksum makes the tag redundant, and `mm_header_ok` is genuine
 verification there rather than a bounds check. Under `fast` the tag is the only
 redundancy that exists, and both walks were treating a bounds-plausible header
@@ -304,8 +304,8 @@ as a block.
   `tiling_agrees`, and `mm_bins_rebuild`. For a free block under `fast` it
   requires the boundary tag to repeat the extent; under a profile with a
   checksum the extent has already been vouched for and it adds nothing. Both
-  seeds now surrender exactly the damaged block — 96 and 112 bytes, against the
-  80 and 96 the scan used to settle for — and the tiling stays in step.
+  seeds now surrender exactly the damaged block, 96 and 112 bytes, against the
+  80 and 96 the scan used to settle for, and the tiling stays in step.
 - **`mm_unchanged`** re-establishes every extent that was read before a bin
   operation and is used after it, in `absorb_neighbours`, `mm_malloc`,
   `mm_realloc` and `mm_quarantine`. A bin operation writes into free blocks, so
@@ -313,7 +313,7 @@ as a block.
   block that no longer agrees with itself is quarantined rather than merged.
 - **`mm_publish` refuses** to write when the block's recorded extent is not
   inside the arena. Both of its writes are positioned by that extent, so this is
-  where the promise can be kept whatever a corrupted control word says — and
+  where the promise can be kept whatever a corrupted control word says, and
   keeping it there rather than only on the paths that reach it is the difference
   between a guarantee and a coincidence. A refusal reports and surrenders the
   span through `mm_rescue`; callers that were about to file the block into a bin
@@ -331,7 +331,7 @@ as a block.
 
 Worth being exact about, because the obvious reading is wrong. **The two seeded
 cases pin the outcome, not the mechanism.** Reduce `mm_extent_corroborated` back
-to `mm_header_ok` and both still pass, as do 20,000 further `fast` trials —
+to `mm_header_ok` and both still pass, as do 20,000 further `fast` trials,
 because `mm_publish` refuses the out-of-arena write on its own, and a refused
 write is not a crash. That is defence in depth working as intended, and it is
 the right thing for the fault injector to gate: the arena promise is a statement
@@ -360,14 +360,14 @@ bytes wide, that header covers the eight bytes immediately before the target:
 
 | refusal point | `fast` | `hardened` | `paranoid` | what closes it |
 |---|:-:|:-:|:-:|---|
-| forward, the block being freed | yes | yes | yes | — |
+| forward, the block being freed | yes | yes | yes |, |
 | forward, the neighbour | yes | no | yes | the phantom's header lands on the freed block's canary, and `hardened` always has one in an allocated block's last sixteen bytes; `paranoid` fills them with the tail mirror instead |
 | backward, the block being freed | yes | no | no | the phantom's checksum field lands on the predecessor's boundary tag, which `mm_prev_free_block` must read to reach the backward merge at all |
-| backward, the predecessor | yes | yes | yes | — |
-| the block `mm_malloc` chose | yes | yes | yes | — |
+| backward, the predecessor | yes | yes | yes |, |
+| the block `mm_malloc` chose | yes | yes | yes |, |
 
 CI's 200-trial smoke sweep could never have hit a 1-in-120,000 event; the
-10,000-trial run is what found it. The sweep is now 2,000 trials per cell —
+10,000-trial run is what found it. The sweep is now 2,000 trials per cell,
 56,000 per profile per push, at a cost of well under a minute. But the sweep is
 not what stops this returning: the seeds pin the outcome and the unit tests pin
 the mechanism, and only the second kind fails when the fix is removed.
